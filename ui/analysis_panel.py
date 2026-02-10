@@ -284,9 +284,9 @@ class TradeLogWidget(QtWidgets.QWidget):
         layout.setContentsMargins(5, 5, 5, 5)
         
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
-            "方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "市场状态"
+            "方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "市场状态", "ABC坐标"
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setStyleSheet(f"""
@@ -356,6 +356,13 @@ class TradeLogWidget(QtWidgets.QWidget):
             except Exception:
                 pass
             self.table.setItem(i, 8, regime_item)
+
+            # ABC 坐标
+            abc_str = t.get("abc", "")
+            abc_item = QtWidgets.QTableWidgetItem(abc_str)
+            abc_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
+            abc_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(i, 9, abc_item)
 
 
 class MarketRegimeWidget(QtWidgets.QWidget):
@@ -535,14 +542,311 @@ class MarketRegimeWidget(QtWidgets.QWidget):
             self.table.setItem(row, 6, avg_item)
 
 
+class TrajectoryMatchWidget(QtWidgets.QWidget):
+    """轨迹匹配结果显示组件"""
+
+    # 信号
+    walk_forward_requested = QtCore.pyqtSignal()
+    save_memory_requested = QtCore.pyqtSignal()
+    load_memory_requested = QtCore.pyqtSignal()
+    clear_memory_requested = QtCore.pyqtSignal()
+    merge_all_requested = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        group_style = f"""
+            QGroupBox {{
+                border: 1px solid #444;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 15px;
+                color: {UI_CONFIG['THEME_TEXT']};
+                font-weight: bold;
+            }}
+        """
+
+        # ── 当前匹配状态 ──
+        match_group = QtWidgets.QGroupBox("实时匹配状态")
+        match_group.setStyleSheet(group_style)
+        match_layout = QtWidgets.QFormLayout(match_group)
+
+        self.current_regime_label = QtWidgets.QLabel("--")
+        self.best_match_label = QtWidgets.QLabel("--")
+        self.cosine_sim_label = QtWidgets.QLabel("--")
+        self.dtw_sim_label = QtWidgets.QLabel("--")
+        self.match_direction_label = QtWidgets.QLabel("--")
+
+        match_layout.addRow("市场状态:", self.current_regime_label)
+        match_layout.addRow("最佳匹配:", self.best_match_label)
+        match_layout.addRow("余弦相似度:", self.cosine_sim_label)
+        match_layout.addRow("DTW相似度:", self.dtw_sim_label)
+        match_layout.addRow("匹配方向:", self.match_direction_label)
+
+        layout.addWidget(match_group)
+
+        # ── 模板库统计 ──
+        template_group = QtWidgets.QGroupBox("模板库统计")
+        template_group.setStyleSheet(group_style)
+        template_layout = QtWidgets.QFormLayout(template_group)
+
+        self.total_templates_label = QtWidgets.QLabel("0")
+        self.long_templates_label = QtWidgets.QLabel("0")
+        self.short_templates_label = QtWidgets.QLabel("0")
+        self.avg_profit_label = QtWidgets.QLabel("--")
+
+        template_layout.addRow("模板总数:", self.total_templates_label)
+        template_layout.addRow("做多模板:", self.long_templates_label)
+        template_layout.addRow("做空模板:", self.short_templates_label)
+        template_layout.addRow("平均收益:", self.avg_profit_label)
+
+        layout.addWidget(template_group)
+
+        # ── Walk-Forward 验证结果 ──
+        wf_group = QtWidgets.QGroupBox("Walk-Forward 验证")
+        wf_group.setStyleSheet(group_style)
+        wf_layout = QtWidgets.QVBoxLayout(wf_group)
+
+        # 验证按钮
+        btn_layout = QtWidgets.QHBoxLayout()
+        self.wf_btn = QtWidgets.QPushButton("运行 Walk-Forward 验证")
+        self.wf_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {UI_CONFIG['THEME_ACCENT']};
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #0088dd;
+            }}
+            QPushButton:disabled {{
+                background-color: #555;
+                color: #888;
+            }}
+        """)
+        self.wf_btn.setEnabled(False)
+        self.wf_btn.clicked.connect(self.walk_forward_requested.emit)
+        btn_layout.addWidget(self.wf_btn)
+        wf_layout.addLayout(btn_layout)
+
+        # 结果展示
+        results_layout = QtWidgets.QFormLayout()
+        self.wf_avg_sharpe_label = QtWidgets.QLabel("--")
+        self.wf_consistency_label = QtWidgets.QLabel("--")
+        self.wf_avg_profit_label = QtWidgets.QLabel("--")
+        self.wf_status_label = QtWidgets.QLabel("未运行")
+        self.wf_status_label.setStyleSheet("color: #888;")
+
+        results_layout.addRow("状态:", self.wf_status_label)
+        results_layout.addRow("平均Sharpe:", self.wf_avg_sharpe_label)
+        results_layout.addRow("一致性:", self.wf_consistency_label)
+        results_layout.addRow("平均利润:", self.wf_avg_profit_label)
+
+        wf_layout.addLayout(results_layout)
+        layout.addWidget(wf_group)
+
+        # ── 最优交易参数 ──
+        params_group = QtWidgets.QGroupBox("GA优化参数")
+        params_group.setStyleSheet(group_style)
+        params_layout = QtWidgets.QFormLayout(params_group)
+
+        self.param_labels = {}
+        param_names = [
+            ("cosine_threshold", "余弦阈值"),
+            ("dtw_threshold", "DTW阈值"),
+            ("stop_loss_atr", "止损ATR"),
+            ("take_profit_atr", "止盈ATR"),
+            ("max_hold_bars", "最大持仓"),
+        ]
+        for key, name in param_names:
+            label = QtWidgets.QLabel("--")
+            self.param_labels[key] = label
+            params_layout.addRow(f"{name}:", label)
+
+        layout.addWidget(params_group)
+
+        # ── 记忆管理 ──
+        memory_group = QtWidgets.QGroupBox("记忆管理")
+        memory_group.setStyleSheet(group_style)
+        memory_layout = QtWidgets.QVBoxLayout(memory_group)
+
+        # 记忆统计
+        memory_stats_layout = QtWidgets.QFormLayout()
+        self.memory_count_label = QtWidgets.QLabel("0")
+        self.memory_files_label = QtWidgets.QLabel("0 个文件")
+        memory_stats_layout.addRow("已加载模板:", self.memory_count_label)
+        memory_stats_layout.addRow("本地存档:", self.memory_files_label)
+        memory_layout.addLayout(memory_stats_layout)
+
+        # 按钮样式
+        btn_style = f"""
+            QPushButton {{
+                background-color: #444;
+                color: {UI_CONFIG['THEME_TEXT']};
+                border: 1px solid #555;
+                padding: 6px 12px;
+                border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                background-color: #555;
+            }}
+            QPushButton:disabled {{
+                background-color: #333;
+                color: #666;
+            }}
+        """
+        btn_style_accent = f"""
+            QPushButton {{
+                background-color: {UI_CONFIG['THEME_ACCENT']};
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                background-color: #0088dd;
+            }}
+            QPushButton:disabled {{
+                background-color: #555;
+                color: #888;
+            }}
+        """
+        btn_style_danger = """
+            QPushButton {
+                background-color: #aa3333;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #cc4444;
+            }
+        """
+
+        # 第一行：保存 + 加载
+        btn_row1 = QtWidgets.QHBoxLayout()
+        self.save_memory_btn = QtWidgets.QPushButton("保存记忆")
+        self.save_memory_btn.setStyleSheet(btn_style_accent)
+        self.save_memory_btn.setEnabled(False)
+        self.save_memory_btn.clicked.connect(self.save_memory_requested.emit)
+        btn_row1.addWidget(self.save_memory_btn)
+
+        self.load_memory_btn = QtWidgets.QPushButton("加载最新")
+        self.load_memory_btn.setStyleSheet(btn_style)
+        self.load_memory_btn.clicked.connect(self.load_memory_requested.emit)
+        btn_row1.addWidget(self.load_memory_btn)
+        memory_layout.addLayout(btn_row1)
+
+        # 第二行：合并全部 + 清空
+        btn_row2 = QtWidgets.QHBoxLayout()
+        self.merge_all_btn = QtWidgets.QPushButton("合并全部")
+        self.merge_all_btn.setStyleSheet(btn_style)
+        self.merge_all_btn.setToolTip("加载并合并所有历史记忆文件")
+        self.merge_all_btn.clicked.connect(self.merge_all_requested.emit)
+        btn_row2.addWidget(self.merge_all_btn)
+
+        self.clear_memory_btn = QtWidgets.QPushButton("清空记忆")
+        self.clear_memory_btn.setStyleSheet(btn_style_danger)
+        self.clear_memory_btn.clicked.connect(self.clear_memory_requested.emit)
+        btn_row2.addWidget(self.clear_memory_btn)
+        memory_layout.addLayout(btn_row2)
+
+        layout.addWidget(memory_group)
+
+        layout.addStretch()
+
+    def update_match_status(self, regime: str, best_match: str,
+                            cosine_sim: float, dtw_sim: float, direction: str):
+        """更新当前匹配状态"""
+        self.current_regime_label.setText(regime)
+        self.best_match_label.setText(best_match)
+        self.cosine_sim_label.setText(f"{cosine_sim:.1%}")
+        self.dtw_sim_label.setText(f"{dtw_sim:.1%}")
+
+        # 方向着色
+        self.match_direction_label.setText(direction)
+        if direction == "LONG":
+            self.match_direction_label.setStyleSheet(f"color: {UI_CONFIG['CHART_UP_COLOR']};")
+        elif direction == "SHORT":
+            self.match_direction_label.setStyleSheet(f"color: {UI_CONFIG['CHART_DOWN_COLOR']};")
+        else:
+            self.match_direction_label.setStyleSheet("color: #888;")
+
+    def update_template_stats(self, total: int, long_count: int, short_count: int,
+                               avg_profit: float):
+        """更新模板库统计"""
+        self.total_templates_label.setText(str(total))
+        self.long_templates_label.setText(str(long_count))
+        self.short_templates_label.setText(str(short_count))
+        self.avg_profit_label.setText(f"{avg_profit:.2f}%")
+
+    def update_walk_forward_result(self, avg_sharpe: float, consistency: float,
+                                    avg_profit: float, status: str = "完成"):
+        """更新 Walk-Forward 验证结果"""
+        self.wf_status_label.setText(status)
+        if status == "完成":
+            self.wf_status_label.setStyleSheet(f"color: {UI_CONFIG['CHART_UP_COLOR']};")
+        elif "运行中" in status:
+            self.wf_status_label.setStyleSheet(f"color: {UI_CONFIG['THEME_ACCENT']};")
+        else:
+            self.wf_status_label.setStyleSheet("color: #888;")
+
+        self.wf_avg_sharpe_label.setText(f"{avg_sharpe:.3f}")
+        self.wf_consistency_label.setText(f"{consistency:.0%}")
+
+        profit_color = UI_CONFIG['CHART_UP_COLOR'] if avg_profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
+        self.wf_avg_profit_label.setText(f"{avg_profit:.2f}%")
+        self.wf_avg_profit_label.setStyleSheet(f"color: {profit_color};")
+
+    def update_trading_params(self, params):
+        """更新GA优化后的交易参数"""
+        if params is None:
+            return
+        for key, label in self.param_labels.items():
+            if hasattr(params, key):
+                value = getattr(params, key)
+                if isinstance(value, float):
+                    label.setText(f"{value:.3f}")
+                else:
+                    label.setText(str(value))
+
+    def enable_walk_forward(self, enabled: bool):
+        """启用/禁用 Walk-Forward 按钮"""
+        self.wf_btn.setEnabled(enabled)
+
+    def update_memory_stats(self, template_count: int, file_count: int):
+        """更新记忆统计"""
+        self.memory_count_label.setText(str(template_count))
+        self.memory_files_label.setText(f"{file_count} 个文件")
+        # 有模板时启用保存按钮
+        self.save_memory_btn.setEnabled(template_count > 0)
+
+    def enable_save_memory(self, enabled: bool):
+        """启用/禁用保存按钮"""
+        self.save_memory_btn.setEnabled(enabled)
+
+
 class AnalysisPanel(QtWidgets.QWidget):
     """
     分析面板 - 深色主题
     
-    包含三个标签页：
+    包含标签页：
     1. 特征重要性
     2. 多空逻辑
     3. 生存分析
+    4. 交易明细
+    5. 市场状态
+    6. 指纹图（3D地形图显示轨迹指纹）
+    7. 轨迹匹配
     """
     
     def __init__(self, parent=None):
@@ -597,6 +901,15 @@ class AnalysisPanel(QtWidgets.QWidget):
         # 市场状态标签页
         self.market_regime_widget = MarketRegimeWidget()
         self.tabs.addTab(self.market_regime_widget, "市场状态")
+
+        # 指纹地形图标签页
+        from ui.vector_space_widget import FingerprintWidget
+        self.fingerprint_widget = FingerprintWidget()
+        self.tabs.addTab(self.fingerprint_widget, "指纹图")
+
+        # 轨迹匹配标签页
+        self.trajectory_widget = TrajectoryMatchWidget()
+        self.tabs.addTab(self.trajectory_widget, "轨迹匹配")
         
         layout.addWidget(self.tabs)
         
@@ -638,6 +951,56 @@ class AnalysisPanel(QtWidgets.QWidget):
         """更新市场状态统计"""
         self.market_regime_widget.update_current_regime(current_regime)
         self.market_regime_widget.update_stats(regime_stats)
+
+    def update_fingerprint_templates(self, templates: list):
+        """更新指纹图模板列表"""
+        self.fingerprint_widget.set_templates(templates)
+
+    def update_fingerprint_current(self, fingerprint, best_match_idx: int = -1,
+                                    cosine_sim: float = 0.0, dtw_sim: float = 0.0):
+        """更新当前K线的指纹及最佳匹配"""
+        self.fingerprint_widget.set_current_fingerprint(
+            fingerprint, best_match_idx, cosine_sim, dtw_sim
+        )
+
+    # ── 轨迹匹配相关方法 ──
+    def update_trajectory_match_status(self, regime: str, best_match: str,
+                                        cosine_sim: float, dtw_sim: float,
+                                        direction: str):
+        """更新轨迹匹配状态"""
+        self.trajectory_widget.update_match_status(
+            regime, best_match, cosine_sim, dtw_sim, direction
+        )
+
+    def update_trajectory_template_stats(self, total: int, long_count: int,
+                                          short_count: int, avg_profit: float):
+        """更新模板库统计"""
+        self.trajectory_widget.update_template_stats(
+            total, long_count, short_count, avg_profit
+        )
+
+    def update_walk_forward_result(self, avg_sharpe: float, consistency: float,
+                                    avg_profit: float, status: str = "完成"):
+        """更新 Walk-Forward 验证结果"""
+        self.trajectory_widget.update_walk_forward_result(
+            avg_sharpe, consistency, avg_profit, status
+        )
+
+    def update_trading_params(self, params):
+        """更新 GA 优化后的交易参数"""
+        self.trajectory_widget.update_trading_params(params)
+
+    def enable_walk_forward(self, enabled: bool):
+        """启用/禁用 Walk-Forward 验证按钮"""
+        self.trajectory_widget.enable_walk_forward(enabled)
+
+    def update_memory_stats(self, template_count: int, file_count: int):
+        """更新记忆统计"""
+        self.trajectory_widget.update_memory_stats(template_count, file_count)
+
+    def enable_save_memory(self, enabled: bool):
+        """启用/禁用保存记忆按钮"""
+        self.trajectory_widget.enable_save_memory(enabled)
 
 
 # 测试代码

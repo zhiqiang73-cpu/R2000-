@@ -127,6 +127,56 @@ LABEL_BACKTEST_CONFIG = {
     "SLIPPAGE": 0.0002,         # 滑点
 }
 
+# ==================== 向量空间配置 ====================
+VECTOR_SPACE_CONFIG = {
+    "K_NEIGHBORS": 5,            # 偏离指数计算时取最近的 k 个点
+    "MIN_CLOUD_POINTS": 3,       # 点云最少多少个点才计算偏离指数
+    "ENTRY_SIM_THRESHOLD": 70.0, # 入场相似度阈值 (%)
+    "EXIT_SIM_THRESHOLD": 70.0,  # 出场相似度阈值 (%)
+    "LOST_THRESHOLD": 20.0,      # 迷失信号阈值 (%) - entry和exit都低于此值
+    "EXIT_CONFIRM_BARS": 3,      # 出场信号需连续确认的K线数
+    "PRECISION": 3,              # 坐标精度（小数位）
+    # GA权重搜索范围
+    "WEIGHT_MIN": -10.0,
+    "WEIGHT_MAX": 10.0,
+}
+
+# ==================== 轨迹匹配配置 ====================
+TRAJECTORY_CONFIG = {
+    "PRE_ENTRY_WINDOW": 60,      # 入场前回看窗口（K线数）
+    "PRE_EXIT_WINDOW": 30,       # 离场前回看窗口（K线数）
+    "COSINE_TOP_K": 20,          # 余弦粗筛保留候选数量
+    "DTW_RADIUS": 10,            # FastDTW半径约束（加速计算）
+    "MIN_PROFIT_PCT": 0.5,       # 只提取收益率>0.5%的交易作为模板
+    "FEATURE_DIM": 32,           # 特征维度 (16+10+6)
+    # 匹配阈值默认值（由GA优化）
+    "COSINE_THRESHOLD": 0.6,     # 余弦相似度阈值
+    "DTW_THRESHOLD": 0.5,        # DTW归一化距离阈值（越小越严格）
+    "HOLD_DIVERGENCE_LIMIT": 0.7,# 持仓偏离上限
+    "EXIT_MATCH_THRESHOLD": 0.5, # 离场匹配阈值
+}
+
+# ==================== Walk-Forward验证配置 ====================
+WALK_FORWARD_CONFIG = {
+    "TRAIN_RATIO": 0.6,          # 训练集比例
+    "VAL_RATIO": 0.2,            # 验证集比例
+    "TEST_RATIO": 0.2,           # 测试集比例
+    "N_FOLDS": 3,                # 滑动窗口折数
+    "STEP_SIZE": 5000,           # 每折滑动的K线数
+    "MIN_TRAIN_TRADES": 30,      # 训练集最少交易数
+    "MIN_VAL_TRADES": 10,        # 验证集最少交易数
+}
+
+# ==================== 记忆持久化配置 ====================
+MEMORY_CONFIG = {
+    "MEMORY_DIR": "data/memory",      # 记忆存储目录
+    "AUTO_SAVE": True,                # 回测完成后自动保存记忆
+    "AUTO_LOAD": True,                # 启动时自动加载最新记忆
+    "MERGE_ON_LOAD": True,            # 加载时合并（而非覆盖）
+    "DEDUPLICATE": True,              # 合并时去重
+    "MAX_MEMORY_FILES": 50,           # 最多保留的记忆文件数
+}
+
 # ==================== 市场状态分类配置 ====================
 MARKET_REGIME_CONFIG = {
     "DIR_STRONG_THRESHOLD": 0.008,       # 方向强趋势阈值 (0.8%)

@@ -52,6 +52,15 @@ class TradeRecord:
     liquidation_price: float = 0.0
     margin: float = 0.0
     market_regime: str = ""  # 市场状态分类
+    # ABC 向量坐标
+    entry_abc: tuple = (0.0, 0.0, 0.0)  # 入场时的 (A, B, C) 坐标
+    exit_abc: tuple = (0.0, 0.0, 0.0)   # 离场时的 (A, B, C) 坐标
+    # 轨迹匹配字段
+    pre_entry_traj: object = None       # (60, 32) 入场前轨迹 np.ndarray
+    holding_traj: object = None         # (hold, 32) 持仓轨迹 np.ndarray
+    pre_exit_traj: object = None        # (30, 32) 离场前轨迹 np.ndarray
+    matched_template_idx: int = -1      # 匹配到的模板编号
+    entry_similarity: float = 0.0       # 入场匹配度 (DTW相似度)
 
 
 @dataclass

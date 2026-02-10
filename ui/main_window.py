@@ -10,9 +10,12 @@ import sys
 import os
 import time
 import traceback
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import UI_CONFIG, DATA_CONFIG, LABEL_BACKTEST_CONFIG, MARKET_REGIME_CONFIG
+from config import (UI_CONFIG, DATA_CONFIG, LABEL_BACKTEST_CONFIG,
+                    MARKET_REGIME_CONFIG, VECTOR_SPACE_CONFIG,
+                    TRAJECTORY_CONFIG, WALK_FORWARD_CONFIG, MEMORY_CONFIG)
 from ui.chart_widget import ChartWidget
 from ui.control_panel import ControlPanel
 from ui.analysis_panel import AnalysisPanel
@@ -268,6 +271,11 @@ class MainWindow(QtWidgets.QMainWindow):
     - 右侧：分析面板
     - 底部：优化器面板
     """
+
+    # GA 完成信号
+    _ga_done_signal = QtCore.pyqtSignal(float)
+    # Walk-Forward 完成信号
+    _wf_done_signal = QtCore.pyqtSignal(object)
     
     def __init__(self):
         super().__init__()
@@ -300,8 +308,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.regime_classifier = None
         self.regime_map: dict = {}  # {trade_index: regime_string}
         
+        # 向量空间引擎和记忆体
+        self.fv_engine = None       # FeatureVectorEngine
+        self.vector_memory = None   # VectorMemory
+        self._fv_ready = False
+        self._ga_running = False
+
+        # 轨迹匹配相关
+        self.trajectory_memory = None
+
+        # GA 完成信号（analysis_panel 在后续 _init_ui 中创建后再连接按钮）
+        self._ga_done_signal.connect(self._on_ga_finished)
+        # Walk-Forward 完成信号
+        self._wf_done_signal.connect(self._on_walk_forward_finished)
+        
         self._init_ui()
         self._connect_signals()
+
+        # 自动加载已有记忆（如果配置了）
+        self._auto_load_memory()
     
     def _init_ui(self):
         """初始化 UI - 深色主题"""
@@ -375,6 +400,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 右侧分析面板
         self.analysis_panel = AnalysisPanel()
         main_layout.addWidget(self.analysis_panel)
+
+        # 注：旧的向量空间GA按钮已移除，指纹图使用不同的交互方式
         
         # 状态栏
         self.statusBar().showMessage("就绪")
@@ -432,6 +459,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control_panel.pause_requested.connect(self._on_pause_requested)
         self.control_panel.stop_requested.connect(self._on_stop_requested)
         self.control_panel.speed_changed.connect(self._on_speed_changed)
+
+        # 轨迹匹配相关
+        self.analysis_panel.trajectory_widget.walk_forward_requested.connect(
+            self._on_walk_forward_requested
+        )
+
+        # 记忆管理
+        self.analysis_panel.trajectory_widget.save_memory_requested.connect(
+            self._on_save_memory
+        )
+        self.analysis_panel.trajectory_widget.load_memory_requested.connect(
+            self._on_load_memory
+        )
+        self.analysis_panel.trajectory_widget.clear_memory_requested.connect(
+            self._on_clear_memory
+        )
+        self.analysis_panel.trajectory_widget.merge_all_requested.connect(
+            self._on_merge_all_memory
+        )
     
     def _on_load_data(self):
         """加载数据"""
@@ -500,7 +546,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rt_last_trade_count = 0
         self.regime_classifier = None
         self.regime_map = {}
+        self.fv_engine = None
+        self.vector_memory = None
+        self._fv_ready = False
         self.analysis_panel.update_trade_log([])
+        self.analysis_panel.fingerprint_widget.clear_plot()
         self.control_panel.set_playing_state(True)
         self.control_panel.set_status("正在执行上帝视角标注...")
         self.statusBar().showMessage("正在标注...")
@@ -563,20 +613,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 }
                 self.optimizer_panel.update_backtest_metrics(metrics)
 
-                # 仅在交易数量变化时刷新明细 + 市场状态
+                # 仅在交易数量变化时刷新明细 + 市场状态 + 向量
                 if self.rt_backtester is not None and len(self.rt_backtester.trades) != self.rt_last_trade_count:
                     new_count = len(self.rt_backtester.trades)
-                    # 为新产生的交易分类市场状态
-                    if self.regime_classifier is not None:
-                        for ti in range(self.rt_last_trade_count, new_count):
-                            trade = self.rt_backtester.trades[ti]
+                    for ti in range(self.rt_last_trade_count, new_count):
+                        trade = self.rt_backtester.trades[ti]
+                        # 市场状态分类
+                        if self.regime_classifier is not None:
                             regime = self.regime_classifier.classify_at(trade.entry_idx)
                             trade.market_regime = regime
                             self.regime_map[ti] = regime
+                        # 向量坐标记录
+                        if self._fv_ready and self.fv_engine:
+                            self._record_trade_vectors(trade)
                     self.rt_last_trade_count = new_count
                     self.analysis_panel.update_trade_log(self._format_trades(self.rt_backtester.trades))
-                    # 更新市场状态统计
                     self._update_regime_stats()
+                    # 每10笔交易刷新一次3D图（节省性能）
+                    if new_count % 10 == 0 or new_count < 20:
+                        self._update_vector_space_plot()
 
                 # 实时更新当前K线的市场状态
                 if self.regime_classifier is not None:
@@ -622,6 +677,23 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 print(f"[MarketRegime] 初始化失败: {e}")
 
+        # 初始化特征向量引擎 + 记忆体
+        if self.df is not None:
+            try:
+                from core.feature_vector import FeatureVectorEngine
+                from core.vector_memory import VectorMemory
+                self.fv_engine = FeatureVectorEngine()
+                self.fv_engine.precompute(self.df)
+                self.vector_memory = VectorMemory(
+                    k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
+                    min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
+                )
+                self._fv_ready = True
+                print("[FeatureVector] 引擎和记忆体就绪")
+            except Exception as e:
+                print(f"[FeatureVector] 初始化失败: {e}")
+                traceback.print_exc()
+
         # 启动回测追赶（避免主线程卡顿）
         if self.df is not None:
             end_idx = max(0, self.chart_widget.current_display_index - 1)
@@ -661,16 +733,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.optimizer_panel.update_backtest_metrics(metrics)
         self.rt_last_trade_count = len(self.rt_backtester.trades) if self.rt_backtester else 0
 
-        # 为追赶期间产生的所有交易分类市场状态
-        if self.regime_classifier is not None and self.rt_backtester:
+        # 为追赶期间产生的所有交易分类市场状态 + 填充向量记忆体
+        if self.rt_backtester:
             for ti, trade in enumerate(self.rt_backtester.trades):
-                regime = self.regime_classifier.classify_at(trade.entry_idx)
-                trade.market_regime = regime
-                self.regime_map[ti] = regime
+                if self.regime_classifier is not None:
+                    regime = self.regime_classifier.classify_at(trade.entry_idx)
+                    trade.market_regime = regime
+                    self.regime_map[ti] = regime
+                # 填充向量坐标和记忆体
+                if self._fv_ready and self.fv_engine:
+                    self._record_trade_vectors(trade)
 
         if self.rt_backtester:
             self.analysis_panel.update_trade_log(self._format_trades(self.rt_backtester.trades))
         self._update_regime_stats()
+        self._update_vector_space_plot()
 
     def _format_trades(self, trades):
         """格式化交易明细（仅展示最近200条）"""
@@ -697,6 +774,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rows = []
         for t in trades[-200:]:
             side = "LONG" if t.side == 1 else "SHORT"
+            entry_abc = getattr(t, 'entry_abc', (0, 0, 0))
             rows.append({
                 "side": side,
                 "entry_time": fmt_time(t.entry_idx),
@@ -707,9 +785,391 @@ class MainWindow(QtWidgets.QMainWindow):
                 "profit_pct": f"{t.profit_pct:.2f}",
                 "hold": str(t.hold_periods),
                 "regime": getattr(t, 'market_regime', ''),
+                "abc": f"({entry_abc[0]:.1f},{entry_abc[1]:.1f},{entry_abc[2]:.1f})",
             })
         return rows
     
+    def _record_trade_vectors(self, trade):
+        """为一笔交易记录入场和离场的 ABC 向量坐标到记忆体"""
+        if not self._fv_ready or self.fv_engine is None or self.vector_memory is None:
+            return
+        regime = getattr(trade, 'market_regime', '') or '未知'
+        direction = "LONG" if trade.side == 1 else "SHORT"
+
+        # 入场坐标
+        entry_abc = self.fv_engine.get_abc(trade.entry_idx)
+        trade.entry_abc = entry_abc
+        self.vector_memory.add_point(regime, direction, "ENTRY", *entry_abc)
+
+        # 离场坐标
+        exit_abc = self.fv_engine.get_abc(trade.exit_idx)
+        trade.exit_abc = exit_abc
+        self.vector_memory.add_point(regime, direction, "EXIT", *exit_abc)
+
+    def _update_vector_space_plot(self):
+        """更新向量空间/指纹图（兼容旧调用）"""
+        # 向量空间3D散点图已替换为指纹地形图
+        # 指纹图的更新通过 _update_fingerprint_view 方法
+        pass
+
+    def _update_fingerprint_view(self):
+        """更新指纹图3D地形视图"""
+        if not hasattr(self, 'trajectory_memory') or self.trajectory_memory is None:
+            return
+
+        try:
+            templates = self.trajectory_memory.get_all_templates()
+            self.analysis_panel.update_fingerprint_templates(templates)
+        except Exception as e:
+            print(f"[Fingerprint] 3D图更新失败: {e}")
+
+    def _on_ga_optimize(self):
+        """GA 优化权重按钮点击（向量空间旧功能，已废弃）"""
+        # 旧的ABC向量空间GA优化已移除
+        # 新的轨迹匹配使用 GATradingOptimizer 通过 Walk-Forward 验证
+        pass
+
+    def _on_ga_finished(self, fitness: float):
+        """GA 优化完成（旧功能，保留信号处理）"""
+        self._ga_running = False
+        if fitness >= 0:
+            self.statusBar().showMessage(f"GA 优化完成! 适应度: {fitness:.4f}")
+        else:
+            self.statusBar().showMessage("GA 优化失败")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 轨迹匹配相关方法
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _extract_trajectory_templates(self, trades):
+        """提取轨迹模板"""
+        if not self._fv_ready or self.fv_engine is None:
+            return
+
+        try:
+            from core.trajectory_engine import TrajectoryMemory
+
+            # 检查是否已有记忆体，如果有则合并，否则新建
+            if hasattr(self, 'trajectory_memory') and self.trajectory_memory is not None:
+                # 提取新模板到临时记忆体
+                new_memory = TrajectoryMemory()
+                n_new = new_memory.extract_from_trades(
+                    trades, self.fv_engine, self.regime_map, verbose=False
+                )
+                # 合并到现有记忆体
+                if n_new > 0:
+                    added = self.trajectory_memory.merge(
+                        new_memory,
+                        deduplicate=MEMORY_CONFIG.get("DEDUPLICATE", True),
+                        verbose=True
+                    )
+                    n_templates = self.trajectory_memory.total_count
+                    print(f"[TrajectoryMemory] 增量合并: 新增 {added} 个模板, 总计 {n_templates}")
+                else:
+                    n_templates = self.trajectory_memory.total_count
+            else:
+                # 新建记忆体
+                self.trajectory_memory = TrajectoryMemory()
+                n_templates = self.trajectory_memory.extract_from_trades(
+                    trades, self.fv_engine, self.regime_map
+                )
+
+            if n_templates > 0:
+                # 更新 UI 统计
+                self._update_trajectory_ui()
+                self._update_memory_stats()
+
+                # 启用 Walk-Forward 验证按钮
+                self.analysis_panel.enable_walk_forward(True)
+
+                # 自动保存（如果配置了）
+                if MEMORY_CONFIG.get("AUTO_SAVE", True):
+                    try:
+                        filepath = self.trajectory_memory.save(verbose=False)
+                        print(f"[TrajectoryMemory] 自动保存: {filepath}")
+                        self._update_memory_stats()
+                    except Exception as save_err:
+                        print(f"[TrajectoryMemory] 自动保存失败: {save_err}")
+
+            else:
+                print("[TrajectoryMemory] 无盈利交易可提取模板")
+
+        except Exception as e:
+            print(f"[TrajectoryMemory] 模板提取失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _on_walk_forward_requested(self):
+        """Walk-Forward 验证请求"""
+        if self.df is None or self.labels is None:
+            QtWidgets.QMessageBox.warning(self, "警告", "请先完成标注")
+            return
+
+        if not hasattr(self, 'trajectory_memory') or self.trajectory_memory is None:
+            QtWidgets.QMessageBox.warning(self, "警告", "请先提取轨迹模板")
+            return
+
+        # 禁用按钮，显示运行中状态
+        self.analysis_panel.enable_walk_forward(False)
+        self.analysis_panel.update_walk_forward_result(0, 0, 0, "运行中...")
+        self.statusBar().showMessage("Walk-Forward 验证运行中...")
+
+        # 在后台线程运行
+        self._wf_thread = threading.Thread(target=self._run_walk_forward)
+        self._wf_thread.start()
+
+    def _run_walk_forward(self):
+        """在后台运行 Walk-Forward 验证"""
+        try:
+            from core.walk_forward import WalkForwardValidator
+
+            validator = WalkForwardValidator()
+            result = validator.run(
+                self.df, self.labels,
+                n_folds=WALK_FORWARD_CONFIG["N_FOLDS"],
+                callback=self._wf_progress_callback
+            )
+
+            # 通过信号更新 UI
+            self._wf_done_signal.emit(result)
+
+        except Exception as e:
+            print(f"[WalkForward] 验证失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 发送空结果
+            from core.walk_forward import WalkForwardResult
+            self._wf_done_signal.emit(WalkForwardResult())
+
+    def _wf_progress_callback(self, fold_idx: int, stage: str, message: str):
+        """Walk-Forward 进度回调"""
+        status = f"Walk-Forward: Fold {fold_idx + 1} - {stage}"
+        QtCore.QMetaObject.invokeMethod(
+            self.statusBar(), "showMessage",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, status)
+        )
+
+    def _on_walk_forward_finished(self, result):
+        """Walk-Forward 验证完成"""
+        self.analysis_panel.enable_walk_forward(True)
+
+        if not result.folds:
+            self.analysis_panel.update_walk_forward_result(0, 0, 0, "失败")
+            self.statusBar().showMessage("Walk-Forward 验证失败")
+            return
+
+        result.summarize()
+
+        self.analysis_panel.update_walk_forward_result(
+            result.avg_test_sharpe,
+            result.consistency_ratio,
+            result.avg_test_profit,
+            "完成"
+        )
+
+        # 如果有最优参数，更新显示
+        if result.folds and result.folds[0].best_params:
+            self.analysis_panel.update_trading_params(result.folds[0].best_params)
+
+        result.print_summary()
+        self.statusBar().showMessage(
+            f"Walk-Forward 完成: 平均Sharpe={result.avg_test_sharpe:.3f}, "
+            f"一致性={result.consistency_ratio:.0%}"
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 记忆持久化管理
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _auto_load_memory(self):
+        """启动时自动加载已有记忆"""
+        if not MEMORY_CONFIG.get("AUTO_LOAD", True):
+            self._update_memory_stats()
+            return
+
+        try:
+            from core.trajectory_engine import TrajectoryMemory
+
+            files = TrajectoryMemory.list_saved_memories()
+            if not files:
+                print("[TrajectoryMemory] 启动: 无历史记忆文件")
+                self._update_memory_stats()
+                return
+
+            # 加载最新的记忆文件
+            memory = TrajectoryMemory.load(files[0]["path"], verbose=True)
+            if memory and memory.total_count > 0:
+                self.trajectory_memory = memory
+                self._update_memory_stats()
+                self._update_trajectory_ui()
+                print(f"[TrajectoryMemory] 自动加载: {memory.total_count} 个模板")
+            else:
+                self._update_memory_stats()
+
+        except Exception as e:
+            print(f"[TrajectoryMemory] 自动加载失败: {e}")
+            self._update_memory_stats()
+
+    def _update_memory_stats(self):
+        """更新记忆统计显示"""
+        template_count = 0
+        if hasattr(self, 'trajectory_memory') and self.trajectory_memory:
+            template_count = self.trajectory_memory.total_count
+
+        from core.trajectory_engine import TrajectoryMemory
+        files = TrajectoryMemory.list_saved_memories()
+        file_count = len(files)
+
+        self.analysis_panel.update_memory_stats(template_count, file_count)
+
+    def _on_save_memory(self):
+        """保存当前记忆体到本地"""
+        if not hasattr(self, 'trajectory_memory') or self.trajectory_memory is None:
+            QtWidgets.QMessageBox.warning(self, "警告", "没有可保存的记忆体")
+            return
+
+        if self.trajectory_memory.total_count == 0:
+            QtWidgets.QMessageBox.warning(self, "警告", "记忆体为空")
+            return
+
+        try:
+            filepath = self.trajectory_memory.save()
+            self._update_memory_stats()
+            QtWidgets.QMessageBox.information(
+                self, "保存成功",
+                f"已保存 {self.trajectory_memory.total_count} 个模板\n"
+                f"文件: {filepath}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "保存失败", str(e))
+
+    def _on_load_memory(self):
+        """加载最新的记忆体"""
+        try:
+            from core.trajectory_engine import TrajectoryMemory
+
+            # 如果配置为合并模式
+            if MEMORY_CONFIG.get("MERGE_ON_LOAD", True):
+                if hasattr(self, 'trajectory_memory') and self.trajectory_memory:
+                    # 从最新文件合并
+                    files = TrajectoryMemory.list_saved_memories()
+                    if files:
+                        added = self.trajectory_memory.merge_from_file(
+                            files[0]["path"],
+                            deduplicate=MEMORY_CONFIG.get("DEDUPLICATE", True)
+                        )
+                        self._update_memory_stats()
+                        self._update_trajectory_ui()
+                        self.statusBar().showMessage(f"已合并 {added} 个模板")
+                        return
+                    else:
+                        QtWidgets.QMessageBox.information(self, "提示", "没有找到已保存的记忆文件")
+                        return
+
+            # 覆盖加载模式
+            memory = TrajectoryMemory.load_latest()
+            if memory is None:
+                QtWidgets.QMessageBox.information(self, "提示", "没有找到已保存的记忆文件")
+                return
+
+            self.trajectory_memory = memory
+            self._update_memory_stats()
+            self._update_trajectory_ui()
+            self.analysis_panel.enable_walk_forward(True)
+            self.statusBar().showMessage(f"已加载 {memory.total_count} 个模板")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "加载失败", str(e))
+            import traceback
+            traceback.print_exc()
+
+    def _on_merge_all_memory(self):
+        """加载并合并所有历史记忆"""
+        try:
+            from core.trajectory_engine import TrajectoryMemory
+
+            if hasattr(self, 'trajectory_memory') and self.trajectory_memory:
+                # 合并所有文件到当前记忆体
+                files = TrajectoryMemory.list_saved_memories()
+                if not files:
+                    QtWidgets.QMessageBox.information(self, "提示", "没有找到已保存的记忆文件")
+                    return
+
+                total_added = 0
+                for f in files:
+                    added = self.trajectory_memory.merge_from_file(
+                        f["path"],
+                        deduplicate=True,
+                        verbose=False
+                    )
+                    total_added += added
+
+                self._update_memory_stats()
+                self._update_trajectory_ui()
+                QtWidgets.QMessageBox.information(
+                    self, "合并完成",
+                    f"从 {len(files)} 个文件中合并了 {total_added} 个新模板\n"
+                    f"当前总模板数: {self.trajectory_memory.total_count}"
+                )
+            else:
+                # 没有当前记忆体，创建并合并全部
+                memory = TrajectoryMemory.load_and_merge_all()
+                self.trajectory_memory = memory
+                self._update_memory_stats()
+                self._update_trajectory_ui()
+                if memory.total_count > 0:
+                    self.analysis_panel.enable_walk_forward(True)
+                    QtWidgets.QMessageBox.information(
+                        self, "加载完成",
+                        f"已加载并合并全部历史记忆\n"
+                        f"总模板数: {memory.total_count}"
+                    )
+                else:
+                    QtWidgets.QMessageBox.information(self, "提示", "没有找到历史记忆文件")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "合并失败", str(e))
+            import traceback
+            traceback.print_exc()
+
+    def _on_clear_memory(self):
+        """清空当前记忆体"""
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认清空",
+            "确定要清空当前加载的记忆吗？\n（本地保存的文件不会被删除）",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            if hasattr(self, 'trajectory_memory') and self.trajectory_memory:
+                self.trajectory_memory.clear()
+            self._update_memory_stats()
+            self._update_trajectory_ui()
+            self.statusBar().showMessage("记忆已清空")
+
+    def _update_trajectory_ui(self):
+        """更新轨迹匹配相关的UI"""
+        if not hasattr(self, 'trajectory_memory') or self.trajectory_memory is None:
+            self.analysis_panel.update_trajectory_template_stats(0, 0, 0, 0)
+            self.analysis_panel.update_fingerprint_templates([])
+            return
+
+        memory = self.trajectory_memory
+        total = memory.total_count
+        long_count = len(memory.get_templates_by_direction("LONG"))
+        short_count = len(memory.get_templates_by_direction("SHORT"))
+        all_templates = memory.get_all_templates()
+        avg_profit = np.mean([t.profit_pct for t in all_templates]) if all_templates else 0
+
+        # 更新轨迹匹配面板统计
+        self.analysis_panel.update_trajectory_template_stats(
+            total, long_count, short_count, avg_profit
+        )
+
+        # 更新指纹图3D地形视图
+        self.analysis_panel.update_fingerprint_templates(all_templates)
+
     def _update_regime_stats(self):
         """更新市场状态统计到 UI"""
         if self.rt_backtester is None or not self.regime_map:
@@ -783,21 +1243,57 @@ class MainWindow(QtWidgets.QMainWindow):
                 }
                 self.optimizer_panel.update_backtest_metrics(metrics)
 
-                # 最终市场状态分类
+                # 最终市场状态分类 + 向量记忆体构建
                 if self.labeler and self.labeler.alternating_swings:
                     classifier = MarketRegimeClassifier(
                         self.labeler.alternating_swings, MARKET_REGIME_CONFIG
                     )
                     self.regime_classifier = classifier
                     self.regime_map = {}
+
+                    # 初始化向量引擎（如果还没有）
+                    if not self._fv_ready:
+                        try:
+                            from core.feature_vector import FeatureVectorEngine
+                            from core.vector_memory import VectorMemory
+                            self.fv_engine = FeatureVectorEngine()
+                            self.fv_engine.precompute(self.df)
+                            self.vector_memory = VectorMemory(
+                                k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
+                                min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
+                            )
+                            self._fv_ready = True
+                        except Exception as fv_err:
+                            print(f"[FeatureVector] 最终初始化失败: {fv_err}")
+                    else:
+                        # 清空旧记忆体重新构建
+                        if self.vector_memory:
+                            self.vector_memory.clear()
+
                     for ti, trade in enumerate(bt_result.trades):
                         regime = classifier.classify_at(trade.entry_idx)
                         trade.market_regime = regime
                         self.regime_map[ti] = regime
+                        # 记录向量坐标
+                        if self._fv_ready and self.fv_engine:
+                            self._record_trade_vectors(trade)
+
                     # 保存回测器引用以便统计
                     self.rt_backtester = backtester
                     self._update_regime_stats()
+                    self._update_vector_space_plot()
                     self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
+
+                    # 打印记忆体统计
+                    if self.vector_memory:
+                        stats = self.vector_memory.get_stats()
+                        total = self.vector_memory.total_points()
+                        print(f"[VectorMemory] 记忆体构建完成: {total} 个点, "
+                              f"{len(stats)} 个市场状态")
+
+                    # ── 轨迹模板提取 ──
+                    self._extract_trajectory_templates(bt_result.trades)
+
             except Exception as e:
                 self.statusBar().showMessage(f"标注回测失败: {str(e)}")
                 traceback.print_exc()
