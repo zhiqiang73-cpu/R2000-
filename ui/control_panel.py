@@ -20,13 +20,13 @@ class ControlPanel(QtWidgets.QWidget):
     - 数据采样配置
     - 标注参数配置
     - 播放速度控制
-    - GA 参数配置
-    - 操作按钮
+    - 状态显示
     """
     
     # 信号
     sample_requested = QtCore.pyqtSignal(int, object)  # (sample_size, seed)
     label_requested = QtCore.pyqtSignal(dict)           # labeling_params
+    quick_label_requested = QtCore.pyqtSignal(dict)     # 仅标注（不播放动画）
     analyze_requested = QtCore.pyqtSignal()
     optimize_requested = QtCore.pyqtSignal(dict)       # ga_params
     play_requested = QtCore.pyqtSignal()               # 开始播放
@@ -115,6 +115,7 @@ class ControlPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(15)
+        self.main_layout = layout
         
         # === 数据采样组 ===
         sample_group = QtWidgets.QGroupBox("数据采样")
@@ -203,6 +204,28 @@ class ControlPanel(QtWidgets.QWidget):
         
         play_layout.addLayout(btn_layout)
         
+        # 仅标注按钮（快速模式，不播放动画）
+        self.quick_label_btn = QtWidgets.QPushButton("⚡ 仅标注")
+        self.quick_label_btn.setToolTip("只计算标注，不播放动画，完成后可直接运行Walk-Forward")
+        self.quick_label_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #2d5a2d;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: #3d7a3d;
+            }}
+            QPushButton:disabled {{
+                background-color: #444;
+                color: #888;
+            }}
+        """)
+        self.quick_label_btn.clicked.connect(self._on_quick_label_clicked)
+        play_layout.addWidget(self.quick_label_btn)
+        
         # 进度显示
         self.play_progress_label = QtWidgets.QLabel("进度: 0 / 0")
         self.play_progress_label.setStyleSheet("color: #888;")
@@ -210,41 +233,8 @@ class ControlPanel(QtWidgets.QWidget):
         
         layout.addWidget(play_group)
         
-        # === 模式挖掘组 ===
-        analyze_group = QtWidgets.QGroupBox("模式挖掘")
-        analyze_layout = QtWidgets.QVBoxLayout(analyze_group)
-        
-        self.analyze_btn = QtWidgets.QPushButton("分析特征与模式")
-        self.analyze_btn.clicked.connect(self._on_analyze_clicked)
-        analyze_layout.addWidget(self.analyze_btn)
-        
-        layout.addWidget(analyze_group)
-        
-        # === GA 优化组 ===
-        ga_group = QtWidgets.QGroupBox("遗传算法优化")
-        ga_layout = QtWidgets.QFormLayout(ga_group)
-        
-        self.population_spin = QtWidgets.QSpinBox()
-        self.population_spin.setRange(10, 200)
-        self.population_spin.setValue(GA_CONFIG["POPULATION_SIZE"])
-        ga_layout.addRow("种群大小:", self.population_spin)
-        
-        self.generations_spin = QtWidgets.QSpinBox()
-        self.generations_spin.setRange(10, 500)
-        self.generations_spin.setValue(GA_CONFIG["MAX_GENERATIONS"])
-        ga_layout.addRow("最大代数:", self.generations_spin)
-        
-        self.mutation_spin = QtWidgets.QDoubleSpinBox()
-        self.mutation_spin.setRange(0.01, 0.5)
-        self.mutation_spin.setSingleStep(0.01)
-        self.mutation_spin.setValue(GA_CONFIG["MUTATION_RATE"])
-        ga_layout.addRow("变异率:", self.mutation_spin)
-        
-        self.optimize_btn = QtWidgets.QPushButton("开始优化")
-        self.optimize_btn.clicked.connect(self._on_optimize_clicked)
-        ga_layout.addRow(self.optimize_btn)
-        
-        layout.addWidget(ga_group)
+        # === 模式挖掘组（已隐藏，保留后端）===
+        # analyze_group 和 ga_group 已移除UI入口，相关方法保留以便未来使用
         
         # === 状态显示 ===
         status_group = QtWidgets.QGroupBox("状态")
@@ -272,11 +262,27 @@ class ControlPanel(QtWidgets.QWidget):
         layout.addWidget(status_group)
         
         # 弹性空间
-        layout.addStretch()
+        self._bottom_spacer = QtWidgets.QSpacerItem(
+            20, 40,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+            QtWidgets.QSizePolicy.Policy.Expanding
+        )
+        layout.addSpacerItem(self._bottom_spacer)
         
         # 设置最小宽度
         self.setMinimumWidth(280)
         self.setMaximumWidth(350)
+
+    def add_bottom_widget(self, widget: QtWidgets.QWidget):
+        """把外部组件插入到控制面板左下区域（在弹性空间之前）"""
+        if widget is None:
+            return
+        # 避免重复插入
+        if widget.parent() is self:
+            return
+        widget.setParent(self)
+        insert_idx = max(0, self.main_layout.count() - 1)
+        self.main_layout.insertWidget(insert_idx, widget)
     
     def _on_sample_clicked(self):
         """采样按钮点击"""
@@ -302,21 +308,30 @@ class ControlPanel(QtWidgets.QWidget):
         """停止按钮点击"""
         self.stop_requested.emit()
     
+    def _on_quick_label_clicked(self):
+        """仅标注按钮点击 - 快速计算标注，不播放动画"""
+        params = {
+            "swing_window": self.swing_window_spin.value(),
+        }
+        self.quick_label_requested.emit(params)
+    
     def _on_speed_changed(self, value):
         """速度滑块变化"""
         self.speed_label.setText(f"{value}x")
         self.speed_changed.emit(value)
     
     def _on_analyze_clicked(self):
-        """分析按钮点击"""
+        """分析按钮点击（UI已移除，保留方法以便未来使用）"""
         self.analyze_requested.emit()
     
     def _on_optimize_clicked(self):
-        """优化按钮点击"""
+        """优化按钮点击（UI已移除，保留方法以便未来使用）"""
+        # UI控件已移除，使用默认配置
+        from config import GA_CONFIG
         params = {
-            "population_size": self.population_spin.value(),
-            "max_generations": self.generations_spin.value(),
-            "mutation_rate": self.mutation_spin.value(),
+            "population_size": GA_CONFIG.get("POPULATION_SIZE", 50),
+            "max_generations": GA_CONFIG.get("MAX_GENERATIONS", 100),
+            "mutation_rate": GA_CONFIG.get("MUTATION_RATE", 0.1),
         }
         self.optimize_requested.emit(params)
     
@@ -363,8 +378,8 @@ class ControlPanel(QtWidgets.QWidget):
     def set_buttons_enabled(self, enabled: bool):
         """设置按钮可用性"""
         self.sample_btn.setEnabled(enabled)
-        self.analyze_btn.setEnabled(enabled)
-        self.optimize_btn.setEnabled(enabled)
+        self.quick_label_btn.setEnabled(enabled)
+        # analyze_btn 和 optimize_btn 已从UI移除，保留方法以便未来扩展
     
     def get_labeling_params(self) -> Dict:
         """获取当前标注参数"""
@@ -373,9 +388,10 @@ class ControlPanel(QtWidgets.QWidget):
         }
     
     def get_ga_params(self) -> Dict:
-        """获取当前 GA 参数"""
+        """获取当前 GA 参数（UI已移除，返回默认配置）"""
+        from config import GA_CONFIG
         return {
-            "population_size": self.population_spin.value(),
-            "max_generations": self.generations_spin.value(),
-            "mutation_rate": self.mutation_spin.value(),
+            "population_size": GA_CONFIG.get("POPULATION_SIZE", 50),
+            "max_generations": GA_CONFIG.get("MAX_GENERATIONS", 100),
+            "mutation_rate": GA_CONFIG.get("MUTATION_RATE", 0.1),
         }

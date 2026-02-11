@@ -145,15 +145,17 @@ VECTOR_SPACE_CONFIG = {
 TRAJECTORY_CONFIG = {
     "PRE_ENTRY_WINDOW": 60,      # 入场前回看窗口（K线数）
     "PRE_EXIT_WINDOW": 30,       # 离场前回看窗口（K线数）
-    "COSINE_TOP_K": 20,          # 余弦粗筛保留候选数量
-    "DTW_RADIUS": 10,            # FastDTW半径约束（加速计算）
+    "COSINE_TOP_K": 5,           # 余弦粗筛保留候选数量（降低以加速DTW）
+    "DTW_RADIUS": 5,             # FastDTW半径约束（加速计算）
     "MIN_PROFIT_PCT": 0.5,       # 只提取收益率>0.5%的交易作为模板
     "FEATURE_DIM": 32,           # 特征维度 (16+10+6)
-    # 匹配阈值默认值（由GA优化）
+    # 匹配阈值默认值（由贝叶斯优化）
     "COSINE_THRESHOLD": 0.6,     # 余弦相似度阈值
     "DTW_THRESHOLD": 0.5,        # DTW归一化距离阈值（越小越严格）
     "HOLD_DIVERGENCE_LIMIT": 0.7,# 持仓偏离上限
     "EXIT_MATCH_THRESHOLD": 0.5, # 离场匹配阈值
+    # 优化加速参数
+    "EVAL_SKIP_BARS": 5,         # 模拟交易时每N根K线评估一次（加速）
 }
 
 # ==================== Walk-Forward验证配置 ====================
@@ -165,6 +167,12 @@ WALK_FORWARD_CONFIG = {
     "STEP_SIZE": 5000,           # 每折滑动的K线数
     "MIN_TRAIN_TRADES": 30,      # 训练集最少交易数
     "MIN_VAL_TRADES": 10,        # 验证集最少交易数
+
+    # 模板评估筛选参数
+    "EVAL_MIN_MATCHES": 3,       # 最小匹配次数（低于此为"待观察"）
+    "EVAL_MIN_WIN_RATE": 0.6,    # 最小胜率（低于此为"淘汰"）
+    "EVAL_MIN_AVG_PROFIT": 0.0,  # 最小平均收益（默认0，即只看胜率）
+    "BATCH_ROUND_WORKERS": 2,    # 批量WF并行轮次线程数（1=串行）
 }
 
 # ==================== 记忆持久化配置 ====================
@@ -175,6 +183,21 @@ MEMORY_CONFIG = {
     "MERGE_ON_LOAD": True,            # 加载时合并（而非覆盖）
     "DEDUPLICATE": True,              # 合并时去重
     "MAX_MEMORY_FILES": 50,           # 最多保留的记忆文件数
+}
+
+# ==================== 原型聚类配置 ====================
+PROTOTYPE_CONFIG = {
+    "N_CLUSTERS_LONG": 30,            # LONG 方向聚类数
+    "N_CLUSTERS_SHORT": 30,           # SHORT 方向聚类数
+    "MIN_CLUSTER_SIZE": 3,            # 最小簇大小（小于此丢弃）
+    "PROTOTYPE_DIR": "data/prototypes",  # 原型存储目录
+    "AUTO_LOAD_PROTOTYPE": True,      # 启动时自动加载最新原型库
+    # 原型匹配参数
+    "COSINE_THRESHOLD": 0.5,          # 余弦相似度阈值
+    "MIN_PROTOTYPES_AGREE": 2,        # 最少原型同意数（投票）
+    "HOLDING_SAFE_THRESHOLD": 0.7,    # 持仓健康阈值
+    "HOLDING_ALERT_THRESHOLD": 0.5,   # 持仓警告阈值
+    "HOLDING_DANGER_THRESHOLD": 0.3,  # 持仓危险阈值
 }
 
 # ==================== 市场状态分类配置 ====================
@@ -196,6 +219,12 @@ UI_CONFIG = {
     "THEME_SURFACE": "#252526",
     "THEME_TEXT": "#cccccc",
     "THEME_ACCENT": "#007acc",
+
+    # 字体大小（适配高分辨率屏幕，可调大）
+    "FONT_SIZE_NORMAL": 12,       # 正常文字
+    "FONT_SIZE_SMALL": 11,        # 小文字（表格等）
+    "FONT_SIZE_LARGE": 14,        # 大标题
+    "FONT_SIZE_XLARGE": 16,       # 特大（当前状态等）
     
     # 图表配置
     "CHART_CANDLE_WIDTH": 0.8,
@@ -219,6 +248,37 @@ UI_CONFIG = {
     
     # 刷新配置
     "CHART_FPS": 30,
+}
+
+# ==================== 模拟交易配置 ====================
+PAPER_TRADING_CONFIG = {
+    "DEFAULT_SYMBOL": "BTCUSDT",
+    "DEFAULT_INTERVAL": "1m",
+    "DEFAULT_BALANCE": 5000.0,
+    "DEFAULT_LEVERAGE": 10,
+    # 数据环境：模拟盘默认用 Futures Testnet
+    "USE_TESTNET": True,
+    "MARKET_TYPE": "futures",  # "spot" / "futures"
+    
+    # 匹配参数
+    "COSINE_THRESHOLD": 0.6,
+    "DTW_THRESHOLD": 0.5,
+    "MIN_TEMPLATES_AGREE": 1,
+    
+    # 止盈止损
+    "STOP_LOSS_ATR": 2.0,
+    "TAKE_PROFIT_ATR": 3.0,
+    "MAX_HOLD_BARS": 240,
+    
+    # 动态追踪
+    "HOLD_SAFE_THRESHOLD": 0.7,
+    "HOLD_ALERT_THRESHOLD": 0.5,
+    "HOLD_DERAIL_THRESHOLD": 0.3,
+    "HOLD_CHECK_INTERVAL": 3,
+    
+    # 数据目录
+    "HISTORY_DIR": "data/paper_trading",
+    "VERIFIED_DIR": "data/sim_verified",
 }
 
 # ==================== 日志配置 ====================

@@ -98,22 +98,33 @@ class FingerprintWidget(QtWidgets.QWidget):
         mode_layout = QtWidgets.QHBoxLayout()
 
         self.mode_group = QtWidgets.QButtonGroup(self)
-        self.mode_single = QtWidgets.QRadioButton("单模板")
-        self.mode_compare = QtWidgets.QRadioButton("对比模式")
-        self.mode_best = QtWidgets.QRadioButton("最佳匹配")
-        self.mode_single.setChecked(True)
+        self.mode_overlay = QtWidgets.QRadioButton("Overlay")
+        self.mode_single = QtWidgets.QRadioButton("Single")
+        self.mode_compare = QtWidgets.QRadioButton("Compare")
+        self.mode_overlay.setChecked(True)  # 默认叠加模式
 
-        self.mode_group.addButton(self.mode_single, 0)
-        self.mode_group.addButton(self.mode_compare, 1)
-        self.mode_group.addButton(self.mode_best, 2)
+        self.mode_group.addButton(self.mode_overlay, 0)
+        self.mode_group.addButton(self.mode_single, 1)
+        self.mode_group.addButton(self.mode_compare, 2)
 
+        self.mode_overlay.toggled.connect(self._refresh_plot)
         self.mode_single.toggled.connect(self._refresh_plot)
         self.mode_compare.toggled.connect(self._refresh_plot)
-        self.mode_best.toggled.connect(self._refresh_plot)
 
+        mode_layout.addWidget(self.mode_overlay)
         mode_layout.addWidget(self.mode_single)
         mode_layout.addWidget(self.mode_compare)
-        mode_layout.addWidget(self.mode_best)
+
+        # 显示数量控制
+        mode_layout.addSpacing(15)
+        mode_layout.addWidget(QtWidgets.QLabel("N:"))
+        self.count_spin = QtWidgets.QSpinBox()
+        self.count_spin.setRange(1, 20)
+        self.count_spin.setValue(5)
+        self.count_spin.setMaximumWidth(50)
+        self.count_spin.valueChanged.connect(self._refresh_plot)
+        mode_layout.addWidget(self.count_spin)
+
         mode_layout.addStretch()
 
         layout.addLayout(mode_layout)
@@ -159,11 +170,11 @@ class FingerprintWidget(QtWidgets.QWidget):
         self.figure.clear()
         self.ax = self.figure.add_subplot(111, projection='3d',
                                            facecolor=UI_CONFIG['CHART_BACKGROUND'])
-        self.ax.set_xlabel('时间 (K线)', color=UI_CONFIG['THEME_TEXT'],
+        self.ax.set_xlabel('Time (Bars)', color=UI_CONFIG['THEME_TEXT'],
                           fontsize=9, labelpad=8)
-        self.ax.set_ylabel('特征维度', color=UI_CONFIG['THEME_TEXT'],
+        self.ax.set_ylabel('Features', color=UI_CONFIG['THEME_TEXT'],
                           fontsize=9, labelpad=8)
-        self.ax.set_zlabel('特征值', color=UI_CONFIG['THEME_TEXT'],
+        self.ax.set_zlabel('Value', color=UI_CONFIG['THEME_TEXT'],
                           fontsize=9, labelpad=8)
         self.ax.tick_params(colors=UI_CONFIG['THEME_TEXT'], labelsize=7)
 
@@ -296,80 +307,83 @@ class FingerprintWidget(QtWidgets.QWidget):
 
         self._init_3d_axes()
 
-        mode = self.mode_group.checkedId()  # 0=单模板, 1=对比, 2=最佳匹配
+        mode = self.mode_group.checkedId()  # 0=叠加, 1=单模板, 2=对比
 
         if mode == 0:
+            # 叠加浏览（多个指纹曲面叠加）
+            self._plot_overlay()
+        elif mode == 1:
             # 单模板浏览
             self._plot_single_template()
-        elif mode == 1:
+        else:
             # 对比模式
             self._plot_compare()
-        else:
-            # 最佳匹配
-            self._plot_best_match()
 
         self.canvas.draw_idle()
 
+    def _plot_overlay(self):
+        """叠加绘制多个指纹曲面"""
+        max_count = self.count_spin.value()
+        templates_to_show = self._filtered_templates[:max_count]
+
+        if not templates_to_show:
+            self.ax.set_title("No templates to display", color=UI_CONFIG['THEME_TEXT'], fontsize=10)
+            return
+
+        # 颜色调色板：LONG用蓝色系，SHORT用红色系
+        colors_long = ['#00BFFF', '#1E90FF', '#4169E1', '#0000CD', '#00008B']
+        colors_short = ['#FF6347', '#FF4500', '#DC143C', '#B22222', '#8B0000']
+
+        long_idx = 0
+        short_idx = 0
+
+        for orig_idx, t in templates_to_show:
+            if t.direction == "LONG":
+                color = colors_long[long_idx % len(colors_long)]
+                long_idx += 1
+            else:
+                color = colors_short[short_idx % len(colors_short)]
+                short_idx += 1
+
+            # 使用pre_entry作为指纹（半透明+网格线）
+            self._draw_wireframe_surface(t.pre_entry, color=color, alpha=0.35)
+
+        # 如果有当前K线指纹，用金色高亮显示
+        if self._current_fingerprint is not None and self._current_fingerprint.size > 0:
+            self._draw_wireframe_surface(self._current_fingerprint, color='#FFD700', alpha=0.7)
+
+        self.ax.set_title(f"Overlay: {len(templates_to_show)} templates",
+                         color=UI_CONFIG['THEME_TEXT'], fontsize=10)
+
     def _plot_single_template(self):
-        """绘制单个模板的3D地形"""
+        """绘制单个模板的3D地形（线框风格）"""
         if self._selected_template_idx < 0 or self._selected_template_idx >= len(self._filtered_templates):
-            self.ax.set_title("请选择一个模板", color=UI_CONFIG['THEME_TEXT'], fontsize=10)
+            self.ax.set_title("Select a template", color=UI_CONFIG['THEME_TEXT'], fontsize=10)
             return
 
         orig_idx, template = self._filtered_templates[self._selected_template_idx]
         matrix = template.pre_entry  # (60, 32)
 
-        self._draw_surface(matrix, color='gold', alpha=0.8, label='模板指纹')
-        self.ax.set_title(f"模板 #{orig_idx}: {template.direction} {template.regime}",
+        self._draw_wireframe_surface(matrix, color='#FFD700', alpha=0.6)
+        self.ax.set_title(f"Template #{orig_idx}: {template.direction} {template.regime}",
                          color=UI_CONFIG['THEME_TEXT'], fontsize=10)
 
     def _plot_compare(self):
-        """对比当前指纹与选中模板"""
+        """对比当前指纹与选中模板（线框风格）"""
         has_current = self._current_fingerprint is not None and self._current_fingerprint.size > 0
         has_template = (self._selected_template_idx >= 0 and
                         self._selected_template_idx < len(self._filtered_templates))
 
         if has_template:
             orig_idx, template = self._filtered_templates[self._selected_template_idx]
-            self._draw_surface(template.pre_entry, color='gold', alpha=0.6, label='模板')
+            self._draw_wireframe_surface(template.pre_entry, color='#FFD700', alpha=0.5)
 
         if has_current:
-            self._draw_surface(self._current_fingerprint, color='deepskyblue', alpha=0.5, label='当前')
+            self._draw_wireframe_surface(self._current_fingerprint, color='#00BFFF', alpha=0.5)
 
-        if has_current or has_template:
-            self.ax.legend(loc='upper left', fontsize=8, framealpha=0.6,
-                          facecolor='#333', edgecolor='#555',
-                          labelcolor=UI_CONFIG['THEME_TEXT'])
-
-        title = "对比模式"
+        title = "Compare"
         if has_current and has_template:
-            title += f" | 余弦: {self._best_cosine:.1%}"
-        self.ax.set_title(title, color=UI_CONFIG['THEME_TEXT'], fontsize=10)
-
-    def _plot_best_match(self):
-        """绘制当前指纹与最佳匹配模板"""
-        has_current = self._current_fingerprint is not None and self._current_fingerprint.size > 0
-
-        if has_current:
-            self._draw_surface(self._current_fingerprint, color='deepskyblue', alpha=0.5, label='当前')
-
-        if self._best_match_idx >= 0 and self._best_match_idx < len(self._filtered_templates):
-            orig_idx, template = self._filtered_templates[self._best_match_idx]
-            self._draw_surface(template.pre_entry, color='gold', alpha=0.6, label=f'最佳匹配 #{orig_idx}')
-
-            # 更新收益标签
-            color = UI_CONFIG['CHART_UP_COLOR'] if template.profit_pct > 0 else UI_CONFIG['CHART_DOWN_COLOR']
-            self.profit_label.setText(f"收益: {template.profit_pct:.2f}%")
-            self.profit_label.setStyleSheet(f"font-weight: bold; font-size: 12px; color: {color};")
-
-        if has_current or self._best_match_idx >= 0:
-            self.ax.legend(loc='upper left', fontsize=8, framealpha=0.6,
-                          facecolor='#333', edgecolor='#555',
-                          labelcolor=UI_CONFIG['THEME_TEXT'])
-
-        title = "最佳匹配"
-        if self._best_cosine > 0:
-            title += f" | 余弦: {self._best_cosine:.1%} | DTW: {self._best_dtw:.1%}"
+            title += f" | Cosine: {self._best_cosine:.1%}"
         self.ax.set_title(title, color=UI_CONFIG['THEME_TEXT'], fontsize=10)
 
     def _draw_surface(self, matrix: np.ndarray, color: str = 'viridis',
@@ -400,13 +414,15 @@ class FingerprintWidget(QtWidgets.QWidget):
         # Z值（转置使特征在Y轴）
         Z = matrix.T  # (32, 60)
 
-        # 绘制曲面
+        # 绘制曲面（带网格线）
         if isinstance(color, str) and color in plt.colormaps():
             surf = self.ax.plot_surface(X, Y, Z, cmap=color, alpha=alpha,
-                                        linewidth=0, antialiased=True)
+                                        linewidth=0.3, edgecolor='#333',
+                                        antialiased=True)
         else:
             surf = self.ax.plot_surface(X, Y, Z, color=color, alpha=alpha,
-                                        linewidth=0, antialiased=True, label=label)
+                                        linewidth=0.3, edgecolor='#333',
+                                        antialiased=True, label=label)
 
         # 设置轴标签
         self.ax.set_xlim(0, n_time - 1)
@@ -415,6 +431,49 @@ class FingerprintWidget(QtWidgets.QWidget):
         # 设置刻度
         self.ax.set_xticks([0, n_time // 2, n_time - 1])
         self.ax.set_yticks([0, n_features // 2, n_features - 1])
+
+    def _draw_wireframe_surface(self, matrix: np.ndarray, color: str = '#00BFFF',
+                                 alpha: float = 0.4):
+        """
+        绘制半透明线框曲面（如用户参考图片的风格）
+
+        Args:
+            matrix: (time, features) 指纹矩阵
+            color: 曲面和网格线颜色
+            alpha: 透明度 (0.3~0.5 效果最好)
+        """
+        if matrix is None or matrix.size == 0:
+            return
+
+        if matrix.ndim != 2:
+            return
+
+        n_time, n_features = matrix.shape
+
+        # 创建网格
+        X = np.arange(n_time)
+        Y = np.arange(n_features)
+        X, Y = np.meshgrid(X, Y)
+
+        # Z值（转置使特征在Y轴）
+        Z = matrix.T  # (features, time)
+
+        # 半透明填充 + 细网格线
+        self.ax.plot_surface(
+            X, Y, Z,
+            color=color,
+            alpha=alpha,
+            rstride=2,            # 行步长（减少密度提升性能）
+            cstride=2,            # 列步长
+            linewidth=0.4,        # 细网格线
+            edgecolor=color,      # 网格线同色
+            antialiased=True,
+            shade=False           # 禁用光照，保持颜色一致
+        )
+
+        # 设置轴范围
+        self.ax.set_xlim(0, n_time - 1)
+        self.ax.set_ylim(0, n_features - 1)
 
     def clear_plot(self):
         """清空图表"""

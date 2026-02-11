@@ -1,6 +1,6 @@
 """
 R3000 分析面板
-右侧分析面板：特征重要性、模式统计、生存分析
+右侧分析面板：交易明细、市场状态、指纹图、轨迹匹配
 深色主题
 """
 from PyQt6 import QtWidgets, QtCore, QtGui
@@ -286,7 +286,7 @@ class TradeLogWidget(QtWidgets.QWidget):
         self.table = QtWidgets.QTableWidget()
         self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
-            "方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "市场状态", "ABC坐标"
+            "方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "市场状态", "指纹摘要"
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setStyleSheet(f"""
@@ -357,12 +357,16 @@ class TradeLogWidget(QtWidgets.QWidget):
                 pass
             self.table.setItem(i, 8, regime_item)
 
-            # ABC 坐标
-            abc_str = t.get("abc", "")
-            abc_item = QtWidgets.QTableWidgetItem(abc_str)
-            abc_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
-            abc_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(i, 9, abc_item)
+            # 指纹摘要（模板ID + 相似度）
+            fp_str = t.get("fingerprint", "--")
+            fp_item = QtWidgets.QTableWidgetItem(fp_str)
+            # 有匹配时用主题高亮色，无匹配时灰色
+            if fp_str and fp_str != "--":
+                fp_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['THEME_ACCENT'])))
+            else:
+                fp_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
+            fp_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(i, 9, fp_item)
 
 
 class MarketRegimeWidget(QtWidgets.QWidget):
@@ -546,19 +550,62 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
     """轨迹匹配结果显示组件"""
 
     # 信号
-    walk_forward_requested = QtCore.pyqtSignal()
+    batch_wf_requested = QtCore.pyqtSignal()       # 批量Walk-Forward
+    batch_wf_stop_requested = QtCore.pyqtSignal()  # 停止批量验证
     save_memory_requested = QtCore.pyqtSignal()
     load_memory_requested = QtCore.pyqtSignal()
     clear_memory_requested = QtCore.pyqtSignal()
     merge_all_requested = QtCore.pyqtSignal()
+    apply_template_filter_requested = QtCore.pyqtSignal()  # 应用模板筛选
+    # 原型相关信号
+    generate_prototypes_requested = QtCore.pyqtSignal(int, int)  # (n_long, n_short)
+    load_prototypes_requested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._batch_last_progress = 0
         self._init_ui()
 
     def _init_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
+        # 外层布局（仅包含滚动区域）
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 滚动区域
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{
+                border: none;
+                background-color: {UI_CONFIG['THEME_BACKGROUND']};
+            }}
+            QScrollBar:vertical {{
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+                width: 8px;
+                border-radius: 4px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: #555;
+                border-radius: 4px;
+                min-height: 30px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: #777;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """)
+
+        # 内容容器
+        content_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content_widget)
         layout.setContentsMargins(5, 5, 5, 5)
+        self._trajectory_content_layout = layout
+
+        scroll_area.setWidget(content_widget)
+        outer_layout.addWidget(scroll_area)
 
         group_style = f"""
             QGroupBox {{
@@ -571,53 +618,315 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
             }}
         """
 
-        # ── 当前匹配状态 ──
-        match_group = QtWidgets.QGroupBox("实时匹配状态")
-        match_group.setStyleSheet(group_style)
-        match_layout = QtWidgets.QFormLayout(match_group)
-
+        # ── 实时匹配状态（已移除UI，保留变量供兼容）──
         self.current_regime_label = QtWidgets.QLabel("--")
         self.best_match_label = QtWidgets.QLabel("--")
         self.cosine_sim_label = QtWidgets.QLabel("--")
         self.dtw_sim_label = QtWidgets.QLabel("--")
         self.match_direction_label = QtWidgets.QLabel("--")
 
-        match_layout.addRow("市场状态:", self.current_regime_label)
-        match_layout.addRow("最佳匹配:", self.best_match_label)
-        match_layout.addRow("余弦相似度:", self.cosine_sim_label)
-        match_layout.addRow("DTW相似度:", self.dtw_sim_label)
-        match_layout.addRow("匹配方向:", self.match_direction_label)
+        # ══════════════════════════════════════════════════════════
+        # ── 指纹模板库（合并：模板库统计 + 模板评估） ──
+        # ══════════════════════════════════════════════════════════
+        template_group = QtWidgets.QGroupBox("指纹模板库")
+        template_group.setStyleSheet(f"""
+            QGroupBox {{
+                border: 2px solid {UI_CONFIG['THEME_ACCENT']};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 18px;
+                color: {UI_CONFIG['THEME_TEXT']};
+                font-weight: bold;
+                font-size: {UI_CONFIG.get('FONT_SIZE_LARGE', 14)}px;
+            }}
+        """)
+        template_layout = QtWidgets.QVBoxLayout(template_group)
 
-        layout.addWidget(match_group)
+        # ── 已验证模板 (核心醒目显示) ──
+        verified_frame = QtWidgets.QFrame()
+        verified_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: #1a2a1a;
+                border: 1px solid #2a5a2a;
+                border-radius: 5px;
+                padding: 8px;
+            }}
+        """)
+        verified_inner = QtWidgets.QVBoxLayout(verified_frame)
+        verified_inner.setContentsMargins(8, 6, 8, 6)
 
-        # ── 模板库统计 ──
-        template_group = QtWidgets.QGroupBox("模板库统计")
-        template_group.setStyleSheet(group_style)
-        template_layout = QtWidgets.QFormLayout(template_group)
+        # 标题行
+        verified_title = QtWidgets.QLabel("Walk-Forward 已验证模板")
+        verified_title.setStyleSheet(f"""
+            color: {UI_CONFIG['CHART_UP_COLOR']};
+            font-size: {UI_CONFIG.get('FONT_SIZE_LARGE', 14)}px;
+            font-weight: bold;
+        """)
+        verified_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        verified_inner.addWidget(verified_title)
+
+        # LONG / SHORT 数字 — 大字醒目
+        verified_counts_layout = QtWidgets.QHBoxLayout()
+
+        # LONG 已验证
+        long_box = QtWidgets.QVBoxLayout()
+        self.verified_long_count = QtWidgets.QLabel("0")
+        self.verified_long_count.setStyleSheet(f"""
+            color: {UI_CONFIG['CHART_UP_COLOR']};
+            font-size: 28px;
+            font-weight: bold;
+        """)
+        self.verified_long_count.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        long_box_title = QtWidgets.QLabel("LONG")
+        long_box_title.setStyleSheet(f"color: {UI_CONFIG['CHART_UP_COLOR']}; font-size: 12px;")
+        long_box_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        long_box.addWidget(self.verified_long_count)
+        long_box.addWidget(long_box_title)
+        verified_counts_layout.addLayout(long_box)
+
+        # 分隔
+        sep_label = QtWidgets.QLabel("|")
+        sep_label.setStyleSheet("color: #555; font-size: 28px;")
+        sep_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        sep_label.setFixedWidth(20)
+        verified_counts_layout.addWidget(sep_label)
+
+        # SHORT 已验证
+        short_box = QtWidgets.QVBoxLayout()
+        self.verified_short_count = QtWidgets.QLabel("0")
+        self.verified_short_count.setStyleSheet(f"""
+            color: {UI_CONFIG['CHART_DOWN_COLOR']};
+            font-size: 28px;
+            font-weight: bold;
+        """)
+        self.verified_short_count.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        short_box_title = QtWidgets.QLabel("SHORT")
+        short_box_title.setStyleSheet(f"color: {UI_CONFIG['CHART_DOWN_COLOR']}; font-size: 12px;")
+        short_box_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        short_box.addWidget(self.verified_short_count)
+        short_box.addWidget(short_box_title)
+        verified_counts_layout.addLayout(short_box)
+
+        verified_inner.addLayout(verified_counts_layout)
+
+        # 验证状态行（评级详情）
+        verified_detail_layout = QtWidgets.QHBoxLayout()
+        self.eval_excellent_label = QtWidgets.QLabel("0")
+        self.eval_excellent_label.setStyleSheet(f"color: {UI_CONFIG['CHART_UP_COLOR']}; font-weight: bold;")
+        self.eval_qualified_label = QtWidgets.QLabel("0")
+        self.eval_qualified_label.setStyleSheet(f"color: {UI_CONFIG['THEME_ACCENT']}; font-weight: bold;")
+        self.eval_pending_label = QtWidgets.QLabel("0")
+        self.eval_pending_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
+        self.eval_eliminated_label = QtWidgets.QLabel("0")
+        self.eval_eliminated_label.setStyleSheet(f"color: {UI_CONFIG['CHART_DOWN_COLOR']}; font-weight: bold;")
+
+        for lbl_text, lbl_widget in [("优质:", self.eval_excellent_label),
+                                      ("合格:", self.eval_qualified_label),
+                                      ("待观:", self.eval_pending_label),
+                                      ("淘汰:", self.eval_eliminated_label)]:
+            mini = QtWidgets.QHBoxLayout()
+            tag = QtWidgets.QLabel(lbl_text)
+            tag.setStyleSheet("color: #aaa; font-size: 11px;")
+            mini.addWidget(tag)
+            mini.addWidget(lbl_widget)
+            verified_detail_layout.addLayout(mini)
+
+        verified_inner.addLayout(verified_detail_layout)
+
+        template_layout.addWidget(verified_frame)
+
+        # ── 记忆库概况（次要信息） ──
+        stats_layout = QtWidgets.QHBoxLayout()
+        stats_left = QtWidgets.QFormLayout()
+        stats_right = QtWidgets.QFormLayout()
 
         self.total_templates_label = QtWidgets.QLabel("0")
         self.long_templates_label = QtWidgets.QLabel("0")
         self.short_templates_label = QtWidgets.QLabel("0")
         self.avg_profit_label = QtWidgets.QLabel("--")
+        self.eval_total_label = QtWidgets.QLabel("--")
+        self.eval_evaluated_label = QtWidgets.QLabel("--")
 
-        template_layout.addRow("模板总数:", self.total_templates_label)
-        template_layout.addRow("做多模板:", self.long_templates_label)
-        template_layout.addRow("做空模板:", self.short_templates_label)
-        template_layout.addRow("平均收益:", self.avg_profit_label)
+        stats_left.addRow("记忆库总数:", self.total_templates_label)
+        stats_left.addRow("做多:", self.long_templates_label)
+        stats_right.addRow("做空:", self.short_templates_label)
+        stats_right.addRow("已匹配:", self.eval_evaluated_label)
+
+        stats_layout.addLayout(stats_left)
+        stats_layout.addLayout(stats_right)
+        template_layout.addLayout(stats_layout)
+
+        # Top模板表格
+        self.eval_table = QtWidgets.QTableWidget()
+        self.eval_table.setColumnCount(5)
+        self.eval_table.setHorizontalHeaderLabels(["方向", "状态", "匹配", "胜率", "评级"])
+        self.eval_table.horizontalHeader().setStretchLastSection(True)
+        self.eval_table.setMinimumHeight(80)
+        self.eval_table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.eval_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.eval_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+                color: {UI_CONFIG['THEME_TEXT']};
+                gridline-color: #444;
+                font-size: 11px;
+            }}
+            QHeaderView::section {{
+                background-color: #333;
+                color: {UI_CONFIG['THEME_TEXT']};
+                padding: 3px;
+                border: 1px solid #444;
+            }}
+        """)
+        self.eval_table.setVisible(False)
+        template_layout.addWidget(self.eval_table)
+
+        # 应用筛选按钮 + 保存按钮（同一行）
+        filter_btn_layout = QtWidgets.QHBoxLayout()
+        self.apply_filter_btn = QtWidgets.QPushButton("应用筛选 (淘汰差模板)")
+        self.apply_filter_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #aa6600;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                background-color: #cc8800;
+            }}
+            QPushButton:disabled {{
+                background-color: #555;
+                color: #888;
+            }}
+        """)
+        self.apply_filter_btn.setEnabled(False)
+        self.apply_filter_btn.setToolTip("删除所有评级为'淘汰'的模板，保留优质/合格/待观察，并自动保存")
+        self.apply_filter_btn.clicked.connect(self.apply_template_filter_requested.emit)
+        filter_btn_layout.addWidget(self.apply_filter_btn)
+        template_layout.addLayout(filter_btn_layout)
+
+        # 评级标准说明
+        eval_note = QtWidgets.QLabel("评级: 匹配>=3次 & 胜率>=60% => 优质/合格 | <3次 => 待观察 | 胜率<60% => 淘汰")
+        eval_note.setStyleSheet("color: #666; font-size: 10px;")
+        eval_note.setWordWrap(True)
+        template_layout.addWidget(eval_note)
 
         layout.addWidget(template_group)
 
-        # ── Walk-Forward 验证结果 ──
-        wf_group = QtWidgets.QGroupBox("Walk-Forward 验证")
-        wf_group.setStyleSheet(group_style)
-        wf_layout = QtWidgets.QVBoxLayout(wf_group)
+        # ══════════════════════════════════════════════════════════
+        # ── 原型库（聚类后的交易模式） ──
+        # ══════════════════════════════════════════════════════════
+        prototype_group = QtWidgets.QGroupBox("原型库（聚类模式）")
+        prototype_group.setStyleSheet(f"""
+            QGroupBox {{
+                border: 2px solid #9933cc;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 18px;
+                color: {UI_CONFIG['THEME_TEXT']};
+                font-weight: bold;
+                font-size: {UI_CONFIG.get('FONT_SIZE_LARGE', 14)}px;
+            }}
+        """)
+        proto_layout = QtWidgets.QVBoxLayout(prototype_group)
 
-        # 验证按钮
-        btn_layout = QtWidgets.QHBoxLayout()
-        self.wf_btn = QtWidgets.QPushButton("运行 Walk-Forward 验证")
-        self.wf_btn.setStyleSheet(f"""
+        # 原型统计
+        proto_stats_frame = QtWidgets.QFrame()
+        proto_stats_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: #2a1a3a;
+                border: 1px solid #4a2a6a;
+                border-radius: 5px;
+                padding: 6px;
+            }}
+        """)
+        proto_stats_inner = QtWidgets.QVBoxLayout(proto_stats_frame)
+        proto_stats_inner.setContentsMargins(8, 6, 8, 6)
+
+        # 原型数量显示
+        proto_counts_layout = QtWidgets.QHBoxLayout()
+
+        # LONG 原型
+        proto_long_box = QtWidgets.QVBoxLayout()
+        self.proto_long_count = QtWidgets.QLabel("0")
+        self.proto_long_count.setStyleSheet(f"""
+            color: {UI_CONFIG['CHART_UP_COLOR']};
+            font-size: 24px;
+            font-weight: bold;
+        """)
+        self.proto_long_count.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        proto_long_title = QtWidgets.QLabel("LONG原型")
+        proto_long_title.setStyleSheet(f"color: {UI_CONFIG['CHART_UP_COLOR']}; font-size: 11px;")
+        proto_long_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        proto_long_box.addWidget(self.proto_long_count)
+        proto_long_box.addWidget(proto_long_title)
+        proto_counts_layout.addLayout(proto_long_box)
+
+        proto_sep = QtWidgets.QLabel("|")
+        proto_sep.setStyleSheet("color: #555; font-size: 24px;")
+        proto_sep.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        proto_sep.setFixedWidth(20)
+        proto_counts_layout.addWidget(proto_sep)
+
+        # SHORT 原型
+        proto_short_box = QtWidgets.QVBoxLayout()
+        self.proto_short_count = QtWidgets.QLabel("0")
+        self.proto_short_count.setStyleSheet(f"""
+            color: {UI_CONFIG['CHART_DOWN_COLOR']};
+            font-size: 24px;
+            font-weight: bold;
+        """)
+        self.proto_short_count.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        proto_short_title = QtWidgets.QLabel("SHORT原型")
+        proto_short_title.setStyleSheet(f"color: {UI_CONFIG['CHART_DOWN_COLOR']}; font-size: 11px;")
+        proto_short_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        proto_short_box.addWidget(self.proto_short_count)
+        proto_short_box.addWidget(proto_short_title)
+        proto_counts_layout.addLayout(proto_short_box)
+
+        proto_stats_inner.addLayout(proto_counts_layout)
+
+        # 原型详情
+        proto_detail_layout = QtWidgets.QHBoxLayout()
+        self.proto_source_label = QtWidgets.QLabel("来源: 0 模板")
+        self.proto_source_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.proto_avg_winrate_label = QtWidgets.QLabel("平均胜率: --")
+        self.proto_avg_winrate_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        proto_detail_layout.addWidget(self.proto_source_label)
+        proto_detail_layout.addStretch()
+        proto_detail_layout.addWidget(self.proto_avg_winrate_label)
+        proto_stats_inner.addLayout(proto_detail_layout)
+
+        proto_layout.addWidget(proto_stats_frame)
+
+        # 聚类参数行
+        proto_params_layout = QtWidgets.QHBoxLayout()
+        proto_params_layout.addWidget(QtWidgets.QLabel("LONG:"))
+        self.proto_n_long_spin = QtWidgets.QSpinBox()
+        self.proto_n_long_spin.setRange(5, 100)
+        self.proto_n_long_spin.setValue(30)
+        self.proto_n_long_spin.setFixedWidth(55)
+        self.proto_n_long_spin.setToolTip("LONG 方向聚类数")
+        proto_params_layout.addWidget(self.proto_n_long_spin)
+
+        proto_params_layout.addWidget(QtWidgets.QLabel("SHORT:"))
+        self.proto_n_short_spin = QtWidgets.QSpinBox()
+        self.proto_n_short_spin.setRange(5, 100)
+        self.proto_n_short_spin.setValue(30)
+        self.proto_n_short_spin.setFixedWidth(55)
+        self.proto_n_short_spin.setToolTip("SHORT 方向聚类数")
+        proto_params_layout.addWidget(self.proto_n_short_spin)
+        proto_params_layout.addStretch()
+        proto_layout.addLayout(proto_params_layout)
+
+        # 按钮行
+        proto_btn_layout = QtWidgets.QHBoxLayout()
+
+        self.generate_proto_btn = QtWidgets.QPushButton("生成原型")
+        self.generate_proto_btn.setStyleSheet(f"""
             QPushButton {{
-                background-color: {UI_CONFIG['THEME_ACCENT']};
+                background-color: #9933cc;
                 color: white;
                 border: none;
                 padding: 8px 16px;
@@ -625,58 +934,272 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
                 font-weight: bold;
             }}
             QPushButton:hover {{
-                background-color: #0088dd;
+                background-color: #aa44dd;
             }}
             QPushButton:disabled {{
                 background-color: #555;
                 color: #888;
             }}
         """)
-        self.wf_btn.setEnabled(False)
-        self.wf_btn.clicked.connect(self.walk_forward_requested.emit)
-        btn_layout.addWidget(self.wf_btn)
-        wf_layout.addLayout(btn_layout)
+        self.generate_proto_btn.setEnabled(False)
+        self.generate_proto_btn.setToolTip("对模板库进行 K-Means 聚类，生成交易原型")
+        self.generate_proto_btn.clicked.connect(self._on_generate_prototypes_clicked)
+        proto_btn_layout.addWidget(self.generate_proto_btn)
 
-        # 结果展示
-        results_layout = QtWidgets.QFormLayout()
-        self.wf_avg_sharpe_label = QtWidgets.QLabel("--")
-        self.wf_consistency_label = QtWidgets.QLabel("--")
-        self.wf_avg_profit_label = QtWidgets.QLabel("--")
-        self.wf_status_label = QtWidgets.QLabel("未运行")
-        self.wf_status_label.setStyleSheet("color: #888;")
+        self.load_proto_btn = QtWidgets.QPushButton("加载原型")
+        self.load_proto_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #444;
+                color: {UI_CONFIG['THEME_TEXT']};
+                border: 1px solid #555;
+                padding: 8px 12px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: #555;
+            }}
+        """)
+        self.load_proto_btn.clicked.connect(self.load_prototypes_requested.emit)
+        proto_btn_layout.addWidget(self.load_proto_btn)
 
-        results_layout.addRow("状态:", self.wf_status_label)
-        results_layout.addRow("平均Sharpe:", self.wf_avg_sharpe_label)
-        results_layout.addRow("一致性:", self.wf_consistency_label)
-        results_layout.addRow("平均利润:", self.wf_avg_profit_label)
+        proto_layout.addLayout(proto_btn_layout)
 
-        wf_layout.addLayout(results_layout)
-        layout.addWidget(wf_group)
+        # 原型列表表格
+        self.proto_table = QtWidgets.QTableWidget()
+        self.proto_table.setColumnCount(6)
+        self.proto_table.setHorizontalHeaderLabels(["方向", "成员", "胜率", "平均收益", "持仓", "ID"])
+        self.proto_table.horizontalHeader().setStretchLastSection(True)
+        self.proto_table.setMinimumHeight(80)
+        self.proto_table.setMaximumHeight(150)
+        self.proto_table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.proto_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+                color: {UI_CONFIG['THEME_TEXT']};
+                gridline-color: #444;
+                font-size: 11px;
+            }}
+            QHeaderView::section {{
+                background-color: #333;
+                color: {UI_CONFIG['THEME_TEXT']};
+                padding: 3px;
+                border: 1px solid #444;
+            }}
+        """)
+        self.proto_table.setVisible(False)
+        proto_layout.addWidget(self.proto_table)
+
+        # 说明
+        proto_note = QtWidgets.QLabel("聚类将模板压缩为少量原型，提升匹配效率和统计可靠性")
+        proto_note.setStyleSheet("color: #666; font-size: 10px;")
+        proto_note.setWordWrap(True)
+        proto_layout.addWidget(proto_note)
+
+        layout.addWidget(prototype_group)
+
+        # ══════════════════════════════════════════════════════════
+        # ── 批量 Walk-Forward 验证 ──
+        # ══════════════════════════════════════════════════════════
+        batch_group = QtWidgets.QGroupBox("批量 Walk-Forward 验证")
+        batch_group.setStyleSheet(f"""
+            QGroupBox {{
+                border: 2px solid #cc8800;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 18px;
+                color: {UI_CONFIG['THEME_TEXT']};
+                font-weight: bold;
+                font-size: {UI_CONFIG.get('FONT_SIZE_LARGE', 14)}px;
+            }}
+        """)
+        batch_layout = QtWidgets.QVBoxLayout(batch_group)
+
+        # 参数设置行
+        batch_params_layout = QtWidgets.QHBoxLayout()
+
+        batch_params_layout.addWidget(QtWidgets.QLabel("轮数:"))
+        self.batch_rounds_spin = QtWidgets.QSpinBox()
+        self.batch_rounds_spin.setRange(1, 30)
+        self.batch_rounds_spin.setValue(30)
+        self.batch_rounds_spin.setFixedWidth(60)
+        self.batch_rounds_spin.setToolTip("验证轮数（每轮采样不同数据段）")
+        batch_params_layout.addWidget(self.batch_rounds_spin)
+
+        batch_params_layout.addWidget(QtWidgets.QLabel("采样:"))
+        self.batch_sample_spin = QtWidgets.QSpinBox()
+        self.batch_sample_spin.setRange(10000, 200000)
+        self.batch_sample_spin.setValue(50000)
+        self.batch_sample_spin.setSingleStep(10000)
+        self.batch_sample_spin.setFixedWidth(80)
+        self.batch_sample_spin.setToolTip("每轮采样K线数")
+        self.batch_sample_spin.setSuffix("K线")
+        batch_params_layout.addWidget(self.batch_sample_spin)
+
+        batch_params_layout.addStretch()
+        batch_layout.addLayout(batch_params_layout)
+
+        # 启动/停止按钮行
+        batch_btn_layout = QtWidgets.QHBoxLayout()
+
+        self.batch_wf_btn = QtWidgets.QPushButton("一键批量验证")
+        self.batch_wf_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #cc8800;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: {UI_CONFIG.get('FONT_SIZE_LARGE', 14)}px;
+            }}
+            QPushButton:hover {{
+                background-color: #ee9900;
+            }}
+            QPushButton:disabled {{
+                background-color: #555;
+                color: #888;
+            }}
+        """)
+        self.batch_wf_btn.setEnabled(False)
+        self.batch_wf_btn.clicked.connect(self.batch_wf_requested.emit)
+        batch_btn_layout.addWidget(self.batch_wf_btn)
+
+        self.batch_stop_btn = QtWidgets.QPushButton("停止")
+        self.batch_stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #aa3333;
+                color: white;
+                border: none;
+                padding: 8px 12px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #cc4444;
+            }
+            QPushButton:disabled {
+                background-color: #555;
+                color: #888;
+            }
+        """)
+        self.batch_stop_btn.setEnabled(False)
+        self.batch_stop_btn.clicked.connect(self.batch_wf_stop_requested.emit)
+        batch_btn_layout.addWidget(self.batch_stop_btn)
+
+        batch_layout.addLayout(batch_btn_layout)
+
+        # 进度条
+        self.batch_progress_bar = QtWidgets.QProgressBar()
+        self.batch_progress_bar.setVisible(False)
+        self.batch_progress_bar.setTextVisible(True)
+        self.batch_progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                border: 1px solid #444;
+                border-radius: 3px;
+                text-align: center;
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+                color: {UI_CONFIG['THEME_TEXT']};
+            }}
+            QProgressBar::chunk {{
+                background-color: #cc8800;
+            }}
+        """)
+        batch_layout.addWidget(self.batch_progress_bar)
+
+        # 实时计数器 — 醒目大字
+        batch_counter_frame = QtWidgets.QFrame()
+        batch_counter_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: #2a2a1a;
+                border: 1px solid #5a5a2a;
+                border-radius: 5px;
+                padding: 6px;
+            }}
+        """)
+        batch_counter_inner = QtWidgets.QVBoxLayout(batch_counter_frame)
+        batch_counter_inner.setContentsMargins(8, 4, 8, 4)
+
+        # 轮次 + ETA
+        batch_status_layout = QtWidgets.QHBoxLayout()
+        self.batch_round_label = QtWidgets.QLabel("待启动")
+        self.batch_round_label.setStyleSheet(f"color: #cc8800; font-size: 12px;")
+        self.batch_eta_label = QtWidgets.QLabel("")
+        self.batch_eta_label.setStyleSheet("color: #888; font-size: 11px;")
+        batch_status_layout.addWidget(self.batch_round_label)
+        batch_status_layout.addStretch()
+        batch_status_layout.addWidget(self.batch_eta_label)
+        batch_counter_inner.addLayout(batch_status_layout)
+
+        # 累计匹配数
+        batch_match_layout = QtWidgets.QHBoxLayout()
+        match_tag = QtWidgets.QLabel("累计匹配:")
+        match_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.batch_match_count_label = QtWidgets.QLabel("0")
+        self.batch_match_count_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 14px;")
+        unique_tag = QtWidgets.QLabel("涉及模板:")
+        unique_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.batch_unique_label = QtWidgets.QLabel("0")
+        self.batch_unique_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 14px;")
+        batch_match_layout.addWidget(match_tag)
+        batch_match_layout.addWidget(self.batch_match_count_label)
+        batch_match_layout.addSpacing(15)
+        batch_match_layout.addWidget(unique_tag)
+        batch_match_layout.addWidget(self.batch_unique_label)
+        batch_match_layout.addStretch()
+        batch_counter_inner.addLayout(batch_match_layout)
+
+        # 本轮信息
+        batch_round_info = QtWidgets.QHBoxLayout()
+        round_trades_tag = QtWidgets.QLabel("本轮交易:")
+        round_trades_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.batch_round_trades_label = QtWidgets.QLabel("--")
+        self.batch_round_trades_label.setStyleSheet("color: #ccc; font-size: 12px;")
+        round_sharpe_tag = QtWidgets.QLabel("Sharpe:")
+        round_sharpe_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.batch_round_sharpe_label = QtWidgets.QLabel("--")
+        self.batch_round_sharpe_label.setStyleSheet("color: #ccc; font-size: 12px;")
+        batch_round_info.addWidget(round_trades_tag)
+        batch_round_info.addWidget(self.batch_round_trades_label)
+        batch_round_info.addSpacing(15)
+        batch_round_info.addWidget(round_sharpe_tag)
+        batch_round_info.addWidget(self.batch_round_sharpe_label)
+        batch_round_info.addStretch()
+        batch_counter_inner.addLayout(batch_round_info)
+
+        batch_layout.addWidget(batch_counter_frame)
+
+        batch_note = QtWidgets.QLabel("直接用全局模板库在多段随机数据上验证，无需重新标注")
+        batch_note.setStyleSheet("color: #666; font-size: 10px;")
+        batch_note.setWordWrap(True)
+        batch_layout.addWidget(batch_note)
+
+        layout.addWidget(batch_group)
 
         # ── 最优交易参数 ──
-        params_group = QtWidgets.QGroupBox("GA优化参数")
-        params_group.setStyleSheet(group_style)
-        params_layout = QtWidgets.QFormLayout(params_group)
+        self.params_group = QtWidgets.QGroupBox("优化参数")
+        self.params_group.setStyleSheet(group_style)
+        params_layout = QtWidgets.QFormLayout(self.params_group)
 
         self.param_labels = {}
         param_names = [
             ("cosine_threshold", "余弦阈值"),
             ("dtw_threshold", "DTW阈值"),
+            ("min_templates_agree", "最少模板"),
             ("stop_loss_atr", "止损ATR"),
             ("take_profit_atr", "止盈ATR"),
             ("max_hold_bars", "最大持仓"),
+            ("hold_divergence_limit", "偏离上限"),
         ]
         for key, name in param_names:
             label = QtWidgets.QLabel("--")
             self.param_labels[key] = label
             params_layout.addRow(f"{name}:", label)
 
-        layout.addWidget(params_group)
+        layout.addWidget(self.params_group)
 
         # ── 记忆管理 ──
-        memory_group = QtWidgets.QGroupBox("记忆管理")
-        memory_group.setStyleSheet(group_style)
-        memory_layout = QtWidgets.QVBoxLayout(memory_group)
+        self.memory_group = QtWidgets.QGroupBox("记忆管理")
+        self.memory_group.setStyleSheet(group_style)
+        memory_layout = QtWidgets.QVBoxLayout(self.memory_group)
 
         # 记忆统计
         memory_stats_layout = QtWidgets.QFormLayout()
@@ -760,9 +1283,41 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         btn_row2.addWidget(self.clear_memory_btn)
         memory_layout.addLayout(btn_row2)
 
-        layout.addWidget(memory_group)
+        layout.addWidget(self.memory_group)
 
         layout.addStretch()
+
+    def extract_bottom_tools_widget(self) -> QtWidgets.QWidget:
+        """
+        提取“优化参数 + 记忆管理”区域，用于移动到左下角控制区。
+        """
+        container = QtWidgets.QGroupBox("优化与记忆")
+        container.setStyleSheet(f"""
+            QGroupBox {{
+                border: 1px solid #444;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                color: {UI_CONFIG['THEME_TEXT']};
+                font-weight: bold;
+            }}
+        """)
+        v = QtWidgets.QVBoxLayout(container)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(6)
+
+        for name in ("params_group", "memory_group"):
+            w = getattr(self, name, None)
+            if w is None:
+                continue
+            try:
+                self._trajectory_content_layout.removeWidget(w)
+            except Exception:
+                pass
+            w.setParent(container)
+            v.addWidget(w)
+
+        return container
 
     def update_match_status(self, regime: str, best_match: str,
                             cosine_sim: float, dtw_sim: float, direction: str):
@@ -789,24 +1344,6 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         self.short_templates_label.setText(str(short_count))
         self.avg_profit_label.setText(f"{avg_profit:.2f}%")
 
-    def update_walk_forward_result(self, avg_sharpe: float, consistency: float,
-                                    avg_profit: float, status: str = "完成"):
-        """更新 Walk-Forward 验证结果"""
-        self.wf_status_label.setText(status)
-        if status == "完成":
-            self.wf_status_label.setStyleSheet(f"color: {UI_CONFIG['CHART_UP_COLOR']};")
-        elif "运行中" in status:
-            self.wf_status_label.setStyleSheet(f"color: {UI_CONFIG['THEME_ACCENT']};")
-        else:
-            self.wf_status_label.setStyleSheet("color: #888;")
-
-        self.wf_avg_sharpe_label.setText(f"{avg_sharpe:.3f}")
-        self.wf_consistency_label.setText(f"{consistency:.0%}")
-
-        profit_color = UI_CONFIG['CHART_UP_COLOR'] if avg_profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
-        self.wf_avg_profit_label.setText(f"{avg_profit:.2f}%")
-        self.wf_avg_profit_label.setStyleSheet(f"color: {profit_color};")
-
     def update_trading_params(self, params):
         """更新GA优化后的交易参数"""
         if params is None:
@@ -819,10 +1356,6 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
                 else:
                     label.setText(str(value))
 
-    def enable_walk_forward(self, enabled: bool):
-        """启用/禁用 Walk-Forward 按钮"""
-        self.wf_btn.setEnabled(enabled)
-
     def update_memory_stats(self, template_count: int, file_count: int):
         """更新记忆统计"""
         self.memory_count_label.setText(str(template_count))
@@ -834,19 +1367,338 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         """启用/禁用保存按钮"""
         self.save_memory_btn.setEnabled(enabled)
 
+    def update_template_evaluation(self, eval_result):
+        """
+        更新模板评估结果（合并到指纹模板库区块）
+
+        Args:
+            eval_result: EvaluationResult 实例
+        """
+        if eval_result is None:
+            return
+
+        # ── 计算已验证模板的 LONG / SHORT 数量 ──
+        # "已验证" = 优质 + 合格 + 待观察（即保留的模板）
+        verified_long = 0
+        verified_short = 0
+        for perf in eval_result.performances:
+            if perf.grade in ("优质", "合格", "待观察"):
+                if perf.template.direction == "LONG":
+                    verified_long += 1
+                else:
+                    verified_short += 1
+
+        # 更新醒目的 LONG/SHORT 已验证数量
+        self.verified_long_count.setText(str(verified_long))
+        self.verified_short_count.setText(str(verified_short))
+
+        # 更新评估统计标签
+        self.eval_total_label.setText(str(eval_result.total_templates))
+        self.eval_evaluated_label.setText(str(eval_result.evaluated_templates))
+
+        # 优质 - 绿色
+        self.eval_excellent_label.setText(str(eval_result.excellent_count))
+        self.eval_excellent_label.setStyleSheet(f"color: {UI_CONFIG['CHART_UP_COLOR']}; font-weight: bold;")
+
+        # 合格 - 蓝色
+        self.eval_qualified_label.setText(str(eval_result.qualified_count))
+        self.eval_qualified_label.setStyleSheet(f"color: {UI_CONFIG['THEME_ACCENT']}; font-weight: bold;")
+
+        # 待观察 - 黄色
+        self.eval_pending_label.setText(str(eval_result.pending_count))
+        self.eval_pending_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
+
+        # 淘汰 - 红色
+        self.eval_eliminated_label.setText(str(eval_result.eliminated_count))
+        self.eval_eliminated_label.setStyleSheet(f"color: {UI_CONFIG['CHART_DOWN_COLOR']}; font-weight: bold;")
+
+        # 更新表格 - 只显示优质+合格+待观察模板（有价值的）
+        self.eval_table.setVisible(True)
+        self.eval_table.setRowCount(0)
+
+        # 筛选有价值的模板（优质、合格、待观察），排在前面
+        valuable = [p for p in eval_result.performances if p.grade in ("优质", "合格", "待观察")]
+        # 再补充几条淘汰的，供参考
+        eliminated = [p for p in eval_result.performances if p.grade == "淘汰"]
+        display_list = valuable[:20] + eliminated[:5]
+
+        for i, perf in enumerate(display_list):
+            self.eval_table.insertRow(i)
+
+            # 方向
+            direction = perf.template.direction
+            dir_item = QtWidgets.QTableWidgetItem(direction)
+            if direction == "LONG":
+                dir_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_UP_COLOR']))
+            else:
+                dir_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR']))
+            self.eval_table.setItem(i, 0, dir_item)
+
+            # 市场状态
+            regime_item = QtWidgets.QTableWidgetItem(perf.template.regime[:6])
+            self.eval_table.setItem(i, 1, regime_item)
+
+            # 匹配次数
+            match_item = QtWidgets.QTableWidgetItem(str(perf.match_count))
+            match_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.eval_table.setItem(i, 2, match_item)
+
+            # 胜率
+            winrate_item = QtWidgets.QTableWidgetItem(f"{perf.win_rate:.0%}")
+            winrate_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if perf.win_rate >= 0.6:
+                winrate_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_UP_COLOR']))
+            elif perf.win_rate < 0.4:
+                winrate_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR']))
+            self.eval_table.setItem(i, 3, winrate_item)
+
+            # 评级
+            grade_item = QtWidgets.QTableWidgetItem(perf.grade)
+            grade_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if perf.grade == "优质":
+                grade_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_UP_COLOR']))
+                grade_item.setFont(QtGui.QFont("", -1, QtGui.QFont.Weight.Bold))
+            elif perf.grade == "合格":
+                grade_item.setForeground(QtGui.QColor(UI_CONFIG['THEME_ACCENT']))
+            elif perf.grade == "待观察":
+                grade_item.setForeground(QtGui.QColor("#ffaa00"))
+            else:
+                grade_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR']))
+            self.eval_table.setItem(i, 4, grade_item)
+
+        # 如果有淘汰的模板，启用筛选按钮
+        self.apply_filter_btn.setEnabled(eval_result.eliminated_count > 0)
+
+    def reset_template_evaluation(self):
+        """重置模板评估显示"""
+        self.verified_long_count.setText("0")
+        self.verified_short_count.setText("0")
+        self.eval_total_label.setText("--")
+        self.eval_evaluated_label.setText("--")
+        self.eval_excellent_label.setText("0")
+        self.eval_qualified_label.setText("0")
+        self.eval_pending_label.setText("0")
+        self.eval_eliminated_label.setText("0")
+        self.eval_table.setRowCount(0)
+        self.eval_table.setVisible(False)
+        self.apply_filter_btn.setEnabled(False)
+
+    # ── 原型库方法 ──
+
+    def _on_generate_prototypes_clicked(self):
+        """生成原型按钮点击"""
+        n_long = self.proto_n_long_spin.value()
+        n_short = self.proto_n_short_spin.value()
+        self.generate_prototypes_requested.emit(n_long, n_short)
+
+    def update_prototype_stats(self, library):
+        """
+        更新原型库统计显示
+        
+        Args:
+            library: PrototypeLibrary 实例
+        """
+        if library is None:
+            self.proto_long_count.setText("0")
+            self.proto_short_count.setText("0")
+            self.proto_source_label.setText("来源: 0 模板")
+            self.proto_avg_winrate_label.setText("平均胜率: --")
+            self.proto_table.setRowCount(0)
+            self.proto_table.setVisible(False)
+            return
+
+        # 更新统计数字
+        n_long = len(library.long_prototypes)
+        n_short = len(library.short_prototypes)
+        self.proto_long_count.setText(str(n_long))
+        self.proto_short_count.setText(str(n_short))
+        self.proto_source_label.setText(f"来源: {library.source_template_count} 模板")
+
+        # 计算平均胜率
+        all_protos = library.get_all_prototypes()
+        if all_protos:
+            avg_win = sum(p.win_rate for p in all_protos) / len(all_protos)
+            self.proto_avg_winrate_label.setText(f"平均胜率: {avg_win:.1%}")
+        else:
+            self.proto_avg_winrate_label.setText("平均胜率: --")
+
+        # 更新表格（显示前10个）
+        display_protos = sorted(all_protos, key=lambda p: p.member_count, reverse=True)[:10]
+        self.proto_table.setRowCount(len(display_protos))
+
+        for i, proto in enumerate(display_protos):
+            # 方向
+            dir_item = QtWidgets.QTableWidgetItem(proto.direction)
+            if proto.direction == "LONG":
+                dir_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_UP_COLOR']))
+            else:
+                dir_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR']))
+            self.proto_table.setItem(i, 0, dir_item)
+
+            # 成员数
+            member_item = QtWidgets.QTableWidgetItem(str(proto.member_count))
+            member_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.proto_table.setItem(i, 1, member_item)
+
+            # 胜率
+            winrate_item = QtWidgets.QTableWidgetItem(f"{proto.win_rate:.0%}")
+            winrate_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if proto.win_rate >= 0.6:
+                winrate_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_UP_COLOR']))
+            elif proto.win_rate < 0.4:
+                winrate_item.setForeground(QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR']))
+            self.proto_table.setItem(i, 2, winrate_item)
+
+            # 平均收益
+            profit_item = QtWidgets.QTableWidgetItem(f"{proto.avg_profit_pct:.2f}%")
+            profit_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.proto_table.setItem(i, 3, profit_item)
+
+            # 平均持仓
+            hold_item = QtWidgets.QTableWidgetItem(f"{proto.avg_hold_bars:.0f}")
+            hold_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.proto_table.setItem(i, 4, hold_item)
+
+            # ID
+            id_item = QtWidgets.QTableWidgetItem(str(proto.prototype_id))
+            id_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.proto_table.setItem(i, 5, id_item)
+
+        self.proto_table.setVisible(len(display_protos) > 0)
+
+    def enable_generate_prototypes(self, enabled: bool):
+        """启用/禁用生成原型按钮"""
+        self.generate_proto_btn.setEnabled(enabled)
+
+    def reset_prototype_stats(self):
+        """重置原型库显示"""
+        self.proto_long_count.setText("0")
+        self.proto_short_count.setText("0")
+        self.proto_source_label.setText("来源: 0 模板")
+        self.proto_avg_winrate_label.setText("平均胜率: --")
+        self.proto_table.setRowCount(0)
+        self.proto_table.setVisible(False)
+
+    # ── 批量 Walk-Forward 方法 ──
+
+    def update_batch_wf_progress(self, round_idx: int, n_rounds: int,
+                                  cumulative_stats: dict):
+        """更新批量WF进度（每轮完成后调用）"""
+        # 检查是否是"正在运行"状态（轮次开始时发送）
+        is_running = cumulative_stats.get("running", False)
+        global_pct = cumulative_stats.get("global_progress_pct", None)
+        
+        # 进度条
+        self.batch_progress_bar.setVisible(True)
+        
+        if is_running:
+            # 轮次运行中：支持trial级细粒度进度
+            phase = cumulative_stats.get("phase", "")
+            trial_idx = int(cumulative_stats.get("trial_idx", 0))
+            trial_total = max(1, int(cumulative_stats.get("trial_total", 1)))
+            
+            if phase == "bayes_opt":
+                if global_pct is not None:
+                    pct = int(max(self._batch_last_progress, min(100, global_pct)))
+                else:
+                    frac = min(1.0, max(0.0, trial_idx / trial_total))
+                    pct = int(((round_idx + frac) / n_rounds) * 100)
+                self.batch_progress_bar.setFormat(
+                    f"第 {round_idx + 1}/{n_rounds} 轮优化中: trial {trial_idx}/{trial_total} ({pct}%)"
+                )
+                self.batch_round_label.setText(
+                    f"第 {round_idx + 1} 轮运行中（贝叶斯优化 {trial_idx}/{trial_total}）"
+                )
+            else:
+                if global_pct is not None:
+                    pct = int(max(self._batch_last_progress, min(100, global_pct)))
+                else:
+                    pct = int(round_idx / n_rounds * 100)  # 还没完成这一轮
+                self.batch_progress_bar.setFormat(f"第 {round_idx + 1}/{n_rounds} 轮运行中... ({pct}%)")
+                self.batch_round_label.setText(f"第 {round_idx + 1} 轮运行中...")
+            
+            self._batch_last_progress = max(self._batch_last_progress, pct)
+            self.batch_progress_bar.setValue(pct)
+            self.batch_eta_label.setText("计算中...")
+        else:
+            # 轮次完成
+            if global_pct is not None:
+                pct = int(max(self._batch_last_progress, min(100, global_pct)))
+            else:
+                pct = int((round_idx + 1) / n_rounds * 100)
+            self._batch_last_progress = max(self._batch_last_progress, pct)
+            self.batch_progress_bar.setValue(pct)
+
+            # ETA
+            eta = cumulative_stats.get("eta_seconds", 0)
+            if eta > 60:
+                eta_str = f"剩余 {int(eta // 60)}分{int(eta % 60)}秒"
+            else:
+                eta_str = f"剩余 {int(eta)}秒"
+            self.batch_progress_bar.setFormat(f"Round {round_idx + 1}/{n_rounds} ({pct}%) | {eta_str}")
+
+            # 轮次
+            self.batch_round_label.setText(f"Round {round_idx + 1} / {n_rounds}")
+            self.batch_eta_label.setText(eta_str)
+
+        # 累计匹配
+        self.batch_match_count_label.setText(str(cumulative_stats.get("total_match_events", 0)))
+        self.batch_unique_label.setText(str(cumulative_stats.get("unique_matched", 0)))
+
+        # 本轮信息
+        round_trades = cumulative_stats.get("round_trades", 0)
+        round_sharpe = cumulative_stats.get("round_sharpe", 0.0)
+        self.batch_round_trades_label.setText(str(round_trades))
+
+        if round_sharpe >= 0:
+            self.batch_round_sharpe_label.setText(f"{round_sharpe:.3f}")
+            self.batch_round_sharpe_label.setStyleSheet(
+                f"color: {UI_CONFIG['CHART_UP_COLOR']}; font-size: 12px;")
+        else:
+            self.batch_round_sharpe_label.setText(f"{round_sharpe:.3f}")
+            self.batch_round_sharpe_label.setStyleSheet(
+                f"color: {UI_CONFIG['CHART_DOWN_COLOR']}; font-size: 12px;")
+
+    def on_batch_wf_started(self):
+        """批量WF开始时调用"""
+        self.batch_wf_btn.setEnabled(False)
+        self.batch_stop_btn.setEnabled(True)
+        self.batch_rounds_spin.setEnabled(False)
+        self.batch_sample_spin.setEnabled(False)
+        self.batch_progress_bar.setVisible(True)
+        self.batch_progress_bar.setValue(0)
+        self._batch_last_progress = 0
+        self.batch_round_label.setText("启动中...")
+        self.batch_eta_label.setText("")
+        self.batch_match_count_label.setText("0")
+        self.batch_unique_label.setText("0")
+        self.batch_round_trades_label.setText("--")
+        self.batch_round_sharpe_label.setText("--")
+
+    def on_batch_wf_finished(self):
+        """批量WF完成时调用"""
+        self.batch_wf_btn.setEnabled(True)
+        self.batch_stop_btn.setEnabled(False)
+        self.batch_rounds_spin.setEnabled(True)
+        self.batch_sample_spin.setEnabled(True)
+        self._batch_last_progress = 0
+        self.batch_progress_bar.setVisible(False)
+        self.batch_round_label.setText("完成")
+
+    def enable_batch_wf(self, enabled: bool):
+        """启用/禁用批量验证按钮"""
+        self.batch_wf_btn.setEnabled(enabled)
+
 
 class AnalysisPanel(QtWidgets.QWidget):
     """
     分析面板 - 深色主题
     
     包含标签页：
-    1. 特征重要性
-    2. 多空逻辑
-    3. 生存分析
-    4. 交易明细
-    5. 市场状态
-    6. 指纹图（3D地形图显示轨迹指纹）
-    7. 轨迹匹配
+    1. 交易明细
+    2. 市场状态
+    3. 指纹图（3D地形图显示轨迹指纹）
+    4. 轨迹匹配
     """
     
     def __init__(self, parent=None):
@@ -854,10 +1706,21 @@ class AnalysisPanel(QtWidgets.QWidget):
         self._init_ui()
     
     def _init_ui(self):
+        # 获取字体大小配置
+        font_normal = UI_CONFIG.get('FONT_SIZE_NORMAL', 12)
+        font_small = UI_CONFIG.get('FONT_SIZE_SMALL', 11)
+
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: {UI_CONFIG['THEME_BACKGROUND']};
                 color: {UI_CONFIG['THEME_TEXT']};
+                font-size: {font_normal}px;
+            }}
+            QLabel {{
+                font-size: {font_normal}px;
+            }}
+            QGroupBox {{
+                font-size: {font_normal}px;
             }}
             QTabWidget::pane {{
                 border: 1px solid #444;
@@ -869,10 +1732,17 @@ class AnalysisPanel(QtWidgets.QWidget):
                 padding: 8px 16px;
                 border: 1px solid #444;
                 border-bottom: none;
+                font-size: {font_normal}px;
             }}
             QTabBar::tab:selected {{
                 background-color: {UI_CONFIG['THEME_ACCENT']};
                 color: white;
+            }}
+            QTableWidget {{
+                font-size: {font_small}px;
+            }}
+            QPushButton {{
+                font-size: {font_normal}px;
             }}
         """)
         
@@ -881,18 +1751,6 @@ class AnalysisPanel(QtWidgets.QWidget):
         
         # 标签页
         self.tabs = QtWidgets.QTabWidget()
-        
-        # 特征重要性标签页
-        self.feature_widget = FeatureImportanceWidget()
-        self.tabs.addTab(self.feature_widget, "特征重要性")
-        
-        # 多空逻辑标签页
-        self.pattern_widget = PatternLogicWidget()
-        self.tabs.addTab(self.pattern_widget, "多空逻辑")
-        
-        # 生存分析标签页
-        self.survival_widget = SurvivalAnalysisWidget()
-        self.tabs.addTab(self.survival_widget, "生存分析")
 
         # 交易明细标签页
         self.trade_log_widget = TradeLogWidget()
@@ -913,35 +1771,24 @@ class AnalysisPanel(QtWidgets.QWidget):
         
         layout.addWidget(self.tabs)
         
-        # 设置最小宽度
-        self.setMinimumWidth(300)
+        # 设置最小宽度（增大以适应高分辨率）
+        self.setMinimumWidth(380)
     
     def update_feature_importance(self, feature_names: List[str], importances: List[float]):
-        """更新特征重要性"""
-        self.feature_widget.update_data(feature_names, importances)
+        """更新特征重要性（已弃用，保持接口兼容）"""
+        pass  # UI已移除，保留方法签名
     
     def update_pattern_logic(self, logic_data: Dict):
-        """更新多空逻辑"""
-        self.pattern_widget.update_data(logic_data)
+        """更新多空逻辑（已弃用，保持接口兼容）"""
+        pass  # UI已移除，保留方法签名
     
     def update_survival_analysis(self, survival_data: Dict):
-        """更新生存分析"""
-        self.survival_widget.update_data(survival_data)
+        """更新生存分析（已弃用，保持接口兼容）"""
+        pass  # UI已移除，保留方法签名
     
     def update_all(self, analysis_results: Dict):
-        """更新所有分析结果"""
-        if 'feature_importance' in analysis_results:
-            fi = analysis_results['feature_importance']
-            if 'top_features' in fi:
-                names = [f['name'] for f in fi['top_features']]
-                imps = [f['importance'] for f in fi['top_features']]
-                self.update_feature_importance(names, imps)
-        
-        if 'long_short_logic' in analysis_results:
-            self.update_pattern_logic(analysis_results['long_short_logic'])
-        
-        if 'survival' in analysis_results:
-            self.update_survival_analysis(analysis_results['survival'])
+        """更新所有分析结果（已弃用，保持接口兼容）"""
+        pass  # UI已移除，保留方法签名
 
     def update_trade_log(self, trades: List[Dict]):
         """更新交易明细"""
@@ -979,20 +1826,9 @@ class AnalysisPanel(QtWidgets.QWidget):
             total, long_count, short_count, avg_profit
         )
 
-    def update_walk_forward_result(self, avg_sharpe: float, consistency: float,
-                                    avg_profit: float, status: str = "完成"):
-        """更新 Walk-Forward 验证结果"""
-        self.trajectory_widget.update_walk_forward_result(
-            avg_sharpe, consistency, avg_profit, status
-        )
-
     def update_trading_params(self, params):
         """更新 GA 优化后的交易参数"""
         self.trajectory_widget.update_trading_params(params)
-
-    def enable_walk_forward(self, enabled: bool):
-        """启用/禁用 Walk-Forward 验证按钮"""
-        self.trajectory_widget.enable_walk_forward(enabled)
 
     def update_memory_stats(self, template_count: int, file_count: int):
         """更新记忆统计"""
@@ -1001,6 +1837,34 @@ class AnalysisPanel(QtWidgets.QWidget):
     def enable_save_memory(self, enabled: bool):
         """启用/禁用保存记忆按钮"""
         self.trajectory_widget.enable_save_memory(enabled)
+
+    def update_template_evaluation(self, eval_result):
+        """更新模板评估结果"""
+        self.trajectory_widget.update_template_evaluation(eval_result)
+
+    def reset_template_evaluation(self):
+        """重置模板评估显示"""
+        self.trajectory_widget.reset_template_evaluation()
+
+    # ── 批量 Walk-Forward 方法转发 ──
+
+    def update_batch_wf_progress(self, round_idx: int, n_rounds: int,
+                                  cumulative_stats: dict):
+        """更新批量WF进度"""
+        self.trajectory_widget.update_batch_wf_progress(
+            round_idx, n_rounds, cumulative_stats)
+
+    def on_batch_wf_started(self):
+        """批量WF开始"""
+        self.trajectory_widget.on_batch_wf_started()
+
+    def on_batch_wf_finished(self):
+        """批量WF完成"""
+        self.trajectory_widget.on_batch_wf_finished()
+
+    def enable_batch_wf(self, enabled: bool):
+        """启用/禁用批量验证按钮"""
+        self.trajectory_widget.enable_batch_wf(enabled)
 
 
 # 测试代码
@@ -1013,43 +1877,22 @@ if __name__ == "__main__":
     panel.setWindowTitle("分析面板测试")
     panel.resize(400, 600)
     
-    # 测试数据
-    feature_names = [f"feature_{i}" for i in range(20)]
-    importances = np.random.random(20).tolist()
-    panel.update_feature_importance(feature_names, importances)
-    
-    logic_data = {
-        'long_conditions': [
-            {'feature': 'rsi', 'direction': 'below', 'threshold': 0.3, 'probability': 0.65},
-            {'feature': 'macd', 'direction': 'above', 'threshold': 0.1, 'probability': 0.58},
-        ],
-        'short_conditions': [
-            {'feature': 'rsi', 'direction': 'above', 'threshold': 0.7, 'probability': 0.62},
-        ]
-    }
-    panel.update_pattern_logic(logic_data)
-    
-    survival_data = {
-        'hold_periods': {
-            'mean': 45.5,
-            'median': 38.0,
-            'histogram': {
-                'bins': [0, 10, 20, 30, 40, 50, 60],
-                'counts': [5, 12, 18, 15, 8, 4]
-            }
+    # 测试交易数据
+    test_trades = [
+        {
+            "side": "LONG", "entry_time": "2024-01-01 10:00",
+            "entry_price": "42000.0", "exit_time": "2024-01-01 12:00",
+            "exit_price": "42500.0", "profit": "50.0", "profit_pct": "1.19",
+            "hold": "120", "regime": "TREND_UP", "fingerprint": "T#3 | Sim=0.85"
         },
-        'profit': {
-            'mean': 0.85,
-            'median': 0.62,
-            'histogram': {
-                'bins': [-2, -1, 0, 1, 2, 3],
-                'counts': [3, 8, 12, 20, 10]
-            }
+        {
+            "side": "SHORT", "entry_time": "2024-01-02 14:00",
+            "entry_price": "43000.0", "exit_time": "2024-01-02 16:00",
+            "exit_price": "42500.0", "profit": "50.0", "profit_pct": "1.16",
+            "hold": "120", "regime": "TREND_DOWN", "fingerprint": "--"
         },
-        'win_rate': 0.58,
-        'risk_reward_mean': 1.8
-    }
-    panel.update_survival_analysis(survival_data)
+    ]
+    panel.update_trade_log(test_trades)
     
     panel.show()
     sys.exit(app.exec())

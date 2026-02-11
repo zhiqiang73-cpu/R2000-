@@ -111,7 +111,9 @@ class OptimizerPanel(QtWidgets.QWidget):
             curve_layout.addWidget(self.curve_label)
         
         left_layout.addWidget(curve_group)
-        layout.addWidget(left_widget, stretch=2)
+        # 用户要求精简底部面板：隐藏“优化进度/适应度曲线”区域
+        left_widget.setVisible(False)
+        layout.addWidget(left_widget, stretch=0)
         
         # === 中间：最优策略参数 ===
         params_group = QtWidgets.QGroupBox("最优策略参数")
@@ -136,7 +138,9 @@ class OptimizerPanel(QtWidgets.QWidget):
         self.fitness_label.setStyleSheet(f"color: {UI_CONFIG['THEME_ACCENT']}; font-weight: bold; font-size: 14px;")
         params_layout.addRow("适应度:", self.fitness_label)
         
-        layout.addWidget(params_group, stretch=1)
+        # 用户要求精简底部面板：隐藏“最优策略参数”区域
+        params_group.setVisible(False)
+        layout.addWidget(params_group, stretch=0)
         
         # === 右侧：回测指标 ===
         metrics_group = QtWidgets.QGroupBox("回测指标")
@@ -200,6 +204,31 @@ class OptimizerPanel(QtWidgets.QWidget):
         metrics_layout.addWidget(self.short_profit_label, 4, 5)
         
         layout.addWidget(metrics_group, stretch=2)
+    
+    @staticmethod
+    def _fmt_amount(v: float, signed: bool = False) -> str:
+        """
+        统一金额显示：
+        - 大数用科学计数法 a × 10^b
+        - 普通数保持千分位
+        """
+        try:
+            x = float(v)
+        except Exception:
+            return "--"
+        if not np.isfinite(x):
+            return "--"
+        if x == 0:
+            return "0"
+        ax = abs(x)
+        sign = "+" if (signed and x > 0) else ("-" if x < 0 else "")
+        if ax >= 1e6:
+            exp = int(np.floor(np.log10(ax)))
+            coeff = ax / (10 ** exp)
+            return f"{sign}{coeff:.3f} × 10^{exp}"
+        if signed:
+            return f"{x:+,.2f}"
+        return f"{x:,.2f}"
     
     def reset(self):
         """重置面板"""
@@ -284,7 +313,7 @@ class OptimizerPanel(QtWidgets.QWidget):
     def update_backtest_metrics(self, metrics: Dict):
         """更新回测指标"""
         if 'initial_capital' in metrics:
-            self.initial_capital_label.setText(f"{metrics['initial_capital']:,.2f}")
+            self.initial_capital_label.setText(self._fmt_amount(metrics['initial_capital']))
             
         if 'win_rate' in metrics:
             rate = metrics['win_rate']
@@ -301,7 +330,7 @@ class OptimizerPanel(QtWidgets.QWidget):
         if 'total_profit' in metrics:
             profit = metrics['total_profit']
             color = UI_CONFIG['CHART_UP_COLOR'] if profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
-            self.total_profit_label.setText(f"{profit:,.2f}")
+            self.total_profit_label.setText(self._fmt_amount(profit, signed=True))
             self.total_profit_label.setStyleSheet(f"color: {color}; font-weight: bold;")
             
         if 'max_drawdown' in metrics:
@@ -311,17 +340,17 @@ class OptimizerPanel(QtWidgets.QWidget):
         # 当前/最近开仓信息
         if 'current_pos' in metrics and metrics['current_pos']:
             pos = metrics['current_pos']
-            self.cur_margin_label.setText(f"{pos.margin:,.2f}")
-            self.cur_tp_label.setText(f"{pos.take_profit:,.2f}")
-            self.cur_sl_label.setText(f"{pos.stop_loss:,.2f}")
-            self.cur_liq_label.setText(f"{pos.liquidation_price:,.2f}")
+            self.cur_margin_label.setText(self._fmt_amount(pos.margin))
+            self.cur_tp_label.setText(self._fmt_amount(pos.take_profit))
+            self.cur_sl_label.setText(self._fmt_amount(pos.stop_loss))
+            self.cur_liq_label.setText(self._fmt_amount(pos.liquidation_price))
             self.cur_liq_label.setStyleSheet(f"color: {UI_CONFIG['CHART_DOWN_COLOR']};")
         elif 'last_trade' in metrics and metrics['last_trade']:
             t = metrics['last_trade']
-            self.cur_margin_label.setText(f"{t.margin:,.2f}")
-            self.cur_tp_label.setText(f"{t.take_profit:,.2f}")
-            self.cur_sl_label.setText(f"{t.stop_loss:,.2f}")
-            self.cur_liq_label.setText(f"{t.liquidation_price:,.2f}")
+            self.cur_margin_label.setText(self._fmt_amount(t.margin))
+            self.cur_tp_label.setText(self._fmt_amount(t.take_profit))
+            self.cur_sl_label.setText(self._fmt_amount(t.stop_loss))
+            self.cur_liq_label.setText(self._fmt_amount(t.liquidation_price))
             self.cur_liq_label.setStyleSheet("")
 
         if 'long_win_rate' in metrics:
@@ -333,7 +362,7 @@ class OptimizerPanel(QtWidgets.QWidget):
         if 'long_profit' in metrics:
             profit = metrics['long_profit']
             color = UI_CONFIG['CHART_UP_COLOR'] if profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
-            self.long_profit_label.setText(f"{profit:,.2f}")
+            self.long_profit_label.setText(self._fmt_amount(profit, signed=True))
             self.long_profit_label.setStyleSheet(f"color: {color};")
             
         if 'short_win_rate' in metrics:
@@ -345,7 +374,7 @@ class OptimizerPanel(QtWidgets.QWidget):
         if 'short_profit' in metrics:
             profit = metrics['short_profit']
             color = UI_CONFIG['CHART_UP_COLOR'] if profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
-            self.short_profit_label.setText(f"{profit:,.2f}")
+            self.short_profit_label.setText(self._fmt_amount(profit, signed=True))
             self.short_profit_label.setStyleSheet(f"color: {color};")
 
     

@@ -36,5 +36,9 @@ Thumbs.db
 
 # Project specific
 data/output/
+data/paper_trading/api_config.json
+data/memory/
+data/evaluation/
+data/prototypes/
 *.log
 *.parquet.bak

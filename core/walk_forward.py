@@ -45,6 +45,9 @@ class FoldResult:
     test_total_profit: float = 0.0
     test_max_drawdown: float = 0.0
 
+    # 模板匹配详情（用于模板评估）
+    test_trades: List = field(default_factory=list)  # SimulatedTradeRecord列表
+
 
 @dataclass
 class WalkForwardResult:
@@ -60,6 +63,9 @@ class WalkForwardResult:
     # 稳定性指标
     n_profitable_folds: int = 0     # 多少折测试集盈利
     consistency_ratio: float = 0.0  # 盈利折数 / 总折数
+
+    # 模板评估结果（可选）
+    template_evaluation: Optional[object] = None  # EvaluationResult
 
     def summarize(self):
         """计算汇总统计"""
@@ -77,6 +83,13 @@ class WalkForwardResult:
 
         self.n_profitable_folds = sum(1 for p in test_profits if p > 0)
         self.consistency_ratio = self.n_profitable_folds / len(self.folds)
+
+    def get_all_test_trades(self) -> List:
+        """获取所有测试集的交易记录（用于模板评估）"""
+        all_trades = []
+        for fold in self.folds:
+            all_trades.extend(fold.test_trades)
+        return all_trades
 
     def print_summary(self):
         """打印摘要"""
@@ -129,7 +142,8 @@ class WalkForwardValidator:
         self.min_val_trades = min_val_trades or WALK_FORWARD_CONFIG["MIN_VAL_TRADES"]
 
     def run(self, df: pd.DataFrame, labels: pd.Series,
-            n_folds: int = None, callback=None) -> WalkForwardResult:
+            n_folds: int = None, callback=None,
+            fold_done_callback=None) -> WalkForwardResult:
         """
         运行 Walk-Forward 验证
 
@@ -137,7 +151,8 @@ class WalkForwardValidator:
             df: 完整数据集 DataFrame
             labels: 标注序列
             n_folds: 折数
-            callback: 进度回调 fn(fold_idx, stage, message)
+            callback: 进度回调 fn(fold_idx, n_folds, stage, progress_pct, n_templates)
+            fold_done_callback: 单折完成回调 fn(fold_result)
 
         Returns:
             WalkForwardResult 完整结果
@@ -148,15 +163,22 @@ class WalkForwardValidator:
 
         # 计算每折的数据范围
         fold_ranges = self._compute_fold_ranges(n, n_folds)
+        actual_n_folds = len(fold_ranges)
 
         for fold_idx, (train_range, val_range, test_range) in enumerate(fold_ranges):
             if callback:
-                callback(fold_idx, "start", f"Fold {fold_idx + 1}/{n_folds}")
+                # 每折开始时的进度：fold_idx / n_folds * 100
+                progress = fold_idx / actual_n_folds * 100
+                callback(fold_idx, actual_n_folds, "start", progress, 0, 0, 0)
 
             fold_result = self._run_single_fold(
-                df, labels, fold_idx, train_range, val_range, test_range, callback
+                df, labels, fold_idx, actual_n_folds, train_range, val_range, test_range, callback
             )
             result.folds.append(fold_result)
+
+            # 单折完成回调
+            if fold_done_callback:
+                fold_done_callback(fold_result)
 
         result.summarize()
         return result
@@ -198,7 +220,7 @@ class WalkForwardValidator:
         return ranges
 
     def _run_single_fold(self, df: pd.DataFrame, labels: pd.Series,
-                          fold_idx: int,
+                          fold_idx: int, n_folds: int,
                           train_range: Tuple[int, int],
                           val_range: Tuple[int, int],
                           test_range: Tuple[int, int],
@@ -209,7 +231,7 @@ class WalkForwardValidator:
         from core.market_regime import MarketRegimeClassifier
         from core.feature_vector import FeatureVectorEngine
         from core.trajectory_engine import TrajectoryMemory
-        from core.ga_trading_optimizer import GATradingOptimizer, TradingParams
+        from core.ga_trading_optimizer import BayesianTradingOptimizer, TradingParams
         from utils.indicators import calculate_all_indicators
         from config import MARKET_REGIME_CONFIG
 
@@ -222,7 +244,9 @@ class WalkForwardValidator:
 
         # ── 1. 准备训练集 ──
         if callback:
-            callback(fold_idx, "train", "提取训练集模板...")
+            # 训练阶段占每折的25%
+            base_progress = fold_idx / n_folds * 100
+            callback(fold_idx, n_folds, "train", base_progress + 5, 0)
 
         train_df = df.iloc[train_range[0]:train_range[1]].copy().reset_index(drop=True)
         train_labels = labels.iloc[train_range[0]:train_range[1]].reset_index(drop=True)
@@ -269,9 +293,16 @@ class WalkForwardValidator:
             print(f"[Fold {fold_idx + 1}] 训练集模板不足 ({n_templates} < {self.min_train_trades})")
             return fold_result
 
+        # 训练完成，更新模板数
+        if callback:
+            base_progress = fold_idx / n_folds * 100
+            callback(fold_idx, n_folds, "train", base_progress + 25, n_templates, 0, 0)
+
         # ── 2. 验证集 GA 优化 ──
         if callback:
-            callback(fold_idx, "val", "GA优化交易参数...")
+            # 验证阶段占每折的50%
+            base_progress = fold_idx / n_folds * 100
+            callback(fold_idx, n_folds, "val", base_progress + 30, n_templates, 0, 1)
 
         val_df = df.iloc[val_range[0]:val_range[1]].copy().reset_index(drop=True)
         val_labels = labels.iloc[val_range[0]:val_range[1]].reset_index(drop=True)
@@ -280,21 +311,38 @@ class WalkForwardValidator:
         val_fv_engine = FeatureVectorEngine()
         val_fv_engine.precompute(val_df)
 
-        # 减少GA代数以加快速度
-        original_max_gen = GA_CONFIG["MAX_GENERATIONS"]
-        GA_CONFIG["MAX_GENERATIONS"] = min(30, original_max_gen)
+        # 贝叶斯优化参数（30次评估，快速模式）
+        n_trials = 30
 
-        try:
-            optimizer = GATradingOptimizer(
-                trajectory_memory=memory,
-                fv_engine=val_fv_engine,
-                val_df=val_df,
-                val_labels=val_labels,
-                regime_classifier=None,  # 验证集无法用训练集的分类器
-            )
-            best_params, best_sharpe = optimizer.run()
-        finally:
-            GA_CONFIG["MAX_GENERATIONS"] = original_max_gen
+        # 贝叶斯优化进度回调（每次trial完成）
+        def bayesian_callback(trial_idx, best_fitness, best_params):
+            if callback:
+                # 优化阶段占每折的50%（进度30~80）
+                base_progress = fold_idx / n_folds * 100
+                opt_progress = trial_idx / n_trials * 50  # 0~50%
+                total_progress = base_progress + 30 + opt_progress
+                callback(fold_idx, n_folds, "val", total_progress, n_templates,
+                         trial_idx, n_trials)
+
+        # 细粒度回调（兼容接口）
+        def bayesian_sub_callback(trial_idx, dummy, total):
+            if callback:
+                base_progress = fold_idx / n_folds * 100
+                opt_progress = trial_idx / n_trials * 50
+                total_progress = base_progress + 30 + opt_progress
+                callback(fold_idx, n_folds, "val", total_progress, n_templates,
+                         trial_idx, n_trials)
+
+        optimizer = BayesianTradingOptimizer(
+            trajectory_memory=memory,
+            fv_engine=val_fv_engine,
+            val_df=val_df,
+            val_labels=val_labels,
+            regime_classifier=None,
+            callback=bayesian_callback,
+            n_trials=n_trials,
+        )
+        best_params, best_sharpe = optimizer.run(sub_callback=bayesian_sub_callback)
 
         fold_result.best_params = best_params
         fold_result.val_sharpe = best_sharpe
@@ -306,7 +354,9 @@ class WalkForwardValidator:
 
         # ── 3. 测试集评估 ──
         if callback:
-            callback(fold_idx, "test", "测试集最终评估...")
+            # 测试阶段占每折的25%
+            base_progress = fold_idx / n_folds * 100
+            callback(fold_idx, n_folds, "test", base_progress + 80, n_templates, 0, 0)
 
         test_df = df.iloc[test_range[0]:test_range[1]].copy().reset_index(drop=True)
         test_labels = labels.iloc[test_range[0]:test_range[1]].reset_index(drop=True)
@@ -316,20 +366,22 @@ class WalkForwardValidator:
         test_fv_engine.precompute(test_df)
 
         # 用验证集优化的参数在测试集上评估
-        test_optimizer = GATradingOptimizer(
+        # 启用record_templates以记录模板匹配信息
+        test_optimizer = BayesianTradingOptimizer(
             trajectory_memory=memory,
             fv_engine=test_fv_engine,
             val_df=test_df,
             val_labels=test_labels,
             regime_classifier=None,
         )
-        test_result = test_optimizer._simulate_trading(best_params)
+        test_result = test_optimizer._simulate_trading(best_params, record_templates=True, fast_mode=False)
 
         fold_result.test_sharpe = test_result.sharpe_ratio
         fold_result.test_n_trades = test_result.n_trades
         fold_result.test_win_rate = test_result.win_rate
         fold_result.test_total_profit = test_result.total_profit
         fold_result.test_max_drawdown = test_result.max_drawdown
+        fold_result.test_trades = test_result.trades  # 保存详细交易记录
 
         return fold_result
 
@@ -351,3 +403,39 @@ def quick_train_test_split(df: pd.DataFrame, labels: pd.Series,
     test_labels = labels.iloc[split_idx:].reset_index(drop=True)
 
     return train_df, train_labels, test_df, test_labels
+
+
+def evaluate_templates_from_wf_result(wf_result: WalkForwardResult,
+                                       memory,
+                                       min_matches: int = 3,
+                                       min_win_rate: float = 0.6):
+    """
+    从Walk-Forward结果中评估模板表现
+
+    Args:
+        wf_result: WalkForwardResult 实例
+        memory: TrajectoryMemory 实例（用于初始化评估器）
+        min_matches: 最小匹配次数要求
+        min_win_rate: 最小胜率要求
+
+    Returns:
+        EvaluationResult 评估结果
+    """
+    from core.template_evaluator import TemplateEvaluator
+
+    evaluator = TemplateEvaluator(memory)
+
+    # 收集所有测试集交易的模板匹配数据
+    all_trades = wf_result.get_all_test_trades()
+
+    for trade in all_trades:
+        if trade.template_fingerprint:
+            evaluator.record_match(trade.template_fingerprint, trade.profit_pct)
+
+    # 评估并返回结果
+    result = evaluator.evaluate(
+        min_matches=min_matches,
+        min_win_rate=min_win_rate
+    )
+
+    return result

@@ -547,6 +547,84 @@ class TrajectoryMemory:
 
         return filepath
 
+    def get_template_with_global_index(self, global_idx: int) -> Optional[TrajectoryTemplate]:
+        """
+        根据全局索引获取模板
+
+        Args:
+            global_idx: 全局模板索引（跨所有regime/direction）
+
+        Returns:
+            模板或None
+        """
+        current = 0
+        for regime in sorted(self._templates.keys()):
+            for direction in ["LONG", "SHORT"]:
+                templates = self.get_candidates(regime, direction)
+                if current + len(templates) > global_idx:
+                    return templates[global_idx - current]
+                current += len(templates)
+        return None
+
+    def filter_by_fingerprints(self, keep_fingerprints: set, verbose: bool = True) -> int:
+        """
+        根据指纹集合过滤模板，只保留指纹在集合中的模板
+
+        Args:
+            keep_fingerprints: 要保留的模板指纹集合
+            verbose: 是否打印信息
+
+        Returns:
+            删除的模板数量
+        """
+        removed = 0
+        new_templates = {}
+
+        for regime in self._templates:
+            new_templates[regime] = {}
+            for direction in self._templates[regime]:
+                kept = []
+                for template in self._templates[regime][direction]:
+                    if template.fingerprint() in keep_fingerprints:
+                        kept.append(template)
+                    else:
+                        removed += 1
+                if kept:
+                    new_templates[regime][direction] = kept
+
+        # 清理空的regime
+        self._templates = {r: d for r, d in new_templates.items() if d}
+        self._total_count = sum(
+            len(templates)
+            for regime_dict in self._templates.values()
+            for templates in regime_dict.values()
+        )
+
+        if verbose:
+            print(f"[TrajectoryMemory] 过滤完成: 删除 {removed} 个模板, 保留 {self._total_count} 个")
+
+        return removed
+
+    def remove_by_fingerprints(self, remove_fingerprints: set, verbose: bool = True) -> int:
+        """
+        根据指纹集合删除模板
+
+        Args:
+            remove_fingerprints: 要删除的模板指纹集合
+            verbose: 是否打印信息
+
+        Returns:
+            删除的模板数量
+        """
+        all_templates = self.get_all_templates()
+        keep_fingerprints = set()
+        for t in all_templates:
+            fp = t.fingerprint()
+            if fp not in remove_fingerprints:
+                keep_fingerprints.add(fp)
+
+        return self.filter_by_fingerprints(keep_fingerprints, verbose)
+
 
 def extract_current_trajectory(fv_engine, current_idx: int,
                                 pre_window: int = None) -> np.ndarray:
