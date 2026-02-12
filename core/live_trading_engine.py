@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.live_data_feed import LiveDataFeed, KlineData
 from core.paper_trader import PaperOrder, OrderSide, CloseReason
 from core.binance_testnet_trader import BinanceTestnetTrader
+from core.market_regime import MarketRegimeClassifier, MarketRegime
+from core.labeler import SwingPoint
 
 
 @dataclass
@@ -48,7 +50,12 @@ class EngineState:
     market_regime: str = "未知"
     fingerprint_status: str = "待匹配"
     decision_reason: str = ""
+    hold_reason: str = ""        # 为何继续持仓
+    danger_level: float = 0.0    # 风险度 (0-100%)
+    exit_reason: str = ""        # 预估平仓理由
     position_side: str = "-"
+    swing_points_count: int = 0       # 已识别的摆动点数量
+    last_event: str = ""              # 最新事件（用于UI日志显示）
 
 
 class LiveTradingEngine:
@@ -73,7 +80,7 @@ class LiveTradingEngine:
                  initial_balance: float = 5000.0,
                  leverage: float = 10,
                  # 匹配参数
-                 cosine_threshold: float = 0.6,
+                 cosine_threshold: float = 0.7,
                  dtw_threshold: float = 0.5,
                  min_templates_agree: int = 1,
                  # 止盈止损参数
@@ -211,6 +218,13 @@ class LiveTradingEngine:
         self._current_template = None
         self._current_prototype = None
         
+        # 市场状态分类（6态上帝视角）
+        self._swing_points: List[SwingPoint] = []  # 实时检测的摆动点
+        self._regime_classifier: Optional[MarketRegimeClassifier] = None
+        # 摆动点检测窗口（从配置读取，应与训练一致）
+        from config import LABELING_CONFIG
+        self._swing_window = LABELING_CONFIG.get("SWING_WINDOW", 5)
+        
         # 线程控制
         self._running = False
         self._lock = threading.Lock()
@@ -321,6 +335,8 @@ class LiveTradingEngine:
                     created_at=src.created_at,
                     source_template_count=src.source_template_count,
                     clustering_params=src.clustering_params,
+                    source_symbol=getattr(src, "source_symbol", ""),
+                    source_interval=getattr(src, "source_interval", ""),
                 )
                 self._proto_matcher = PrototypeMatcher(
                     library=self._active_prototype_library,
@@ -387,10 +403,78 @@ class LiveTradingEngine:
             
             print(f"[LiveEngine] 历史特征计算完成: {len(df)} 根K线")
             
+            # 【新增】从历史数据预先检测摆动点，避免冷启动等待
+            self._init_swing_points_from_history()
+            
         except Exception as e:
             print(f"[LiveEngine] 特征计算失败: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _init_swing_points_from_history(self):
+        """从历史数据预先检测摆动点（避免冷启动等待）"""
+        if self._df_buffer is None or len(self._df_buffer) < 20:
+            return
+        
+        try:
+            import numpy as np
+            
+            high = self._df_buffer['high'].values
+            low = self._df_buffer['low'].values
+            window = self._swing_window
+            n = len(high)
+            
+            # 清空现有摆动点
+            self._swing_points = []
+            
+            # 从头到尾扫描历史数据，检测所有可确认的摆动点
+            # 从 window 开始，到 n - window 结束（需要前后各 window 个K线确认）
+            for i in range(window, n - window):
+                start = i - window
+                end = i + window + 1
+                
+                hi = high[i]
+                lo = low[i]
+                
+                # 检测高点
+                if hi >= np.max(high[start:end]):
+                    self._swing_points.append(SwingPoint(
+                        index=i,
+                        price=hi,
+                        is_high=True,
+                        atr=0.0
+                    ))
+                # 检测低点
+                elif lo <= np.min(low[start:end]):
+                    self._swing_points.append(SwingPoint(
+                        index=i,
+                        price=lo,
+                        is_high=False,
+                        atr=0.0
+                    ))
+            
+            # 按时间排序
+            self._swing_points.sort(key=lambda s: s.index)
+            
+            raw_count = len(self._swing_points)
+            
+            # 过滤为交替序列
+            self._swing_points = self._filter_alternating_swings(self._swing_points)
+            
+            # 只保留最近的若干个摆动点（避免过多历史数据干扰）
+            if len(self._swing_points) > 10:
+                self._swing_points = self._swing_points[-10:]
+            
+            print(f"[LiveEngine] 历史摆动点预检测: {len(self._swing_points)} 个 (原始: {raw_count})")
+            
+            if self._swing_points:
+                # 显示最近的摆动点
+                recent = self._swing_points[-4:] if len(self._swing_points) >= 4 else self._swing_points
+                seq = [('H' if s.is_high else 'L') + f'@{s.index}' for s in recent]
+                print(f"[LiveEngine] 最近摆动点序列: {seq}")
+            
+        except Exception as e:
+            print(f"[LiveEngine] 历史摆动点检测失败: {e}")
     
     def _on_kline_received(self, kline: KlineData):
         """K线数据回调"""
@@ -410,17 +494,27 @@ class LiveTradingEngine:
             if self.on_kline:
                 self.on_kline(kline)
             
-            # 只处理完整K线
+            # 只处理完整K线（入场/持仓决策）
             if kline.is_closed:
                 self._process_closed_kline(kline)
             else:
-                # 实时更新持仓盈亏
+                # 实时更新持仓盈亏 + TP/SL检查（含挂起重试）
                 if self._paper_trader.has_position():
-                    self._paper_trader.update_price(
+                    close_reason = self._paper_trader.update_price(
                         kline.close,
                         high=kline.high,
                         low=kline.low,
                     )
+                    if close_reason:
+                        self.state.matching_phase = "等待"
+                        self.state.tracking_status = "-"
+                        self._current_template = None
+                        self._current_prototype = None
+                        self.state.position_side = "-"
+                        self.state.decision_reason = f"实时TP/SL触发: {close_reason.value}"
+                else:
+                    # 未持仓时，做预匹配展示（不下单，仅更新UI状态）
+                    self._preview_match(kline)
             
             if self.on_state_update:
                 self.on_state_update(self.state)
@@ -430,8 +524,12 @@ class LiveTradingEngine:
         self.state.total_bars += 1
         self._current_bar_idx += 1
         
+        print(f"[LiveEngine] K线收线: {kline.open_time} | 价格={kline.close:.2f} | 持仓={self._paper_trader.has_position()}")
+        self.state.last_event = f"K线收线 {kline.open_time.strftime('%H:%M')} | ${kline.close:,.2f}"
+        
         # 更新DataFrame和特征
         if not self._update_features(kline):
+            print("[LiveEngine] 特征更新失败，跳过本K线")
             return
         
         # 获取当前ATR
@@ -441,6 +539,7 @@ class LiveTradingEngine:
         if self._paper_trader.has_position():
             self._process_holding(kline, atr)
         else:
+            print(f"[LiveEngine] 尝试入场匹配...")
             self._process_entry(kline, atr)
     
     def _update_features(self, kline: KlineData) -> bool:
@@ -515,8 +614,23 @@ class LiveTradingEngine:
             chosen_fp = ""
 
             if self.use_prototypes:
-                long_result = self._proto_matcher.match_entry(pre_entry_traj, direction="LONG")
-                short_result = self._proto_matcher.match_entry(pre_entry_traj, direction="SHORT")
+                # 关键：传入当前市场状态
+                current_regime = self.state.market_regime
+                
+                # 【预热期降级逻辑】
+                # 如果摆动点不足 4 个，市场状态为 UNKNOWN。
+                # 此时 match_entry 如果传入 regime="未知"，通常会因为原型库中没有该状态而返回未匹配。
+                # 我们将其改为 None，让 matcher 跳过状态过滤，直接匹配所有原型。
+                match_regime = current_regime
+                if current_regime == MarketRegime.UNKNOWN:
+                    match_regime = None
+                
+                long_result = self._proto_matcher.match_entry(
+                    pre_entry_traj, direction="LONG", regime=match_regime
+                )
+                short_result = self._proto_matcher.match_entry(
+                    pre_entry_traj, direction="SHORT", regime=match_regime
+                )
 
                 chosen_proto = None
                 long_sim = long_result.get("similarity", 0.0)
@@ -531,10 +645,19 @@ class LiveTradingEngine:
                 elif short_result.get("matched"):
                     direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
 
+                # 提取投票信息
+                long_votes = long_result.get("vote_long", 0)
+                short_votes = short_result.get("vote_short", 0)
+                print(f"[LiveEngine] 原型匹配结果: LONG={long_sim:.2%}(投票{long_votes}) | SHORT={short_sim:.2%}(投票{short_votes})")
+                
                 if direction is not None and chosen_proto is not None:
-                    chosen_fp = f"proto_{chosen_proto.direction}_{chosen_proto.prototype_id}"
+                    # 显示包含市场状态的原型名称
+                    regime_short = chosen_proto.regime[:2] if chosen_proto.regime else ""
+                    chosen_fp = f"proto_{chosen_proto.direction}_{chosen_proto.prototype_id}_{regime_short}"
                     self._current_prototype = chosen_proto
                     self._current_template = None
+                    print(f"[LiveEngine] 匹配成功! 方向={direction} | 原型={chosen_fp} | 相似度={similarity:.2%}")
+                    self.state.last_event = f"匹配成功 {direction} | {chosen_fp} | {similarity:.1%}"
             else:
                 long_candidates = self.trajectory_memory.get_templates_by_direction("LONG")
                 short_candidates = self.trajectory_memory.get_templates_by_direction("SHORT")
@@ -577,26 +700,48 @@ class LiveTradingEngine:
 
             if direction is not None and chosen_fp:
                 self.state.best_match_similarity = similarity
-                self.state.best_match_template = chosen_fp[:8]
+                self.state.best_match_template = chosen_fp
                 
-                # 计算止盈止损
+                # 【动态止盈止损】基于原型历史表现计算
                 price = kline.close
                 if direction == "LONG":
                     side = OrderSide.LONG
-                    take_profit = price + atr * self.take_profit_atr
-                    stop_loss = price - atr * self.stop_loss_atr
                 else:
                     side = OrderSide.SHORT
-                    take_profit = price - atr * self.take_profit_atr
-                    stop_loss = price + atr * self.stop_loss_atr
                 
-                reason = self._build_entry_reason(
+                # 使用原型的历史表现计算动态TP/SL
+                take_profit, stop_loss = self._calculate_dynamic_tp_sl(
+                    entry_price=price,
                     direction=direction,
-                    similarity=similarity,
-                    regime=self.state.market_regime,
-                    template_fp=chosen_fp,
-                    atr=atr,
+                    prototype=chosen_proto,
+                    atr=atr
                 )
+                
+                # 构建详细的开仓原因说明（包含原型历史表现和动态TP/SL）
+                tp_pct = ((take_profit / price) - 1) * 100 if direction == "LONG" else ((price / take_profit) - 1) * 100
+                sl_pct = ((price / stop_loss) - 1) * 100 if direction == "LONG" else ((stop_loss / price) - 1) * 100
+                
+                if chosen_proto and getattr(chosen_proto, 'member_count', 0) >= 10:
+                    # 有足够数据的原型
+                    reason = (
+                        f"[开仓逻辑] 市场={self.state.market_regime} | 信号={direction} | "
+                        f"原型={chosen_fp}(胜率={chosen_proto.win_rate:.1%}, "
+                        f"历史平均收益={chosen_proto.avg_profit_pct:.2f}%, "
+                        f"样本={chosen_proto.member_count}笔) | "
+                        f"相似度={similarity:.2%} | "
+                        f"动态TP={take_profit:.2f}(+{tp_pct:.2f}%) "
+                        f"动态SL={stop_loss:.2f}(-{sl_pct:.2f}%)"
+                    )
+                else:
+                    # 数据不足，使用固定ATR
+                    reason = (
+                        f"[开仓逻辑] 市场={self.state.market_regime} | 信号={direction} | "
+                        f"原型={chosen_fp}(数据不足,使用固定ATR) | "
+                        f"相似度={similarity:.2%} | "
+                        f"TP={take_profit:.2f}(+{tp_pct:.2f}%) "
+                        f"SL={stop_loss:.2f}(-{sl_pct:.2f}%)"
+                    )
+
                 
                 order = self._paper_trader.open_position(
                     side=side,
@@ -624,17 +769,163 @@ class LiveTradingEngine:
             self.state.fingerprint_status = "未匹配"
             self.state.best_match_similarity = 0.0
             self.state.best_match_template = None
-            self.state.decision_reason = self._build_no_entry_reason(
-                regime=self.state.market_regime,
-                long_sim=(long_result.get("similarity", 0.0) if self.use_prototypes else long_result.dtw_similarity),
-                short_sim=(short_result.get("similarity", 0.0) if self.use_prototypes else short_result.dtw_similarity),
-            )
+            
+            if self.use_prototypes:
+                self.state.decision_reason = self._build_no_entry_reason(
+                    regime=self.state.market_regime,
+                    long_sim=long_result.get("similarity", 0.0),
+                    short_sim=short_result.get("similarity", 0.0),
+                    long_votes=long_result.get("vote_long", 0),
+                    short_votes=short_result.get("vote_short", 0),
+                    threshold=self.cosine_threshold,
+                    min_agree=self.min_templates_agree,
+                )
+            else:
+                self.state.decision_reason = self._build_no_entry_reason(
+                    regime=self.state.market_regime,
+                    long_sim=long_result.dtw_similarity,
+                    short_sim=short_result.dtw_similarity,
+                )
             
         except Exception as e:
             print(f"[LiveEngine] 入场匹配失败: {e}")
             import traceback
             traceback.print_exc()
     
+    def _preview_match(self, kline: KlineData):
+        """K线未收线时的预匹配展示（不下单，仅更新UI状态供用户参考）"""
+        # 【关键】更新市场状态，确保UI始终显示最新市场状态
+        self.state.market_regime = self._infer_market_regime()
+        
+        if self._fv_engine is None:
+            return
+        if self.use_prototypes and self._proto_matcher is None:
+            return
+        if (not self.use_prototypes) and self._matcher is None:
+            return
+
+        try:
+            from config import TRAJECTORY_CONFIG
+            pre_entry_window = TRAJECTORY_CONFIG.get("PRE_ENTRY_WINDOW", 60)
+            start_idx = max(0, self._current_bar_idx - pre_entry_window)
+            pre_entry_traj = self._fv_engine.get_raw_matrix(start_idx, self._current_bar_idx + 1)
+            if pre_entry_traj.size == 0:
+                return
+
+            best_sim = 0.0
+            best_fp = ""
+            best_dir = ""
+            long_sim = 0.0 # Initialize for the no-match message
+            short_sim = 0.0 # Initialize for the no-match message
+
+            if self.use_prototypes:
+                # 预匹配时也使用当前市场状态过滤
+                current_regime = self.state.market_regime
+                
+                # 【预热期降级逻辑】与入场逻辑一致：UNKNOWN 时跳过 regime 过滤
+                match_regime = current_regime
+                if current_regime == MarketRegime.UNKNOWN:
+                    match_regime = None
+                
+                long_r = self._proto_matcher.match_entry(
+                    pre_entry_traj, direction="LONG", regime=match_regime
+                )
+                short_r = self._proto_matcher.match_entry(
+                    pre_entry_traj, direction="SHORT", regime=match_regime
+                )
+                long_sim = long_r.get("similarity", 0.0)
+                short_sim = short_r.get("similarity", 0.0)
+                long_votes = long_r.get("vote_long", 0)
+                short_votes = short_r.get("vote_short", 0)
+                long_matched = long_r.get("matched", False)
+                short_matched = short_r.get("matched", False)
+                
+                if long_sim >= short_sim and long_sim > 0:
+                    best_sim = long_sim
+                    best_votes = long_votes
+                    best_matched = long_matched
+                    proto = long_r.get("best_prototype")
+                    regime_short = proto.regime[:2] if proto and proto.regime else ""
+                    best_fp = f"proto_{proto.direction}_{proto.prototype_id}_{regime_short}" if proto else ""
+                    best_dir = "LONG"
+                elif short_sim > 0:
+                    best_sim = short_sim
+                    best_votes = short_votes
+                    best_matched = short_matched
+                    proto = short_r.get("best_prototype")
+                    regime_short = proto.regime[:2] if proto and proto.regime else ""
+                    best_fp = f"proto_{proto.direction}_{proto.prototype_id}_{regime_short}" if proto else ""
+                    best_dir = "SHORT"
+                else:
+                    best_votes = 0
+                    best_matched = False
+            else:
+                # For non-prototype matching, we still need long_sim and short_sim for the decision reason
+                long_candidates = self.trajectory_memory.get_templates_by_direction("LONG")
+                short_candidates = self.trajectory_memory.get_templates_by_direction("SHORT")
+                
+                long_r = self._matcher.match_entry(
+                    pre_entry_traj,
+                    long_candidates,
+                    cosine_threshold=self.cosine_threshold,
+                    dtw_threshold=self.dtw_threshold,
+                )
+                short_r = self._matcher.match_entry(
+                    pre_entry_traj,
+                    short_candidates,
+                    cosine_threshold=self.cosine_threshold,
+                    dtw_threshold=self.dtw_threshold,
+                )
+                long_sim = long_r.dtw_similarity
+                short_sim = short_r.dtw_similarity
+
+                # The rest of the logic for best_sim, best_fp, best_dir would go here if needed for non-prototype preview
+                # However, the user's instruction only modified the prototype branch for best_sim/fp/dir.
+                # For the non-prototype case, the original code didn't update best_sim/fp/dir in preview.
+                # So, we only calculate long_sim/short_sim here for the decision reason.
+
+
+            # 更新状态（预览，不触发交易）
+            self.state.matching_phase = "预匹配(等待收线)"
+            self.state.fingerprint_status = "实时预览"
+            self.state.best_match_similarity = best_sim
+            self.state.best_match_template = best_fp if best_fp else None
+            
+            if self.use_prototypes and best_sim > 0 and best_fp:
+                # 判断收线后是否会开仓
+                will_open = best_matched
+                status_icon = "✅可开仓" if will_open else "⏳待确认"
+                vote_info = f"投票={best_votes}/{self.min_templates_agree}"
+                threshold_info = f"阈值={self.cosine_threshold:.0%}"
+                
+                self.state.decision_reason = (
+                    f"[预匹配] 市场={self.state.market_regime} | {best_dir} | "
+                    f"相似度={best_sim:.1%} | {vote_info} | {threshold_info} | "
+                    f"{status_icon} — 等K线收线"
+                )
+            elif best_sim > 0 and best_fp:
+                self.state.decision_reason = (
+                    f"[预匹配] 市场={self.state.market_regime} | 最佳={best_dir} | "
+                    f"原型={best_fp} | 相似度={best_sim:.2%} — 等待K线收线后确认入场"
+                )
+            else:
+                if self.use_prototypes:
+                    self.state.decision_reason = (
+                        f"[观望] 市场={self.state.market_regime} | "
+                        f"LONG={long_sim:.1%}(投票{long_votes}) | SHORT={short_sim:.1%}(投票{short_votes}) | "
+                        f"❌未达阈值{self.cosine_threshold:.0%}"
+                    )
+                else:
+                    self.state.decision_reason = (
+                        f"[观望] 市场={self.state.market_regime} | "
+                        f"未找到匹配原型（LONG={long_sim:.1%}, SHORT={short_sim:.1%}）"
+                    )
+
+        except Exception as e:
+            # 预匹配失败不影响主流程
+            print(f"[LiveEngine] 预匹配失败: {e}")
+
+
     def _process_holding(self, kline: KlineData, atr: float):
         """处理持仓逻辑"""
         self.state.matching_phase = "持仓中"
@@ -661,27 +952,21 @@ class LiveTradingEngine:
             self.state.decision_reason = self._build_exit_reason(close_reason.value, order)
             return
         
-        # 检查最大持仓时间
-        if order.hold_bars >= self.max_hold_bars:
-            self._paper_trader.close_position(
-                kline.close,
-                self._current_bar_idx,
-                CloseReason.MAX_HOLD,
-            )
-            self.state.matching_phase = "等待"
-            self.state.tracking_status = "-"
-            self._current_template = None
-            self._current_prototype = None
-            self.state.position_side = "-"
-            self.state.decision_reason = self._build_exit_reason("超时", order)
-            return
+        # 【删除】最大持仓时间限制 - 完全依赖轨迹相似度追踪
         
         # 动态追踪检查
         if order.hold_bars > 0 and order.hold_bars % self.hold_check_interval == 0:
             self._check_holding_similarity(kline)
     
     def _check_holding_similarity(self, kline: KlineData):
-        """检查持仓相似度（动态追踪）"""
+        """
+        检查持仓相似度（动态追踪）
+        
+        三阶段匹配系统的第二、三阶段：
+        1. 持仓健康度监控 - 与当前原型的持仓段对比
+        2. 持仓重匹配 - 如果有更匹配的原型则切换
+        3. 离场模式检测 - 检查是否开始像原型的出场段
+        """
         if self._fv_engine is None:
             return
         if self.use_prototypes and self._current_prototype is None:
@@ -702,21 +987,108 @@ class LiveTradingEngine:
             if holding_traj.size == 0:
                 return
             
+            direction = "LONG" if order.side == OrderSide.LONG else "SHORT"
+            
             if self.use_prototypes:
-                similarity, _ = self._proto_matcher.check_holding_health(
+                # ══════════════════════════════════════════════════════════
+                # 阶段1：持仓健康度监控
+                # ══════════════════════════════════════════════════════════
+                similarity, health_status = self._proto_matcher.check_holding_health(
                     holding_traj, self._current_prototype
                 )
+                
+                # ══════════════════════════════════════════════════════════
+                # 阶段2：持仓重匹配 - 检查是否有更匹配的原型
+                # ══════════════════════════════════════════════════════════
+                # 仅在相似度下降时尝试重匹配（节省计算）
+                if similarity < self.hold_safe_threshold and order.hold_bars >= 5:
+                    # 获取当前市场状态用于过滤
+                    current_regime = self.state.market_regime
+                    if current_regime == MarketRegime.UNKNOWN:
+                        current_regime = None  # 预热期不过滤
+                    
+                    new_proto, new_sim, switched = self._proto_matcher.rematch_by_holding(
+                        holding_traj,
+                        self._current_prototype,
+                        direction,
+                        regime=current_regime,
+                        switch_threshold=0.1,  # 新原型需超出10%才切换
+                    )
+                    
+                    if switched:
+                        old_id = self._current_prototype.prototype_id
+                        self._current_prototype = new_proto
+                        similarity = new_sim
+                        print(f"[LiveEngine] 持仓切换原型: {old_id} → {new_proto.prototype_id} "
+                              f"(相似度: {new_sim:.1%})")
+                        
+                        # 更新订单的模板指纹
+                        order.template_fingerprint = f"proto_{direction}_{new_proto.prototype_id}"
+                
+                # ══════════════════════════════════════════════════════════
+                # 阶段3：离场模式检测
+                # ══════════════════════════════════════════════════════════
+                # 取最近的轨迹（持仓末尾）用于出场模式匹配
+                from config import TRAJECTORY_CONFIG
+                pre_exit_window = TRAJECTORY_CONFIG.get("PRE_EXIT_WINDOW", 10)
+                recent_traj = holding_traj[-pre_exit_window:] if len(holding_traj) >= pre_exit_window else holding_traj
+                
+                exit_check = self._proto_matcher.check_exit_pattern(
+                    recent_trajectory=recent_traj,
+                    current_prototype=self._current_prototype,
+                    direction=direction,
+                    entry_price=order.entry_price,
+                    current_price=kline.close,
+                    stop_loss=order.stop_loss or order.entry_price,
+                    take_profit=order.take_profit or order.entry_price,
+                    current_regime=self.state.market_regime,
+                )
+                
+                # 如果离场模式检测建议离场
+                if exit_check["should_exit"]:
+                    exit_reason_str = exit_check["exit_reason"]
+                    print(f"[LiveEngine] 离场模式触发: {exit_reason_str} "
+                          f"(信号强度: {exit_check['exit_signal_strength']:.0%})")
+                    
+                    # 执行信号离场
+                    self._paper_trader.close_position(
+                        exit_price=kline.close,
+                        exit_time=datetime.now(),
+                        reason=CloseReason.SIGNAL,
+                        bar_idx=self._current_bar_idx,
+                    )
+                    
+                    self.state.matching_phase = "等待"
+                    self.state.tracking_status = "-"
+                    self.state.hold_reason = ""
+                    self.state.danger_level = 0.0
+                    self.state.exit_reason = ""
+                    self._current_template = None
+                    self._current_prototype = None
+                    self.state.position_side = "-"
+                    self.state.decision_reason = self._build_exit_reason(f"信号({exit_reason_str})", order)
+                    return
+                
+                # 更新状态中的出场预估
+                if exit_check["exit_signal_strength"] > 0.3:
+                    self.state.exit_reason = (
+                        f"出场信号 {exit_check['exit_signal_strength']:.0%} | "
+                        f"模式匹配 {exit_check['pattern_similarity']:.0%} | "
+                        f"价格位置 {exit_check['price_position']:+.0%}"
+                    )
+                
             else:
-                # 计算与当前模板的相似度
+                # 模板模式（旧逻辑）
                 divergence, _ = self._matcher.monitor_holding(
                     holding_traj,
                     self._current_template,
-                    divergence_limit=1.0 - self.hold_derail_threshold,  # 转换为偏离度
+                    divergence_limit=1.0 - self.hold_derail_threshold,
                 )
-                # 相似度 = 1 - 偏离度
                 similarity = max(0.0, 1.0 - divergence)
             
-            # 更新追踪状态
+            # ══════════════════════════════════════════════════════════
+            # 更新追踪状态（原有逻辑）
+            # ══════════════════════════════════════════════════════════
             close_reason = self._paper_trader.update_tracking_status(
                 similarity,
                 safe_threshold=self.hold_safe_threshold,
@@ -729,16 +1101,96 @@ class LiveTradingEngine:
             self.state.tracking_status = order.tracking_status
             self.state.best_match_similarity = similarity
             
+            # 填充持仓监控说明
+            status_map = {"安全": "形态配合完美", "警戒": "形态轻微偏离"}
+            hold_desc = status_map.get(order.tracking_status, "形态匹配中")
+            self.state.hold_reason = f"相似度 {similarity:.1%} >= 警戒线 {self.hold_alert_threshold:.1%}，{hold_desc}，故继续持仓。"
+            
+            # 持仓风险度
+            danger = max(0.0, (1.0 - similarity) / (1.0 - self.hold_derail_threshold)) * 100
+            self.state.danger_level = min(100.0, danger)
+            
+            # 如果没有更具体的出场预估，使用默认
+            if not self.state.exit_reason or similarity < self.hold_safe_threshold:
+                if similarity < self.hold_safe_threshold:
+                    self.state.exit_reason = f"相似度下降 ({similarity:.1%})，若跌破 {self.hold_derail_threshold:.1%} 触发【脱轨】。"
+                else:
+                    self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
+            
             if close_reason:
                 self.state.matching_phase = "等待"
                 self.state.tracking_status = "-"
+                self.state.hold_reason = ""
+                self.state.danger_level = 0.0
+                self.state.exit_reason = ""
                 self._current_template = None
                 self._current_prototype = None
                 self.state.position_side = "-"
                 self.state.decision_reason = self._build_exit_reason("脱轨", order)
             
         except Exception as e:
+            import traceback
             print(f"[LiveEngine] 持仓追踪失败: {e}")
+            traceback.print_exc()
+    
+    def _calculate_dynamic_tp_sl(self, entry_price: float, direction: str,
+                                  prototype, atr: float):
+        """
+        基于原型历史表现计算动态止盈止损
+        
+        Args:
+            entry_price: 入场价格
+            direction: LONG/SHORT
+            prototype: 匹配的原型（Prototype对象）
+            atr: 当前ATR
+        
+        Returns:
+            (take_profit_price, stop_loss_price)
+        """
+        # 安全检查：如果原型数据不足，回退到固定ATR倍数
+        if not prototype or getattr(prototype, 'member_count', 0) < 10:
+            if direction == "LONG":
+                tp = entry_price + atr * self.take_profit_atr
+                sl = entry_price - atr * self.stop_loss_atr
+            else:
+                tp = entry_price - atr * self.take_profit_atr
+                sl = entry_price + atr * self.stop_loss_atr
+            return tp, sl
+        
+        # 1. 计算止盈目标（基于平均收益率）
+        import numpy as np
+        profit_pct = np.clip(prototype.avg_profit_pct, 0.5, 10.0) / 100.0
+        
+        # 根据胜率调整（高胜率更激进，低胜率更保守）
+        win_rate = prototype.win_rate
+        if win_rate >= 0.75:
+            profit_pct *= 1.2  # 高胜率：提高20%
+        elif win_rate < 0.60:
+            profit_pct *= 0.8  # 低胜率：降低20%
+        
+        # 2. 计算止损幅度（基于风险收益比）
+        if win_rate >= 0.70:
+            risk_reward_ratio = 2.0  # 高胜率：1:2
+        elif win_rate >= 0.50:
+            risk_reward_ratio = 1.5  # 中胜率：1:1.5
+        else:
+            risk_reward_ratio = 1.0  # 低胜率：1:1
+        
+        stop_loss_pct = profit_pct / risk_reward_ratio
+        
+        # ATR保护：止损至少为1.5倍ATR
+        min_stop_loss_pct = (atr / entry_price) * 1.5
+        stop_loss_pct = max(stop_loss_pct, min_stop_loss_pct)
+        
+        # 3. 计算最终价格
+        if direction == "LONG":
+            take_profit = entry_price * (1 + profit_pct)
+            stop_loss = entry_price * (1 - stop_loss_pct)
+        else:  # SHORT
+            take_profit = entry_price * (1 - profit_pct)
+            stop_loss = entry_price * (1 + stop_loss_pct)
+        
+        return take_profit, stop_loss
     
     def _on_order_update(self, order: PaperOrder):
         """订单更新回调"""
@@ -757,23 +1209,141 @@ class LiveTradingEngine:
         self.state.position_side = "-"
     
     def _infer_market_regime(self) -> str:
-        """轻量市场状态推断（实时）"""
+        """
+        使用上帝视角6态市场状态分类（与训练一致）
+        
+        6个状态：
+          - 强多头 (STRONG_BULL)
+          - 弱多头 (WEAK_BULL)
+          - 震荡偏多 (RANGE_BULL)
+          - 震荡偏空 (RANGE_BEAR)
+          - 弱空头 (WEAK_BEAR)
+          - 强空头 (STRONG_BEAR)
+        """
         if self._df_buffer is None or len(self._df_buffer) < 30:
-            return "未知"
+            return MarketRegime.UNKNOWN
+        
         try:
-            closes = self._df_buffer["close"].values
-            atr = self._df_buffer["atr"].values if "atr" in self._df_buffer.columns else None
-            ret_20 = (closes[-1] / closes[-20] - 1.0) if closes[-20] != 0 else 0.0
-            atr_ratio = float(np.nanmean(atr[-20:]) / closes[-1]) if atr is not None and closes[-1] != 0 else 0.0
-            if ret_20 > 0.004:
-                return "上涨趋势"
-            if ret_20 < -0.004:
-                return "下跌趋势"
-            if atr_ratio > 0.004:
-                return "高波动震荡"
-            return "震荡"
-        except Exception:
-            return "未知"
+            # 1. 更新摆动点检测（只使用已确认的历史数据）
+            self._update_swing_points()
+            
+            # 更新状态中的摆动点计数（供UI显示）
+            self.state.swing_points_count = len(self._swing_points)
+            
+            # 2. 检查是否有足够的摆动点（与上帝视角一致，需要 4 个：2高2低）
+            if len(self._swing_points) < 4:
+                return MarketRegime.UNKNOWN
+            
+            # 3. 创建/更新分类器
+            from config import MARKET_REGIME_CONFIG
+            self._regime_classifier = MarketRegimeClassifier(
+                alternating_swings=self._swing_points,
+                config=MARKET_REGIME_CONFIG
+            )
+            
+            # 4. 分类当前K线的市场状态
+            current_idx = len(self._df_buffer) - 1
+            regime = self._regime_classifier.classify_at(current_idx)
+            return regime
+            
+        except Exception as e:
+            print(f"[LiveEngine] 市场状态分类失败: {e}")
+            return MarketRegime.UNKNOWN
+    
+    def _update_swing_points(self):
+        """
+        实时更新摆动点检测（只使用已确认的历史数据）
+        
+        与上帝视角的区别：
+          - 上帝视角在 i 位置可以看 i+window 的数据
+          - 实时只能看 i-window 到 i 的数据，所以有 window 个K线的延迟
+        
+        检测逻辑：
+          当前位置 = current_idx
+          确认位置 = current_idx - swing_window
+          如果确认位置是局部极值（相对于前后各 swing_window 个K线），则标记
+        """
+        if self._df_buffer is None:
+            return
+        
+        n = len(self._df_buffer)
+        window = self._swing_window
+        
+        # 需要足够的历史数据
+        if n < window * 2 + 1:
+            return
+        
+        high = self._df_buffer['high'].values
+        low = self._df_buffer['low'].values
+        
+        # 只检测可以确认的位置（current_idx - window）
+        # 因为需要前后各 window 个K线来确认极值
+        confirm_idx = n - 1 - window
+        if confirm_idx < window:
+            return
+        
+        # 检查这个位置是否已经被检测过
+        existing_indices = {s.index for s in self._swing_points}
+        if confirm_idx in existing_indices:
+            return
+        
+        # 检测窗口范围
+        start = confirm_idx - window
+        end = confirm_idx + window + 1  # exclusive
+        
+        hi = high[confirm_idx]
+        lo = low[confirm_idx]
+        
+        # 检测高点
+        if hi >= np.max(high[start:end]):
+            self._swing_points.append(SwingPoint(
+                index=confirm_idx,
+                price=hi,
+                is_high=True,
+                atr=0.0
+            ))
+        # 检测低点
+        elif lo <= np.min(low[start:end]):
+            self._swing_points.append(SwingPoint(
+                index=confirm_idx,
+                price=lo,
+                is_high=False,
+                atr=0.0
+            ))
+        
+        # 保持摆动点按时间排序
+        self._swing_points.sort(key=lambda s: s.index)
+        
+        # 记录原始点位
+        raw_count = len(self._swing_points)
+        
+        # 过滤为交替序列（与上帝视角一致）
+        self._swing_points = self._filter_alternating_swings(self._swing_points)
+        
+        if len(self._swing_points) > 0:
+             print(f"[LiveEngine] 当前摆动点: {len(self._swing_points)} (原始: {raw_count}) | 序列: {[('H' if s.is_high else 'L') + '@' + str(s.index) for s in self._swing_points]}")
+    
+    def _filter_alternating_swings(self, swings: List[SwingPoint]) -> List[SwingPoint]:
+        """过滤为严格交替的高低点序列"""
+        if not swings:
+            return []
+        
+        alternating = []
+        for s in swings:
+            if not alternating:
+                alternating.append(s)
+            else:
+                last = alternating[-1]
+                if s.is_high == last.is_high:
+                    # 连续同向：高点保留更高的，低点保留更低的
+                    if s.is_high and s.price > last.price:
+                        alternating[-1] = s
+                    elif not s.is_high and s.price < last.price:
+                        alternating[-1] = s
+                else:
+                    alternating.append(s)
+        
+        return alternating
     
     @staticmethod
     def _sim_grade(similarity: float) -> str:
@@ -787,22 +1357,33 @@ class LiveTradingEngine:
                             regime: str, template_fp: str, atr: float) -> str:
         """交易员风格开仓因果说明"""
         grade = self._sim_grade(similarity)
-        fp_short = template_fp[:10]
         return (
             f"[开仓逻辑] 市场={regime} | 信号={direction} | "
-            f"指纹={fp_short} | 相似度={similarity:.2%}({grade}) | "
+            f"原型={template_fp} | 相似度={similarity:.2%}({grade}) | "
             f"风控=SL {self.stop_loss_atr:.1f}ATR / TP {self.take_profit_atr:.1f}ATR。"
-            f" 因为匹配强度满足阈值且方向一致，所以执行{direction}开仓。"
+            f" 匹配强度满足阈值且方向一致，执行{direction}开仓。"
         )
     
-    def _build_no_entry_reason(self, regime: str, long_sim: float, short_sim: float) -> str:
-        """交易员风格不开仓因果说明"""
+    def _build_no_entry_reason(self, regime: str, long_sim: float, short_sim: float,
+                                 long_votes: int = 0, short_votes: int = 0,
+                                 threshold: float = 0.70, min_agree: int = 1) -> str:
+        """交易员风格不开仓因果说明（含投票信息）"""
         best_side = "LONG" if long_sim >= short_sim else "SHORT"
         best_sim = max(long_sim, short_sim)
+        best_votes = long_votes if long_sim >= short_sim else short_votes
+        
+        # 判断失败原因
+        reasons = []
+        if best_sim < threshold:
+            reasons.append(f"相似度{best_sim:.1%}<阈值{threshold:.0%}")
+        if best_votes < min_agree:
+            reasons.append(f"投票{best_votes}<最低{min_agree}")
+        
+        fail_reason = "；".join(reasons) if reasons else "条件未满足"
+        
         return (
-            f"[观望逻辑] 市场={regime} | 候选最佳={best_side} | "
-            f"最佳相似度={best_sim:.2%}。"
-            f" 因为未达到有效开仓阈值/一致性要求，所以维持观望。"
+            f"[观望] 市场={regime} | 最佳={best_side}({best_sim:.1%}) | "
+            f"投票={best_votes}/{min_agree} | ❌{fail_reason}"
         )
     
     @staticmethod

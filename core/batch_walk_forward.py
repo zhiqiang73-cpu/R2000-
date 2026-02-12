@@ -136,12 +136,21 @@ class BatchWalkForwardEngine:
         self._evaluator = None
         self._prototype_stats = {}
         self._stopped = False
+        
+        # 【新增】缓存完整数据集，避免每轮重复加载
+        self._cached_full_df = None
 
     def _sample_continuous_local(self, total_rows: int, round_idx: int):
         """
         线程安全的本地采样（不修改DataLoader内部状态）
         """
-        full_df = self.data_loader.load_full_data()
+        # 【优化】使用缓存数据，避免重复加载
+        if self._cached_full_df is None:
+            print(f"[BatchWF] 首次加载完整数据集...")
+            self._cached_full_df = self.data_loader.load_full_data()
+            print(f"[BatchWF] 数据加载完成: {len(self._cached_full_df)} 根K线")
+        
+        full_df = self._cached_full_df
         warmup = getattr(self.data_loader, "warmup_bars", 200)
         sample_size = self.sample_size
         max_sample = total_rows - warmup
@@ -256,8 +265,13 @@ class BatchWalkForwardEngine:
                     if match_count < min_matches:
                         grade = "待观察"
                         pending += 1
+                    elif avg_profit > 0 and WALK_FORWARD_CONFIG.get("EVAL_USE_EXPECTED_PROFIT", True):
+                        # 【核心改进】期望收益为正 → 正期望系统 → 合格
+                        # 即使胜率仅45%，只要盈亏比足够（赚多亏少），仍是好策略
+                        grade = "合格"
+                        qualified += 1
                     elif win_rate >= min_win_rate and avg_profit >= 0.0:
-                        # 与模板评估保持口径：满足门槛即“优质/合格”，先统一记为“合格”
+                        # 备用：纯胜率模式（当 EVAL_USE_EXPECTED_PROFIT=False 时）
                         grade = "合格"
                         qualified += 1
                     else:
@@ -335,8 +349,10 @@ class BatchWalkForwardEngine:
                 # 用“已完成轮次”驱动UI百分比，避免并行乱序导致进度跳动
                 callback(max(0, result.completed_rounds - 1), self.n_rounds, round_result, cumulative_stats)
         
-        # 串行模式：支持trial级细粒度进度
-        if self.round_workers <= 1 or self.n_rounds <= 1:
+        # 串行模式：逐轮执行，支持 trial 级细粒度进度
+        # 注：CPU密集计算在Python GIL下无法通过多线程加速，
+        #     并行模式反而引起UI进度显示混乱和锁竞争，故统一使用串行。
+        if True:
             for round_idx in range(self.n_rounds):
                 if self._stopped:
                     print(f"[BatchWF] 已停止 (完成 {round_idx} 轮)")
@@ -367,6 +383,10 @@ class BatchWalkForwardEngine:
                 def trial_progress_cb(trial_idx, trial_total, _):
                     if not callback:
                         return
+                    # 【优化】降低信号发射频率，避免UI阻塞（每5个trial或最后一个trial才发送）
+                    if trial_idx % 5 != 0 and trial_idx != trial_total:
+                        return
+                    
                     frac = min(1.0, max(0.0, trial_idx / max(1, trial_total)))
                     # 5% 启动 + 90% 贝叶斯优化 + 5% 收尾（在apply_round_result里补齐）
                     round_progress[round_idx] = max(round_progress[round_idx], 0.05 + 0.90 * frac)
@@ -519,12 +539,23 @@ class BatchWalkForwardEngine:
                 continue
             win_rate = win_count / match_count
             avg_profit = total_profit / match_count
-            grade = "待观察" if match_count < min_matches else (
-                "合格" if (win_rate >= min_win_rate and avg_profit >= 0.0) else "淘汰"
-            )
+            use_expected = WALK_FORWARD_CONFIG.get("EVAL_USE_EXPECTED_PROFIT", True)
+            if match_count < min_matches:
+                grade = "待观察"
+            elif use_expected and avg_profit > 0:
+                grade = "合格"
+            elif (not use_expected) and win_rate >= min_win_rate and avg_profit >= 0.0:
+                grade = "合格"
+            else:
+                grade = "淘汰"
             if grade in ("优质", "合格", "待观察"):
                 keep.add(fp)
         return keep
+
+    def get_prototype_stats(self) -> dict:
+        """获取原型模式下的原型统计数据（供 PrototypeLibrary.apply_wf_verification 使用）"""
+        return dict(self._prototype_stats)
+
 
     @staticmethod
     def _parse_direction_from_fp(fp: str) -> str:
@@ -557,6 +588,9 @@ class BatchWalkForwardEngine:
         from core.ga_trading_optimizer import BayesianTradingOptimizer, TradingParams
         from utils.indicators import calculate_all_indicators
 
+        # 【诊断日志】开始轮次
+        print(f"\n[BatchWF] ========== Round {round_idx + 1} 开始 ==========")
+        
         round_result = BatchRoundResult(round_idx=round_idx)
 
         # ── 1. 线程安全采样一段数据（每轮确定性但不同） ──
@@ -564,8 +598,8 @@ class BatchWalkForwardEngine:
         round_result.data_start = s_idx
         round_result.data_end = e_idx
 
-        # ── 2. 计算指标 ──
-        sample_df = calculate_all_indicators(sample_df)
+        # ── 2. 指标计算项（已移除冗余计算） ──
+        # 【性能优化】基准数据集 self.full_df 已经预计算过指标，此处只需 copy
 
         # ── 3. 分割 val / test ──
         n = len(sample_df)
@@ -577,13 +611,15 @@ class BatchWalkForwardEngine:
         # ── 4. 构建特征引擎 ──
         val_fv = FeatureVectorEngine()
         val_fv.precompute(val_df)
-
+        
         test_fv = FeatureVectorEngine()
         test_fv.precompute(test_df)
+        print(f"[BatchWF] Round {round_idx + 1}: 特征引擎构建完成")
 
         # ── 5. 贝叶斯优化匹配参数（在 val 上） ──
         # 原型模式：使用 PrototypeLibrary（速度快 200 倍）
         # 模板模式：使用 global_memory（兼容旧逻辑）
+        print(f"[BatchWF] Round {round_idx + 1}: 开始贝叶斯优化 ({self.n_trials} trials)...")
         val_optimizer = BayesianTradingOptimizer(
             trajectory_memory=self.global_memory,
             fv_engine=val_fv,
@@ -600,8 +636,10 @@ class BatchWalkForwardEngine:
         )
         round_result.best_sharpe = best_sharpe
         round_result.best_params = best_params
+        print(f"[BatchWF] Round {round_idx + 1}: 贝叶斯优化完成 (Sharpe={best_sharpe:.3f})")
 
         # ── 6. 在 test 上用最优参数模拟交易 ──
+        print(f"[BatchWF] Round {round_idx + 1}: 测试集交易模拟...")
         test_optimizer = BayesianTradingOptimizer(
             trajectory_memory=self.global_memory,
             fv_engine=test_fv,
@@ -631,4 +669,9 @@ class BatchWalkForwardEngine:
                     (trade.template_fingerprint, trade.profit_pct)
                 )
 
+        print(f"[BatchWF] Round {round_idx + 1}: 完成 | "
+              f"交易={test_result.n_trades}, "
+              f"胜率={test_result.win_rate:.1%}, "
+              f"匹配模板={len(round_result.template_matches)}")
+        
         return round_result

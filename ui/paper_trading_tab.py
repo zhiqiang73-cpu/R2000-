@@ -10,11 +10,12 @@ R3000 模拟交易Tab
 
 from PyQt6 import QtWidgets, QtCore, QtGui
 from typing import Optional, Dict, List, Set
+import numpy as np
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import UI_CONFIG
+from config import UI_CONFIG, VECTOR_SPACE_CONFIG
 
 
 class PaperTradingControlPanel(QtWidgets.QWidget):
@@ -306,9 +307,15 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         """更新K线计数"""
         self.bar_count_label.setText(str(count))
     
-    def update_template_count(self, count: int):
-        """更新模板数量"""
-        self.template_count_label.setText(f"可用聚合指纹图: {count} 个")
+    def update_template_count(self, count: int, mode: str = "prototype", detail: str = ""):
+        """更新可用匹配池数量（区分原型/模板，避免误解）"""
+        if mode == "template":
+            text = f"可用模板: {count} 个"
+        else:
+            text = f"可用聚合指纹图: {count} 个"
+        if detail:
+            text = f"{text} ({detail})"
+        self.template_count_label.setText(text)
 
     def update_match_preview(self, fp: str, similarity: float, fp_status: str = ""):
         """更新左侧筛选区中的匹配预览（聚合指纹图）"""
@@ -477,108 +484,85 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.market_regime_label = QtWidgets.QLabel("未知")
         market_layout.addRow("市场状态:", self.market_regime_label)
         
+        self.swing_points_label = QtWidgets.QLabel("0 / 4")
+        self.swing_points_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
+        self.swing_points_label.setToolTip("已检测到的摆动点数量 / 激活分类所需的最少点数(4: 2高+2低)")
+        market_layout.addRow("摆动点检测:", self.swing_points_label)
+        
         self.fingerprint_status_label = QtWidgets.QLabel("待匹配")
         market_layout.addRow("指纹匹配:", self.fingerprint_status_label)
 
         self.matched_fingerprint_label = QtWidgets.QLabel("-")
         self.matched_fingerprint_label.setWordWrap(True)
-        self.matched_fingerprint_label.setStyleSheet("color: #9fd6ff;")
-        market_layout.addRow("匹配聚合指纹图:", self.matched_fingerprint_label)
+        self.matched_fingerprint_label.setMinimumWidth(120)
+        self.matched_fingerprint_label.setStyleSheet("color: #9fd6ff; font-weight: bold; font-size: 12px;")
+        market_layout.addRow("匹配原型:", self.matched_fingerprint_label)
 
+        # 实时配合度 + 开仓阈值 + 距离
         self.matched_similarity_label = QtWidgets.QLabel("-")
-        market_layout.addRow("配合度:", self.matched_similarity_label)
+        self.matched_similarity_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        market_layout.addRow("实时配合度:", self.matched_similarity_label)
+        
+        self.entry_threshold_label = QtWidgets.QLabel("-")
+        self.entry_threshold_label.setStyleSheet("color: #888;")
+        market_layout.addRow("开仓阈值:", self.entry_threshold_label)
+        
+        self.distance_to_entry_label = QtWidgets.QLabel("-")
+        self.distance_to_entry_label.setStyleSheet("font-weight: bold;")
+        market_layout.addRow("距离开仓:", self.distance_to_entry_label)
         
         self.reason_label = QtWidgets.QLabel("-")
         self.reason_label.setWordWrap(True)
         self.reason_label.setStyleSheet("color: #bbb;")
-        market_layout.addRow("因果说明:", self.reason_label)
+        market_layout.addRow("决策说明:", self.reason_label)
         
         layout.addWidget(market_group)
-        
-        # === 账户统计（详细） ===
-        account_group = QtWidgets.QGroupBox("账户统计（详细）")
-        account_layout = QtWidgets.QGridLayout(account_group)
-        
-        # 第一行
-        account_layout.addWidget(QtWidgets.QLabel("初始:"), 0, 0)
-        self.initial_balance_label = QtWidgets.QLabel("-")
-        account_layout.addWidget(self.initial_balance_label, 0, 1)
-        
-        account_layout.addWidget(QtWidgets.QLabel("当前:"), 0, 2)
-        self.current_balance_label = QtWidgets.QLabel("-")
-        self.current_balance_label.setStyleSheet("font-weight: bold;")
-        account_layout.addWidget(self.current_balance_label, 0, 3)
-        
-        # 第二行
-        account_layout.addWidget(QtWidgets.QLabel("盈亏:"), 1, 0)
-        self.total_pnl_label = QtWidgets.QLabel("-")
-        account_layout.addWidget(self.total_pnl_label, 1, 1)
-        
-        account_layout.addWidget(QtWidgets.QLabel("收益:"), 1, 2)
-        self.total_pnl_pct_label = QtWidgets.QLabel("-")
-        self.total_pnl_pct_label.setStyleSheet("font-weight: bold;")
-        account_layout.addWidget(self.total_pnl_pct_label, 1, 3)
-        
-        # 第三行
-        account_layout.addWidget(QtWidgets.QLabel("交易数:"), 2, 0)
-        self.total_trades_label = QtWidgets.QLabel("-")
-        account_layout.addWidget(self.total_trades_label, 2, 1)
-        
-        account_layout.addWidget(QtWidgets.QLabel("胜率:"), 2, 2)
-        self.win_rate_label = QtWidgets.QLabel("-")
-        account_layout.addWidget(self.win_rate_label, 2, 3)
-        
-        # 第四行
-        account_layout.addWidget(QtWidgets.QLabel("最大回撤:"), 3, 0)
-        self.max_dd_label = QtWidgets.QLabel("-")
-        account_layout.addWidget(self.max_dd_label, 3, 1, 1, 3)
-        
-        # 账户统计与左侧“账户设置与统计”内容重复，隐藏以精简右侧
-        account_group.setVisible(False)
-        layout.addWidget(account_group)
-        
-        # === 模板表现统计 ===
-        template_group = QtWidgets.QGroupBox("模板表现")
-        template_layout = QtWidgets.QFormLayout(template_group)
-        
-        self.matched_templates_label = QtWidgets.QLabel("0")
-        template_layout.addRow("本次匹配模板:", self.matched_templates_label)
-        
-        self.profitable_templates_label = QtWidgets.QLabel("0")
-        self.profitable_templates_label.setStyleSheet("color: #089981; font-weight: bold;")
-        template_layout.addRow("盈利模板:", self.profitable_templates_label)
-        
-        self.losing_templates_label = QtWidgets.QLabel("0")
-        self.losing_templates_label.setStyleSheet("color: #f23645; font-weight: bold;")
-        template_layout.addRow("亏损模板:", self.losing_templates_label)
-        
-        # 模板表现与左侧筛选信息重复，隐藏以精简右侧
-        template_group.setVisible(False)
-        layout.addWidget(template_group)
-        
-        # === 模板操作 ===
-        action_group = QtWidgets.QGroupBox("模板操作")
-        action_layout = QtWidgets.QVBoxLayout(action_group)
-        
-        self.save_btn = QtWidgets.QPushButton("✓ 保存盈利模板到记忆库")
-        self.save_btn.setObjectName("saveBtn")
-        self.save_btn.clicked.connect(self.save_profitable_requested.emit)
-        action_layout.addWidget(self.save_btn)
-        
-        self.delete_btn = QtWidgets.QPushButton("✗ 删除亏损模板")
-        self.delete_btn.setObjectName("deleteBtn")
-        self.delete_btn.clicked.connect(self.delete_losing_requested.emit)
-        action_layout.addWidget(self.delete_btn)
-        
-        self.action_status_label = QtWidgets.QLabel("")
-        self.action_status_label.setStyleSheet("color: #888; font-size: 11px;")
-        self.action_status_label.setWordWrap(True)
-        action_layout.addWidget(self.action_status_label)
-        
-        layout.addWidget(action_group)
+
+        # === 持仓监控与说明 (NEW) ===
+        monitor_group = QtWidgets.QGroupBox("持仓监控与说明")
+        monitor_layout = QtWidgets.QVBoxLayout(monitor_group)
+
+        # 1. 为何继续持仓
+        monitor_layout.addWidget(QtWidgets.QLabel("【持仓理由】"))
+        self.hold_reason_label = QtWidgets.QLabel("未持仓")
+        self.hold_reason_label.setWordWrap(True)
+        self.hold_reason_label.setStyleSheet("color: #ccc; padding: 2px;")
+        monitor_layout.addWidget(self.hold_reason_label)
+
+        # 2. 持仓警觉度 (Danger Bar)
+        monitor_layout.addWidget(QtWidgets.QLabel("【持仓警觉度】(100%触碰平仓线)"))
+        self.danger_bar = QtWidgets.QProgressBar()
+        self.danger_bar.setRange(0, 100)
+        self.danger_bar.setValue(0)
+        self.danger_bar.setTextVisible(True)
+        self.danger_bar.setFormat("%p%")
+        self.danger_bar.setFixedHeight(12)
+        self.danger_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #444;
+                border-radius: 3px;
+                text-align: center;
+                background-color: #333;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
+                                                stop:0 #089981, stop:0.5 #FFD54F, stop:1 #f23645);
+            }
+        """)
+        monitor_layout.addWidget(self.danger_bar)
+
+        # 3. 平仓状态监控
+        monitor_layout.addWidget(QtWidgets.QLabel("【平仓预判】"))
+        self.exit_monitor_label = QtWidgets.QLabel("-")
+        self.exit_monitor_label.setWordWrap(True)
+        self.exit_monitor_label.setStyleSheet("color: #ef9a9a; padding: 2px;")
+        monitor_layout.addWidget(self.exit_monitor_label)
+
+        layout.addWidget(monitor_group)
         
         # === 右下事件日志 ===
-        event_group = QtWidgets.QGroupBox("交易日志")
+        event_group = QtWidgets.QGroupBox("实时日志")
         event_layout = QtWidgets.QVBoxLayout(event_group)
         self.event_log = QtWidgets.QPlainTextEdit()
         self.event_log.setReadOnly(True)
@@ -640,6 +624,9 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             elif tracking == "警戒":
                 tracking_color = "#FFD54F"
                 tracking_icon = "🟡"
+            elif tracking == "危险":
+                tracking_color = "#FF8C00"
+                tracking_icon = "🟠"
             else:
                 tracking_color = "#f23645"
                 tracking_icon = "🔴"
@@ -647,32 +634,99 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.tracking_status_label.setText(f"{tracking_icon} {tracking}")
             self.tracking_status_label.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {tracking_color};")
             
-            # “匹配聚合指纹图”和“配合度”统一放在“匹配与市场状态”分组
-    
+    def update_monitoring(self, hold_reason: str, danger_level: float, exit_reason: str):
+        """更新持仓监控说明 (NEW)"""
+        self.hold_reason_label.setText(hold_reason or "未持仓")
+        self.danger_bar.setValue(int(danger_level))
+        self.exit_monitor_label.setText(exit_reason or "-")
+        
     def update_matching_context(self, market_regime: str, fp_status: str, reason: str,
-                                matched_fp: str = "", matched_similarity: float = None):
+                                matched_fp: str = "", matched_similarity: float = None,
+                                swing_points_count: int = 0):
         """更新匹配状态和因果说明"""
-        self.market_regime_label.setText(market_regime or "未知")
+        regime = market_regime or "未知"
+        self.market_regime_label.setText(regime)
+        
+        # 更新摆动点计数显示
+        sp_text = f"{swing_points_count} / 4"
+        if swing_points_count >= 4:
+            sp_color = "#089981"  # 绿色 - 已激活分类
+            sp_text += "  [已激活]"
+        elif swing_points_count >= 1:
+            sp_color = "#ffaa00"  # 黄色 - 检测中
+            sp_text += "  [检测中...]"
+        else:
+            sp_color = "#f23645"  # 红色 - 等待
+            sp_text += "  [等待数据]"
+        self.swing_points_label.setText(sp_text)
+        self.swing_points_label.setStyleSheet(f"color: {sp_color}; font-weight: bold;")
+        
+        # 根据6态市场状态着色（与上帝视角训练一致）
+        regime_colors = {
+            "强多头": "#00E676",   # 亮绿
+            "弱多头": "#66BB6A",   # 绿
+            "震荡偏多": "#A5D6A7", # 浅绿
+            "震荡偏空": "#EF9A9A", # 浅红
+            "弱空头": "#EF5350",   # 红
+            "强空头": "#FF1744",   # 亮红
+            "未知": "#888888",     # 灰
+        }
+        color = regime_colors.get(regime, "#888888")
+        self.market_regime_label.setStyleSheet(f"color: {color}; font-weight: bold;")
         self.fingerprint_status_label.setText(fp_status or "待匹配")
         if matched_fp:
-            self.matched_fingerprint_label.setText(
-                matched_fp if len(matched_fp) <= 32 else (matched_fp[:32] + "...")
-            )
+            # 完整显示原型名称，并设置 tooltip
+            self.matched_fingerprint_label.setText(matched_fp)
+            self.matched_fingerprint_label.setToolTip(matched_fp)
+            # 根据方向着色
+            if "LONG" in matched_fp:
+                self.matched_fingerprint_label.setStyleSheet(
+                    "color: #089981; font-weight: bold; font-size: 12px;")
+            elif "SHORT" in matched_fp:
+                self.matched_fingerprint_label.setStyleSheet(
+                    "color: #f23645; font-weight: bold; font-size: 12px;")
+            else:
+                self.matched_fingerprint_label.setStyleSheet(
+                    "color: #9fd6ff; font-weight: bold; font-size: 12px;")
         else:
             self.matched_fingerprint_label.setText("-")
+            self.matched_fingerprint_label.setToolTip("")
+            self.matched_fingerprint_label.setStyleSheet(
+                "color: #9fd6ff; font-weight: bold; font-size: 12px;")
 
-        if matched_similarity is None:
+        # 获取开仓阈值（从配置读取）
+        entry_threshold = VECTOR_SPACE_CONFIG.get("ENTRY_SIM_THRESHOLD", 70.0) / 100.0
+        
+        if matched_similarity is None or matched_similarity <= 0:
             self.matched_similarity_label.setText("-")
-            self.matched_similarity_label.setStyleSheet("color: #888;")
+            self.matched_similarity_label.setStyleSheet("color: #888; font-weight: bold; font-size: 13px;")
+            self.entry_threshold_label.setText(f"{entry_threshold:.0%}")
+            self.distance_to_entry_label.setText("-")
+            self.distance_to_entry_label.setStyleSheet("color: #888; font-weight: bold;")
         else:
-            self.matched_similarity_label.setText(f"{float(matched_similarity):.2%}")
-            if matched_similarity >= 0.75:
-                color = "#089981"
-            elif matched_similarity >= 0.60:
-                color = "#FFD54F"
+            sim = float(matched_similarity)
+            self.matched_similarity_label.setText(f"{sim:.2%}")
+            
+            # 根据相似度着色
+            if sim >= entry_threshold:
+                color = "#089981"  # 绿色 - 达到开仓条件
+                self.distance_to_entry_label.setText("✓ 已达标")
+                self.distance_to_entry_label.setStyleSheet("color: #089981; font-weight: bold;")
+            elif sim >= entry_threshold - 0.1:
+                color = "#FFD54F"  # 黄色 - 接近
+                distance = entry_threshold - sim
+                self.distance_to_entry_label.setText(f"差 {distance:.1%}")
+                self.distance_to_entry_label.setStyleSheet("color: #FFD54F; font-weight: bold;")
             else:
-                color = "#f23645"
-            self.matched_similarity_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+                color = "#f23645"  # 红色 - 差距较大
+                distance = entry_threshold - sim
+                self.distance_to_entry_label.setText(f"差 {distance:.1%}")
+                self.distance_to_entry_label.setStyleSheet("color: #f23645; font-weight: bold;")
+            
+            self.matched_similarity_label.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 13px;")
+            self.entry_threshold_label.setText(f"{entry_threshold:.0%}")
+            self.entry_threshold_label.setStyleSheet("color: #888;")
+        
         self.reason_label.setText(reason or "-")
     
     def append_event(self, text: str):
@@ -685,35 +739,32 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
     def update_current_price(self, price: float):
         """更新当前价格"""
         self.position_current_label.setText(f"${price:,.2f}")
+
+    @staticmethod
+    def _fmt_percent(value: float) -> str:
+        """百分比格式化：极大值使用科学计数法 a × 10^b%"""
+        try:
+            v = float(value)
+        except Exception:
+            return "-"
+        if not np.isfinite(v):
+            return "-"
+        av = abs(v)
+        if av >= 1e6:
+            sign = "+" if v >= 0 else "-"
+            b = int(np.floor(np.log10(av)))
+            a = av / (10 ** b)
+            return f"{sign}{a:.3f} × 10^{b}%"
+        return f"{v:+.2f}%"
     
     def update_stats(self, stats: dict):
-        """更新账户统计"""
-        self.initial_balance_label.setText(f"{stats.get('initial_balance', 0):,.2f}")
-        self.current_balance_label.setText(f"{stats.get('current_balance', 0):,.2f}")
-        
-        pnl = stats.get('total_pnl', 0)
-        pnl_color = "#089981" if pnl >= 0 else "#f23645"
-        self.total_pnl_label.setText(f"{pnl:+,.2f}")
-        self.total_pnl_label.setStyleSheet(f"color: {pnl_color};")
-        
-        pnl_pct = stats.get('total_pnl_pct', 0)
-        self.total_pnl_pct_label.setText(f"{pnl_pct:+.2f}%")
-        self.total_pnl_pct_label.setStyleSheet(f"color: {pnl_color}; font-weight: bold;")
-        
-        self.total_trades_label.setText(str(stats.get('total_trades', 0)))
-        
-        win_rate = stats.get('win_rate', 0)
-        wr_color = "#089981" if win_rate >= 0.5 else "#f23645"
-        self.win_rate_label.setText(f"{win_rate:.1%}")
-        self.win_rate_label.setStyleSheet(f"color: {wr_color};")
-        
-        self.max_dd_label.setText(f"{stats.get('max_drawdown_pct', 0):.2f}%")
+        """更新账户统计（面板简化后，账户统计主要显示在配置区快照中，此处仅作为接口保留或处理状态）"""
+        # 面板已简化，不再显示冗余的账户详情
+        pass
     
     def update_template_stats(self, matched: int, profitable: int, losing: int):
-        """更新模板统计"""
-        self.matched_templates_label.setText(str(matched))
-        self.profitable_templates_label.setText(str(profitable))
-        self.losing_templates_label.setText(str(losing))
+        """更新模板统计（面板简化后，统计逻辑已移除，接口保留以兼容主流程）"""
+        pass
     
     def set_action_status(self, message: str):
         """设置操作状态"""
@@ -763,12 +814,30 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         layout.addWidget(self.table)
     
     def add_trade(self, order):
-        """添加交易记录"""
+        """添加单个交易记录"""
+        self._insert_trade_row(order)
+    
+    def set_history(self, trades: List):
+        """批量设置历史记录"""
+        self.table.setRowCount(0)
+        for order in trades:
+            self._insert_trade_row(order)
+            
+    def _insert_trade_row(self, order):
+        """内部通用插入行逻辑"""
         row = self.table.rowCount()
         self.table.insertRow(row)
         
+        # 为了美观，新纪录放前面？或者按时间排序。这里维持原有顺序，但在 TableWidget 中 insertRow(0) 可以置顶
+        # 目前按时间顺序追加
+        
         # 时间
-        time_str = order.exit_time.strftime("%H:%M:%S") if order.exit_time else "-"
+        time_str = "-"
+        if order.exit_time:
+            time_str = order.exit_time.strftime("%m-%d %H:%M")
+        elif order.entry_time:
+            time_str = order.entry_time.strftime("%m-%d %H:%M") + "(持)"
+            
         self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(time_str))
         
         # 方向
@@ -840,10 +909,11 @@ class PaperTradingTab(QtWidgets.QWidget):
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(5)
         
-        # K线图（使用现有的ChartWidget）
+        # K线图（使用现有的ChartWidget）—— 占主要空间
         from ui.chart_widget import ChartWidget
         self.chart_widget = ChartWidget()
-        center_layout.addWidget(self.chart_widget, stretch=2)
+        self.chart_widget.setMinimumHeight(350)
+        center_layout.addWidget(self.chart_widget, stretch=4)
         
         # 交易记录
         trade_group = QtWidgets.QGroupBox("交易记录")
@@ -869,6 +939,10 @@ class PaperTradingTab(QtWidgets.QWidget):
         self.status_panel = PaperTradingStatusPanel()
         layout.addWidget(self.status_panel)
     
+    def load_historical_trades(self, trades: List):
+        """加载历史交易记录到界面"""
+        self.trade_log.set_history(trades)
+        
     def reset(self):
         """重置界面"""
         self.trade_log.clear()
@@ -892,3 +966,36 @@ class PaperTradingTab(QtWidgets.QWidget):
             "win_rate": 0,
         })
         self.control_panel.update_position_direction("-")
+    
+    def add_trade_marker(self, bar_idx: int, price: float, side: str, is_entry: bool = True):
+        """
+        在图表上添加交易标记
+        
+        Args:
+            bar_idx: K线索引
+            price: 价格
+            side: 方向（LONG/SHORT）
+            is_entry: True=入场，False=离场
+        """
+        if side == "LONG":
+            signal_type = 1 if is_entry else 2
+        else:  # SHORT
+            signal_type = -1 if is_entry else -2
+        
+        self.chart_widget.signal_marker.add_signal(bar_idx, price, signal_type)
+    
+    def update_tp_sl_lines(self, tp_price: float = None, sl_price: float = None):
+        """
+        更新图表上的止盈止损线
+        
+        Args:
+            tp_price: 止盈价
+            sl_price: 止损价
+        """
+        if tp_price is not None and sl_price is not None:
+            self.chart_widget._set_tp_sp(tp_price, sl_price)
+        else:
+            # 清除TP/SL线
+            self.chart_widget._last_tp = None
+            self.chart_widget._last_sp = None
+            self.chart_widget._update_tp_sp_segment()

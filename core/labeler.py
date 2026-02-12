@@ -92,34 +92,119 @@ class GodViewLabeler:
         self.optimal_trades: List[Trade] = []
         self.labels: Optional[pd.Series] = None
         
-    def label(self, df: pd.DataFrame) -> pd.Series:
+    def label(self, df: pd.DataFrame, use_dp_optimization: bool = True) -> pd.Series:
         """
         执行上帝视角标注
         
         Args:
             df: K线数据 DataFrame (需包含 open, high, low, close)
+            use_dp_optimization: 是否使用 DP 优化路径（更精确但更慢）
             
         Returns:
             标注序列 (BUY=1, SELL=-1, HOLD=0)
         """
         print("[Labeler] 开始上帝视角标注...")
         
-        # Phase 1: 基于高低点的本地极值标注（使用未来数据）
-        self.swing_points = self._detect_price_swings(df)
-        print(f"[Labeler] 检测到 {len(self.swing_points)} 个高低点")
-        
-        # 直接根据高低点生成标注序列
-        self.optimal_trades = []
-        self.labels = self._generate_labels_from_swings(df)
-        
-        # 统计信息（翻转策略：每个标注点同时隐含平仓+开仓）
-        long_entry = (self.labels == LabelType.LONG_ENTRY).sum()
-        short_entry = (self.labels == LabelType.SHORT_ENTRY).sum()
-        total_signals = long_entry + short_entry
-        print(f"[Labeler] 标注完成 (翻转策略): LONG_ENTRY={long_entry}, SHORT_ENTRY={short_entry}, "
-              f"总信号={total_signals}, 预计交易≈{max(0, total_signals - 1)}笔")
+        if use_dp_optimization:
+            # ═══════════════════════════════════════════════════════════════
+            # 【高级路径】ATR 自适应 ZigZag + 动态规划优化
+            # 优点：过滤低质量交易、选择最优不重叠序列、考虑风险收益比
+            # ═══════════════════════════════════════════════════════════════
+            
+            # 确保 ATR 已计算
+            if 'atr' not in df.columns:
+                from utils.indicators import calculate_atr
+                df = df.copy()
+                df['atr'] = calculate_atr(df, period=self.atr_period)
+                print(f"[Labeler] 计算 ATR (period={self.atr_period})")
+            
+            # Phase 1: ATR 自适应 ZigZag 摆动检测
+            self.swing_points = self._detect_zigzag_swings(df)
+            print(f"[Labeler] ZigZag 检测到 {len(self.swing_points)} 个高低点")
+            
+            # Phase 2: 动态规划选择最优交易序列
+            self.optimal_trades = self._dp_optimize_trades(df)
+            print(f"[Labeler] DP 优化选出 {len(self.optimal_trades)} 笔最优交易")
+            
+            # Phase 3: 根据最优交易生成标注
+            if self.optimal_trades:
+                self.labels = self._generate_labels(df)
+                # 同时生成交替摆动点（用于市场状态分类）
+                self._build_alternating_swings_from_trades()
+            else:
+                # 如果 DP 没有找到合格交易，回退到简单标注
+                print("[Labeler] DP 未找到合格交易，回退到简单标注")
+                self.labels = self._generate_labels_from_swings(df)
+            
+            # 统计信息
+            long_entry = (self.labels == LabelType.LONG_ENTRY).sum()
+            short_entry = (self.labels == LabelType.SHORT_ENTRY).sum()
+            long_exit = (self.labels == LabelType.LONG_EXIT).sum()
+            short_exit = (self.labels == LabelType.SHORT_EXIT).sum()
+            print(f"[Labeler] DP标注完成: LONG={long_entry}入/{long_exit}出, "
+                  f"SHORT={short_entry}入/{short_exit}出")
+        else:
+            # ═══════════════════════════════════════════════════════════════
+            # 【简单路径】滑动窗口 + 翻转策略（快速但粗糙）
+            # ═══════════════════════════════════════════════════════════════
+            self.swing_points = self._detect_price_swings(df)
+            print(f"[Labeler] 简单检测到 {len(self.swing_points)} 个高低点")
+            
+            self.optimal_trades = []
+            self.labels = self._generate_labels_from_swings(df)
+            
+            long_entry = (self.labels == LabelType.LONG_ENTRY).sum()
+            short_entry = (self.labels == LabelType.SHORT_ENTRY).sum()
+            total_signals = long_entry + short_entry
+            print(f"[Labeler] 简单标注完成: LONG_ENTRY={long_entry}, SHORT_ENTRY={short_entry}, "
+                  f"总信号={total_signals}, 预计交易≈{max(0, total_signals - 1)}笔")
         
         return self.labels
+    
+    def _build_alternating_swings_from_trades(self):
+        """从最优交易构建交替摆动点序列（用于市场状态分类）"""
+        self.alternating_swings = []
+        
+        for trade in self.optimal_trades:
+            if trade.is_long:
+                # LONG: 低点入场，高点出场
+                self.alternating_swings.append(SwingPoint(
+                    index=trade.entry_idx,
+                    price=trade.entry_price,
+                    is_high=False,
+                    atr=0.0
+                ))
+                self.alternating_swings.append(SwingPoint(
+                    index=trade.exit_idx,
+                    price=trade.exit_price,
+                    is_high=True,
+                    atr=0.0
+                ))
+            else:
+                # SHORT: 高点入场，低点出场
+                self.alternating_swings.append(SwingPoint(
+                    index=trade.entry_idx,
+                    price=trade.entry_price,
+                    is_high=True,
+                    atr=0.0
+                ))
+                self.alternating_swings.append(SwingPoint(
+                    index=trade.exit_idx,
+                    price=trade.exit_price,
+                    is_high=False,
+                    atr=0.0
+                ))
+        
+        # 按时间排序并去重
+        self.alternating_swings.sort(key=lambda s: s.index)
+        
+        # 过滤为严格交替
+        if self.alternating_swings:
+            filtered = [self.alternating_swings[0]]
+            for s in self.alternating_swings[1:]:
+                if s.is_high != filtered[-1].is_high:
+                    filtered.append(s)
+            self.alternating_swings = filtered
 
     def _detect_price_swings(self, df: pd.DataFrame) -> List[SwingPoint]:
         """基于价格局部高低点检测摆动点（使用未来数据）"""

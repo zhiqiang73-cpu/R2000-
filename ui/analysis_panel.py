@@ -898,6 +898,30 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         proto_detail_layout.addWidget(self.proto_avg_winrate_label)
         proto_stats_inner.addLayout(proto_detail_layout)
 
+        # WF评级分布行
+        wf_dist_layout = QtWidgets.QHBoxLayout()
+        wf_dist_layout.setContentsMargins(0, 4, 0, 0)
+        
+        # 合格
+        self.proto_qualified_label = QtWidgets.QLabel("合格: 0")
+        self.proto_qualified_label.setStyleSheet("color: #089981; font-weight: bold; font-size: 11px;")
+        wf_dist_layout.addWidget(self.proto_qualified_label)
+        wf_dist_layout.addSpacing(10)
+        
+        # 待观察
+        self.proto_pending_label = QtWidgets.QLabel("待观察: 0")
+        self.proto_pending_label.setStyleSheet("color: #ffaa00; font-weight: bold; font-size: 11px;")
+        wf_dist_layout.addWidget(self.proto_pending_label)
+        wf_dist_layout.addSpacing(10)
+        
+        # 淘汰
+        self.proto_eliminated_label = QtWidgets.QLabel("淘汰: 0")
+        self.proto_eliminated_label.setStyleSheet("color: #f23645; font-weight: bold; font-size: 11px;")
+        wf_dist_layout.addWidget(self.proto_eliminated_label)
+        
+        wf_dist_layout.addStretch()
+        proto_stats_inner.addLayout(wf_dist_layout)
+
         proto_layout.addWidget(proto_stats_frame)
 
         # 聚类参数行
@@ -966,8 +990,8 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
 
         # 原型列表表格
         self.proto_table = QtWidgets.QTableWidget()
-        self.proto_table.setColumnCount(6)
-        self.proto_table.setHorizontalHeaderLabels(["方向", "成员", "胜率", "平均收益", "持仓", "ID"])
+        self.proto_table.setColumnCount(7)
+        self.proto_table.setHorizontalHeaderLabels(["方向", "成员", "胜率", "平均收益", "持仓", "WF验证", "ID"])
         self.proto_table.horizontalHeader().setStretchLastSection(True)
         self.proto_table.setMinimumHeight(80)
         self.proto_table.setMaximumHeight(150)
@@ -1019,10 +1043,12 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
 
         batch_params_layout.addWidget(QtWidgets.QLabel("轮数:"))
         self.batch_rounds_spin = QtWidgets.QSpinBox()
-        self.batch_rounds_spin.setRange(1, 30)
-        self.batch_rounds_spin.setValue(30)
+        self.batch_rounds_spin.setRange(1, 100)
+        from config import WALK_FORWARD_CONFIG
+        default_rounds = WALK_FORWARD_CONFIG.get("BATCH_DEFAULT_ROUNDS", 20)
+        self.batch_rounds_spin.setValue(default_rounds)
         self.batch_rounds_spin.setFixedWidth(60)
-        self.batch_rounds_spin.setToolTip("验证轮数（每轮采样不同数据段）")
+        self.batch_rounds_spin.setToolTip("验证轮数（每轮采样不同数据段，建议≥20轮）")
         batch_params_layout.addWidget(self.batch_rounds_spin)
 
         batch_params_layout.addWidget(QtWidgets.QLabel("采样:"))
@@ -1129,33 +1155,62 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         batch_status_layout.addWidget(self.batch_eta_label)
         batch_counter_inner.addLayout(batch_status_layout)
 
-        # 累计匹配数
+        # 累计匹配 + 涉及原型
         batch_match_layout = QtWidgets.QHBoxLayout()
         match_tag = QtWidgets.QLabel("累计匹配:")
         match_tag.setStyleSheet("color: #aaa; font-size: 11px;")
         self.batch_match_count_label = QtWidgets.QLabel("0")
-        self.batch_match_count_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 14px;")
-        unique_tag = QtWidgets.QLabel("涉及模板:")
+        self.batch_match_count_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 13px;")
+        unique_tag = QtWidgets.QLabel("涉及原型:")
         unique_tag.setStyleSheet("color: #aaa; font-size: 11px;")
         self.batch_unique_label = QtWidgets.QLabel("0")
-        self.batch_unique_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 14px;")
+        self.batch_unique_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 13px;")
         batch_match_layout.addWidget(match_tag)
         batch_match_layout.addWidget(self.batch_match_count_label)
-        batch_match_layout.addSpacing(15)
+        batch_match_layout.addSpacing(10)
         batch_match_layout.addWidget(unique_tag)
         batch_match_layout.addWidget(self.batch_unique_label)
         batch_match_layout.addStretch()
         batch_counter_inner.addLayout(batch_match_layout)
 
-        # 本轮信息
+        # 4个评级分类计数
+        batch_rating_layout = QtWidgets.QHBoxLayout()
+        
+        qualified_tag = QtWidgets.QLabel("合格:")
+        qualified_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.batch_qualified_label = QtWidgets.QLabel("0")
+        self.batch_qualified_label.setStyleSheet("color: #089981; font-weight: bold; font-size: 14px;")
+        
+        pending_tag = QtWidgets.QLabel("待观察:")
+        pending_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.batch_pending_label = QtWidgets.QLabel("0")
+        self.batch_pending_label.setStyleSheet("color: #ffaa00; font-weight: bold; font-size: 14px;")
+        
+        eliminated_tag = QtWidgets.QLabel("淘汰:")
+        eliminated_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.batch_eliminated_label = QtWidgets.QLabel("0")
+        self.batch_eliminated_label.setStyleSheet("color: #f23645; font-weight: bold; font-size: 14px;")
+
+        batch_rating_layout.addWidget(qualified_tag)
+        batch_rating_layout.addWidget(self.batch_qualified_label)
+        batch_rating_layout.addSpacing(10)
+        batch_rating_layout.addWidget(pending_tag)
+        batch_rating_layout.addWidget(self.batch_pending_label)
+        batch_rating_layout.addSpacing(10)
+        batch_rating_layout.addWidget(eliminated_tag)
+        batch_rating_layout.addWidget(self.batch_eliminated_label)
+        batch_rating_layout.addStretch()
+        batch_counter_inner.addLayout(batch_rating_layout)
+
+        # 本轮信息（Sharpe）
         batch_round_info = QtWidgets.QHBoxLayout()
         round_trades_tag = QtWidgets.QLabel("本轮交易:")
         round_trades_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_round_trades_label = QtWidgets.QLabel("--")
+        self.batch_round_trades_label = QtWidgets.QLabel("0")
         self.batch_round_trades_label.setStyleSheet("color: #ccc; font-size: 12px;")
         round_sharpe_tag = QtWidgets.QLabel("Sharpe:")
         round_sharpe_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_round_sharpe_label = QtWidgets.QLabel("--")
+        self.batch_round_sharpe_label = QtWidgets.QLabel("0.000")
         self.batch_round_sharpe_label.setStyleSheet("color: #ccc; font-size: 12px;")
         batch_round_info.addWidget(round_trades_tag)
         batch_round_info.addWidget(self.batch_round_trades_label)
@@ -1514,13 +1569,39 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         self.proto_short_count.setText(str(n_short))
         self.proto_source_label.setText(f"来源: {library.source_template_count} 模板")
 
-        # 计算平均胜率
+        # 计算平均胜率和评级分布
         all_protos = library.get_all_prototypes()
+        n_excellent = 0
+        n_qualified = 0
+        n_pending = 0
+        n_eliminated = 0
+        
         if all_protos:
             avg_win = sum(p.win_rate for p in all_protos) / len(all_protos)
             self.proto_avg_winrate_label.setText(f"平均胜率: {avg_win:.1%}")
+            
+            # 统计 WF 评级
+            for p in all_protos:
+                g = getattr(p, "wf_grade", "")
+                if g == "优质": n_excellent += 1
+                elif g == "合格": n_qualified += 1
+                elif g == "待观察": n_pending += 1
+                elif g == "淘汰": n_eliminated += 1
+                # 如果没有wf_grade，默认为待观察（如果是新生成的话）或者不统计
+                # 这里主要统计已经标记的
+            
+            # 优质合并入合格显示，或者单独显示？UI只加了3个label，优质算合格的一种
+            n_qualified += n_excellent 
+            
+            self.proto_qualified_label.setText(f"合格: {n_qualified}")
+            self.proto_pending_label.setText(f"待观察: {n_pending}")
+            self.proto_eliminated_label.setText(f"淘汰: {n_eliminated}")
+            
         else:
             self.proto_avg_winrate_label.setText("平均胜率: --")
+            self.proto_qualified_label.setText("合格: 0")
+            self.proto_pending_label.setText("待观察: 0")
+            self.proto_eliminated_label.setText("淘汰: 0")
 
         # 更新表格（显示前10个）
         display_protos = sorted(all_protos, key=lambda p: p.member_count, reverse=True)[:10]
@@ -1559,10 +1640,28 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
             hold_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.proto_table.setItem(i, 4, hold_item)
 
+            # WF验证状态
+            grade = getattr(proto, 'wf_grade', '')
+            if grade == "合格":
+                grade_item = QtWidgets.QTableWidgetItem("合格")
+                grade_item.setForeground(QtGui.QColor("#089981"))
+            elif grade == "待观察":
+                grade_item = QtWidgets.QTableWidgetItem("待观察")
+                grade_item.setForeground(QtGui.QColor("#ffaa00"))
+            elif grade == "淘汰":
+                grade_item = QtWidgets.QTableWidgetItem("淘汰")
+                grade_item.setForeground(QtGui.QColor("#f23645"))
+            else:
+                grade_item = QtWidgets.QTableWidgetItem("-")
+                grade_item.setForeground(QtGui.QColor("#666"))
+            grade_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.proto_table.setItem(i, 5, grade_item)
+
             # ID
             id_item = QtWidgets.QTableWidgetItem(str(proto.prototype_id))
             id_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            self.proto_table.setItem(i, 5, id_item)
+            self.proto_table.setItem(i, 6, id_item)
+
 
         self.proto_table.setVisible(len(display_protos) > 0)
 
@@ -1576,6 +1675,9 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         self.proto_short_count.setText("0")
         self.proto_source_label.setText("来源: 0 模板")
         self.proto_avg_winrate_label.setText("平均胜率: --")
+        self.proto_qualified_label.setText("合格: 0")
+        self.proto_pending_label.setText("待观察: 0")
+        self.proto_eliminated_label.setText("淘汰: 0")
         self.proto_table.setRowCount(0)
         self.proto_table.setVisible(False)
 
@@ -1645,6 +1747,11 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         self.batch_match_count_label.setText(str(cumulative_stats.get("total_match_events", 0)))
         self.batch_unique_label.setText(str(cumulative_stats.get("unique_matched", 0)))
 
+        # 4个评级分类计数
+        self.batch_qualified_label.setText(str(cumulative_stats.get("qualified", 0)))
+        self.batch_pending_label.setText(str(cumulative_stats.get("pending", 0)))
+        self.batch_eliminated_label.setText(str(cumulative_stats.get("eliminated", 0)))
+
         # 本轮信息
         round_trades = cumulative_stats.get("round_trades", 0)
         round_sharpe = cumulative_stats.get("round_sharpe", 0.0)
@@ -1658,6 +1765,7 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
             self.batch_round_sharpe_label.setText(f"{round_sharpe:.3f}")
             self.batch_round_sharpe_label.setStyleSheet(
                 f"color: {UI_CONFIG['CHART_DOWN_COLOR']}; font-size: 12px;")
+
 
     def on_batch_wf_started(self):
         """批量WF开始时调用"""

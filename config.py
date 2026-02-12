@@ -169,10 +169,12 @@ WALK_FORWARD_CONFIG = {
     "MIN_VAL_TRADES": 10,        # 验证集最少交易数
 
     # 模板评估筛选参数
-    "EVAL_MIN_MATCHES": 3,       # 最小匹配次数（低于此为"待观察"）
-    "EVAL_MIN_WIN_RATE": 0.6,    # 最小胜率（低于此为"淘汰"）
-    "EVAL_MIN_AVG_PROFIT": 0.0,  # 最小平均收益（默认0，即只看胜率）
+    "EVAL_MIN_MATCHES": 2,       # 最小匹配次数（低于此为"待观察"）
+    "EVAL_MIN_WIN_RATE": 0.45,   # 最小胜率（配合盈亏比>1，45%即正期望）
+    "EVAL_MIN_AVG_PROFIT": 0.0,  # 最小平均收益（默认0）
+    "EVAL_USE_EXPECTED_PROFIT": True,  # 是否使用期望收益(avg_profit>0)作为主要合格标准
     "BATCH_ROUND_WORKERS": 2,    # 批量WF并行轮次线程数（1=串行）
+    "BATCH_DEFAULT_ROUNDS": 20,  # 批量WF默认轮数（更多轮次=更充分验证）
 }
 
 # ==================== 记忆持久化配置 ====================
@@ -205,7 +207,7 @@ MARKET_REGIME_CONFIG = {
     "DIR_STRONG_THRESHOLD": 0.008,       # 方向强趋势阈值 (0.8%)
     "DIR_WEAK_THRESHOLD": 0.002,         # 方向弱趋势阈值 (0.2%)
     "STRENGTH_STRONG_THRESHOLD": 0.006,  # 强度阈值 (振幅/均价 > 0.6%)
-    "LOOKBACK_SWINGS": 6,               # 回看摆动点数量
+    "LOOKBACK_SWINGS": 4,               # 回看摆动点数量
 }
 
 # ==================== UI 配置 ====================

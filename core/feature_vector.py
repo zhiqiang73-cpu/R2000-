@@ -123,6 +123,7 @@ class FeatureVectorEngine:
         self.weights = weights
 
     # ── 预计算 ─────────────────────────────────────────
+    # ── 预计算 ─────────────────────────────────────────
     def precompute(self, df: pd.DataFrame):
         """
         预计算所有K线的原始子特征值（不含加权）
@@ -133,9 +134,14 @@ class FeatureVectorEngine:
         self._raw_a = self._compute_layer_a(df)
         self._raw_b = self._compute_layer_b(df)
         self._raw_c = self._compute_layer_c(df)
+        
+        # 【性能优化】预先拼接完整特征矩阵，避免推理时的高频 hstack 拷贝
+        self._full_matrix = np.hstack([self._raw_a, self._raw_b, self._raw_c])
+        
         self._precomputed = True
-        print(f"[FeatureVector] 预计算完成: {n} 根K线, "
-              f"A={N_A}维, B={N_B}维, C={N_C}维, 总={N_A+N_B+N_C}维")
+        # 【优化】减少日志输出，避免控制台噪音
+        # print(f"[FeatureVector] 预计算完成: {n} 根K线, "
+        #       f"A={N_A}维, B={N_B}维, C={N_C}维, 总={N_A+N_B+N_C}维")
 
     # ── 获取坐标 ───────────────────────────────────────
     def get_abc(self, idx: int) -> Tuple[float, float, float]:
@@ -148,9 +154,11 @@ class FeatureVectorEngine:
         if not self._precomputed or idx < 0 or idx >= self._n:
             return (0.0, 0.0, 0.0)
 
-        a_val = round(float(np.dot(self._raw_a[idx], self.weights.w_a)), 3)
-        b_val = round(float(np.dot(self._raw_b[idx], self.weights.w_b)), 3)
-        c_val = round(float(np.dot(self._raw_c[idx], self.weights.w_c)), 3)
+        # 直接使用全量矩阵切片，减少属性访问开销
+        row = self._full_matrix[idx]
+        a_val = round(float(np.dot(row[:N_A], self.weights.w_a)), 3)
+        b_val = round(float(np.dot(row[N_A:N_A+N_B], self.weights.w_b)), 3)
+        c_val = round(float(np.dot(row[N_A+N_B:], self.weights.w_c)), 3)
         return (a_val, b_val, c_val)
 
     def get_abc_batch(self, indices: List[int]) -> np.ndarray:
@@ -169,6 +177,7 @@ class FeatureVectorEngine:
 
         if valid.any():
             vi = idx_arr[valid]
+            # 批量矩阵乘法
             result[valid, 0] = np.round(self._raw_a[vi] @ self.weights.w_a, 3)
             result[valid, 1] = np.round(self._raw_b[vi] @ self.weights.w_b, 3)
             result[valid, 2] = np.round(self._raw_c[vi] @ self.weights.w_c, 3)
@@ -179,16 +188,19 @@ class FeatureVectorEngine:
         """获取某根K线的全部子特征原始值"""
         if not self._precomputed or idx < 0 or idx >= self._n:
             return {"a": np.zeros(N_A), "b": np.zeros(N_B), "c": np.zeros(N_C)}
+        
+        row = self._full_matrix[idx]
         return {
-            "a": self._raw_a[idx].copy(),
-            "b": self._raw_b[idx].copy(),
-            "c": self._raw_c[idx].copy(),
+            "a": row[:N_A].copy(),
+            "b": row[N_A:N_A+N_B].copy(),
+            "c": row[N_A+N_B:].copy(),
         }
 
     def get_raw_matrix(self, start_idx: int, end_idx: int) -> np.ndarray:
         """
         获取 [start_idx, end_idx) 区间的完整32维原始特征矩阵
 
+        【性能关键项】直接返回预计算矩阵的 View (切片)，彻底消除内存分配和数据拷贝。
         用于轨迹匹配：直接拼接 raw_a(16) + raw_b(10) + raw_c(6) = 32维
         不做加权压缩，保留全部信息
 
@@ -208,18 +220,14 @@ class FeatureVectorEngine:
         if start_idx >= end_idx:
             return np.zeros((0, N_A + N_B + N_C))
 
-        # 拼接三层原始特征
-        a_slice = self._raw_a[start_idx:end_idx]  # (n, 16)
-        b_slice = self._raw_b[start_idx:end_idx]  # (n, 10)
-        c_slice = self._raw_c[start_idx:end_idx]  # (n, 6)
-
-        return np.hstack([a_slice, b_slice, c_slice])  # (n, 32)
+        # 直接切片返回 View
+        return self._full_matrix[start_idx:end_idx]
 
     def get_full_raw_matrix(self) -> np.ndarray:
         """获取全部K线的32维原始特征矩阵"""
         if not self._precomputed:
             return np.zeros((0, N_A + N_B + N_C))
-        return np.hstack([self._raw_a, self._raw_b, self._raw_c])
+        return self._full_matrix
 
     # ── Layer A: 即时信号 ──────────────────────────────
     def _compute_layer_a(self, df: pd.DataFrame) -> np.ndarray:

@@ -7,8 +7,11 @@ import pyqtgraph as pg
 from PyQt6 import QtCore, QtGui, QtWidgets
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
+
+# UTC+8 上海时区
+_TZ_SHANGHAI = timezone(timedelta(hours=8))
 import sys
 import os
 
@@ -38,9 +41,11 @@ class DateAxisItem(pg.AxisItem):
                 ts = self.timestamps[idx]
                 try:
                     if isinstance(ts, (int, float)):
-                        dt = datetime.fromtimestamp(ts / 1000)
+                        dt = datetime.fromtimestamp(ts / 1000, tz=_TZ_SHANGHAI)
                     else:
                         dt = pd.to_datetime(ts)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=_TZ_SHANGHAI)
                     if spacing > 60:
                         strings.append(dt.strftime('%m-%d %H:%M'))
                     else:
@@ -109,10 +114,10 @@ class CandlestickItem(pg.GraphicsObject):
         start_idx = indices[0]
         end_idx = indices[-1]
         
-        # K线宽度
+        # K线宽度 —— 更粗更清晰
         w = 0.8
         if len(self.data) > 1:
-            w = min((self.data[1][0] - self.data[0][0]) * 0.8, 4.0)
+            w = min((self.data[1][0] - self.data[0][0]) * 0.85, 6.0)
         
         visible_data = self.data[start_idx:end_idx + 1]
         
@@ -120,19 +125,20 @@ class CandlestickItem(pg.GraphicsObject):
             t, open_, close, low, high = row[:5]
             color = self.up_color if close >= open_ else self.down_color
             
-            # 绘制影线
-            p.setPen(pg.mkPen(color, width=1))
+            # 绘制影线（极细，更专业）
+            p.setPen(pg.mkPen(color, width=1.0))
             p.drawLine(QtCore.QPointF(t, low), QtCore.QPointF(t, high))
             
-            # 绘制实体
-            p.setPen(pg.mkPen(color, width=1))
+            # 绘制实体（币安风格：无边框实心）
+            p.setPen(pg.mkPen(color, width=0))
             p.setBrush(pg.mkBrush(color))
             
             body_height = close - open_
-            if abs(body_height) < 1e-5:
-                body_height = (high - low) * 0.01 if high != low else 0.1
+            # 即使平价也给一个极小的厚度，保证可见
+            if abs(body_height) < 1e-6:
+                body_height = 0.01 * (high - low + 1e-9)
             
-            rect_w = w * 0.6
+            rect_w = w * 0.9
             p.drawRect(QtCore.QRectF(t - rect_w/2, open_, rect_w, body_height))
         
         p.end()
@@ -145,11 +151,14 @@ class CandlestickItem(pg.GraphicsObject):
         v_range = view_box.viewRange()[0]
         x_min, x_max = v_range[0], v_range[1]
         
+        # 增加缓冲区，减少滚动时的重绘频率
+        buffer = 10
         if (self._last_range[0] is None or
-            abs(x_min - self._last_range[0]) > 2 or
-            abs(x_max - self._last_range[1]) > 2):
-            self._generate_picture(x_min, x_max)
-            self._last_range = (x_min, x_max)
+            x_min < self._last_range[0] or 
+            x_max > self._last_range[1]):
+            # 生成一个比可见范围稍大的图像
+            self._generate_picture(x_min - buffer, x_max + buffer)
+            self._last_range = (x_min - buffer, x_max + buffer)
         
         p.drawPicture(0, 0, self.picture)
     
@@ -161,17 +170,18 @@ class SignalMarker(pg.ScatterPlotItem):
     """LONG/SHORT/EXIT 信号标记 - 使用 ScatterPlotItem 实现固定像素大小"""
     
     def __init__(self):
-        super().__init__(pxMode=True)  # 关键：pxMode=True 保证标记大小不随缩放改变
+        super().__init__(pxMode=True)
         self.long_entry_color = UI_CONFIG["CHART_LONG_ENTRY_COLOR"]
         self.long_exit_color = UI_CONFIG["CHART_LONG_EXIT_COLOR"]
         self.short_entry_color = UI_CONFIG["CHART_SHORT_ENTRY_COLOR"]
         self.short_exit_color = UI_CONFIG["CHART_SHORT_EXIT_COLOR"]
         
-        self.all_data = []
+        self.historical_data = [] # 历史标签（如回测信号）
+        self.live_data = []       # 实时信号（如实盘成交）
 
     def update_signals(self, long_entry=None, long_exit=None, short_entry=None, short_exit=None,
                        take_profit=None, stop_loss=None):
-        """更新信号点（批量更新，避免逐点 setData 卡顿）"""
+        """批量更新历史信号"""
         data = []
         if long_entry:
             data.extend(self._build_items(long_entry, 1))
@@ -186,21 +196,25 @@ class SignalMarker(pg.ScatterPlotItem):
         if stop_loss:
             data.extend(self._build_items(stop_loss, 4))
 
-        self.all_data = data
-        self.setData(self.all_data)
+        self.historical_data = data
+        self._refresh()
 
     def clear_signals(self):
         """清空所有信号"""
-        self.all_data = []
+        self.historical_data = []
+        self.live_data = []
         self.setData([])
 
     def add_signal(self, x, y, signal_type):
         """
-        添加单个信号
-        signal_type: 1=LONG_ENTRY, 2=LONG_EXIT, -1=SHORT_ENTRY, -2=SHORT_EXIT, 3=TP, 4=SL
+        添加实时成交信号
         """
-        self.all_data.append(self._build_item(x, y, signal_type))
-        self.setData(self.all_data)
+        self.live_data.append(self._build_item(x, y, signal_type))
+        self._refresh()
+
+    def _refresh(self):
+        """合并显示所有数据"""
+        self.setData(self.historical_data + self.live_data)
 
     def _build_items(self, points, signal_type):
         return [self._build_item(x, y, signal_type) for x, y in points]
@@ -249,7 +263,10 @@ class SignalMarker(pg.ScatterPlotItem):
 
         # 手动画出文字标签（屏幕坐标，避免缩放变形）
         view_box = self.getViewBox()
-        if not view_box or not self.all_data:
+        
+        # 使用合并后的数据绘制
+        all_markers = self.historical_data + self.live_data
+        if not view_box or not all_markers:
             return
 
         views = view_box.scene().views() if view_box.scene() else []
@@ -260,19 +277,29 @@ class SignalMarker(pg.ScatterPlotItem):
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         painter.setFont(QtGui.QFont('Arial', 8, QtGui.QFont.Weight.Bold))
 
-        for item in self.all_data:
+        for item in all_markers:
             x, y = item['pos']
             label = item['data']
             sp = view_box.mapViewToScene(QtCore.QPointF(x, y))
             wp = view.mapFromScene(sp)
 
-            painter.setPen(QtGui.QPen(QtGui.QColor(item['brush'].color())))
-            offset_y = -16 if ("LONG" in label or (label == "EXIT" and item['symbol'] == 't1')) else 16
+            # 样式优化：不仅显示文字，还增加背景框增加专业感
+            color = QtGui.QColor(item['brush'].color())
+            painter.setPen(QtGui.QPen(color, 1))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(20, 20, 20, 200))) # 半透明深色背景
 
+            offset_y = -22 if ("LONG" in label or (label == "EXIT" and item['symbol'] == 't1')) else 12
+            
             painter.save()
             painter.resetTransform()
-            wp_f = QtCore.QPointF(wp)
-            painter.drawText(wp_f + QtCore.QPointF(8, float(offset_y)), label)
+            
+            # 计算背景框
+            rect = QtCore.QRectF(float(wp.x() - 20), float(wp.y() + offset_y), 40, 14)
+            painter.drawRoundedRect(rect, 3, 3)
+            
+            # 绘制文字
+            painter.setPen(QtGui.QPen(color))
+            painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, label)
             painter.restore()
 
     def add_tp_sp(self, tp_point=None, sp_point=None):
@@ -400,33 +427,49 @@ class ChartWidget(QtWidgets.QWidget):
         # 鼠标事件
         self.candle_plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         
-        # 信息标签
-        self.info_label = pg.TextItem(anchor=(0, 0), color=UI_CONFIG['THEME_TEXT'])
-        self.info_label.setFont(QtGui.QFont('Consolas', 10))
-        self.candle_plot.addItem(self.info_label)
+        # === 币安风格叠加层 ===
+        # 1. 实时价格线 (带右侧标)
+        self.price_line = pg.InfiniteLine(angle=0, movable=False, 
+                                        pen=pg.mkPen("#888", width=1, style=QtCore.Qt.PenStyle.DashLine))
+        self.candle_plot.addItem(self.price_line, ignoreBounds=True)
+        self.price_label = pg.TextItem(anchor=(0, 0.5), color="#eee")
+        self.price_label.setFont(QtGui.QFont('Arial', 9, QtGui.QFont.Weight.Bold))
+        self.candle_plot.addItem(self.price_label, ignoreBounds=True)
+
+        # 2. 信息看板 (左上角 OHLCV)
+        self.overlay_layout = QtWidgets.QGraphicsGridLayout()
+        self.info_item = pg.GraphicsWidget()
+        self.info_item.setLayout(self.overlay_layout)
+        self.candle_plot.scene().addItem(self.info_item)
+        
+        # 使用 TextItem 模拟顶栏信息
+        self.ohlc_text = pg.TextItem(anchor=(0, 0), color="#aaa")
+        self.ohlc_text.setFont(QtGui.QFont('Consolas', 10, QtGui.QFont.Weight.Bold))
+        self.candle_plot.addItem(self.ohlc_text, ignoreBounds=True)
+        
+        # 十字线价格标签
+        self.crosshair_price_label = pg.TextItem(anchor=(1, 0.5), fill=(40, 40, 40, 230))
+        self.candle_plot.addItem(self.crosshair_price_label, ignoreBounds=True)
+        self.crosshair_price_label.setVisible(False)
     
     def set_data(self, df: pd.DataFrame, labels: pd.Series = None, show_all: bool = True):
         """
-        设置数据
-        
-        Args:
-            df: K线数据 DataFrame
-            labels: 标注序列（可选）
-            show_all: True=显示全部数据, False=准备动态播放
+        全量设置数据（会清空当前状态）
         """
         self.df = df
         self.labels = labels
         
-        # 清空信号标记
-        self.signal_marker.clear_signals()
-        self._last_tp = None
-        self._last_sp = None
-        self._update_tp_sp_segment()
+        # 仅在真正切换品种或手动重置时清空信号
+        if show_all:
+            self.signal_marker.clear_signals()
+            self._last_tp = None
+            self._last_sp = None
+            self._update_tp_sp_segment()
         
         if df is None or len(df) == 0:
             return
 
-        # 仅在设置数据时更新时间轴，避免每帧更新带来的卡顿
+        # 更新时间轴
         if 'timestamp' in df.columns:
             self.date_axis.set_timestamps(df['timestamp'].tolist())
         elif 'open_time' in df.columns:
@@ -435,32 +478,83 @@ class ChartWidget(QtWidgets.QWidget):
         if show_all:
             self._incremental_signals = False
             self._display_range(0, len(df))
-            # 自动缩放
             self.candle_plot.autoRange()
             self._update_tp_sp_segment()
         else:
             self._incremental_signals = True
-            # 动画播放模式 - 从第一根K线开始
-            self.current_display_index = 1
+            self.current_display_index = 0
+            self._y_range_tick = 0
+            self._signal_range_tick = 0
+            # 从首根K线开始播放
             self._display_range(0, 1)
-            
-            # 设置初始视图范围
-            visible_range = 60
-            self.candle_plot.setXRange(0, visible_range + 10, padding=0)
-            
-            # 设置Y轴范围 - 使用前1000根数据的范围
-            sample_size = min(1000, len(df))
-            y_min = df['low'].iloc[:sample_size].min() * 0.998
-            y_max = df['high'].iloc[:sample_size].max() * 1.002
-            self.candle_plot.setYRange(y_min, y_max, padding=0.02)
             self._update_tp_sp_segment()
+
+    def update_kline(self, df: pd.DataFrame):
+        """
+        增量更新K线（流畅更新，不停轴，不跳变）
+        """
+        if df is None or df.empty:
+            return
+            
+        old_len = len(self.df) if self.df is not None else 0
+        self.df = df
+        
+        # 更新时间轴
+        if 'timestamp' in df.columns:
+            self.date_axis.set_timestamps(df['timestamp'].tolist())
+        
+        # 仅渲染末尾变化的区域
+        self._display_range(0, len(df))
+        
+        # 智能缩放 (Hysteresis Scaling)
+        self._smart_auto_scale()
+
+    def _smart_auto_scale(self):
+        """
+        稳健的自动缩放：避免频繁跳动，增加视觉稳定性
+        """
+        if self.df is None or self.df.empty:
+            return
+            
+        # 获取当前视图范围
+        view_box = self.candle_plot.getViewBox()
+        x_range = view_box.viewRange()[0]
+        y_range = view_box.viewRange()[1]
+        
+        display_start = max(0, int(x_range[0]))
+        display_end = min(len(self.df), int(x_range[1]) + 1)
+        
+        if display_end <= display_start:
+            return
+            
+        df_visible = self.df.iloc[display_start:display_end]
+        actual_min = df_visible['low'].min()
+        actual_max = df_visible['high'].max()
+        
+        # 基础边距 (2%)
+        padding = (actual_max - actual_min) * 0.1
+        target_min = actual_min - padding
+        target_max = actual_max + padding
+        
+        # 稳定性检查：如果当前范围已经包含了目标范围，且余量充足(>30%)，则不更新
+        curr_min, curr_max = y_range
+        margin_top = (curr_max - actual_max) / (actual_max - actual_min + 1e-5)
+        margin_bottom = (actual_min - curr_min) / (actual_max - actual_min + 1e-5)
+        
+        # 如果价格超出了当前范围，或者余量太小(<5%)，则需要平滑调整
+        if actual_max > curr_max or actual_min < curr_min or margin_top < 0.05 or margin_bottom < 0.05:
+            # 立即调整到目标范围，带上充足余量
+            self.candle_plot.setYRange(target_min, target_max, padding=0)
+        elif margin_top > 0.5 or margin_bottom > 0.5:
+            # 如果余量实在太大，也收紧一下
+            self.candle_plot.setYRange(target_min, target_max, padding=0)
     
     def _display_range(self, start_idx: int, end_idx: int):
         """显示指定范围的 K 线"""
         if self.df is None or end_idx <= start_idx:
             return
         
-        visible_range = 60
+        visible_range = 40
         display_start = max(start_idx, end_idx - visible_range + 1)
         df_slice = self.df.iloc[display_start:end_idx]
         n = len(df_slice)
@@ -480,12 +574,21 @@ class ChartWidget(QtWidgets.QWidget):
         if 'volume' in df_slice.columns:
             x = np.arange(display_start, display_start + n)
             height = df_slice['volume'].values
-            colors = np.where(
-                df_slice['close'].values >= df_slice['open'].values,
-                UI_CONFIG["CHART_UP_COLOR"],
-                UI_CONFIG["CHART_DOWN_COLOR"]
-            )
-            self.volume_bars.setOpts(x=x, height=height, brushes=colors)
+            colors = []
+            for i in range(len(df_slice)):
+                c = df_slice['close'].values[i]
+                o = df_slice['open'].values[i]
+                color_hex = UI_CONFIG["CHART_UP_COLOR"] if c >= o else UI_CONFIG["CHART_DOWN_COLOR"]
+                qcolor = QtGui.QColor(color_hex)
+                qcolor.setAlpha(180) # 略微透明，更专业
+                colors.append(pg.mkBrush(qcolor))
+            
+            self.volume_bars.setOpts(x=x, height=height, brushes=colors, width=0.8)
+        
+        # 更新实时价格线
+        last_price = self.df['close'].iloc[-1]
+        self.price_line.setPos(last_price)
+        self._update_ohlc_text(len(self.df)-1)
         
         # 更新信号标记
         if self.labels is not None:
@@ -518,7 +621,7 @@ class ChartWidget(QtWidgets.QWidget):
         self._display_range(0, self.current_display_index)
         
         # 自动滚动视图 - 保持右侧留白
-        visible_range = 60
+        visible_range = 40
         # 始终让 X 轴流动：右侧对齐当前K线
         self.candle_plot.setXRange(
             self.current_display_index - visible_range + 1,
@@ -708,30 +811,92 @@ class ChartWidget(QtWidgets.QWidget):
             self._display_range(0, 1)
     
     def _on_mouse_moved(self, pos):
-        """鼠标移动事件"""
-        if self.df is None:
+        """鼠标移动：更新十字线与信息看板"""
+        if self.df is None or len(self.df) == 0:
             return
-        
-        mouse_point = self.candle_plot.vb.mapSceneToView(pos)
-        x = int(mouse_point.x())
-        y = mouse_point.y()
-        
-        if 0 <= x < len(self.df):
-            self.vline.setPos(x)
-            self.hline.setPos(y)
-            self.vline.setVisible(True)
-            self.hline.setVisible(True)
             
-            row = self.df.iloc[x]
-            info_text = f"O:{row['open']:.2f} H:{row['high']:.2f} L:{row['low']:.2f} C:{row['close']:.2f}"
-            if 'volume' in self.df.columns:
-                info_text += f" V:{row['volume']:.0f}"
+        vb = self.candle_plot.getViewBox()
+        if self.candle_plot.sceneBoundingRect().contains(pos):
+            mouse_point = vb.mapSceneToView(pos)
+            index = int(mouse_point.x())
             
-            self.info_label.setText(info_text)
-            self.info_label.setPos(x + 5, self.df['high'].max())
+            if 0 <= index < len(self.df):
+                # 更新十字线
+                self.vline.setPos(mouse_point.x())
+                self.hline.setPos(mouse_point.y())
+                self.vline.setVisible(True)
+                self.hline.setVisible(True)
+                
+                # 更新十字线旁边的价格标签
+                view_range = vb.viewRange()
+                self.crosshair_price_label.setPos(view_range[0][1], mouse_point.y())
+                self.crosshair_price_label.setHtml(f'<div style="background-color: #333; color: white; padding: 2px;">{mouse_point.y():.2f}</div>')
+                self.crosshair_price_label.setVisible(True)
+                
+                # 更新顶部信息
+                self._update_ohlc_text(index)
+            else:
+                self.vline.setVisible(False)
+                self.hline.setVisible(False)
+                self.crosshair_price_label.setVisible(False)
         else:
             self.vline.setVisible(False)
             self.hline.setVisible(False)
+            self.crosshair_price_label.setVisible(False)
+
+    def _update_ohlc_text(self, index):
+        """更新左上角 OHLCV 文本"""
+        if self.df is None or index < 0 or index >= len(self.df):
+            return
+            
+        row = self.df.iloc[index]
+        o, h, l, c = row['open'], row['high'], row['low'], row['close']
+        v = row.get('volume', 0)
+        
+        # 计算涨跌幅
+        if index > 0:
+            pc = self.df.iloc[index-1]['close']
+            chg = (c - pc) / pc
+        else:
+            chg = 0
+            
+        # 币安风格色码
+        color = UI_CONFIG["CHART_UP_COLOR"] if c >= o else UI_CONFIG["CHART_DOWN_COLOR"]
+        
+        # 格式化文本
+        ts = ""
+        if 'timestamp' in self.df.columns:
+            ts_val = self.df.iloc[index]['timestamp']
+            try:
+                if isinstance(ts_val, (int, float, np.integer, np.floating)):
+                    dt = datetime.fromtimestamp(float(ts_val) / 1000, tz=_TZ_SHANGHAI)
+                else:
+                    dt = pd.to_datetime(ts_val)
+                    if dt.tzinfo is None:
+                        dt = dt.tz_localize(_TZ_SHANGHAI)
+                    else:
+                        dt = dt.tz_convert(_TZ_SHANGHAI)
+                ts = dt.strftime('%Y/%m/%d %H:%M')
+            except Exception:
+                ts = str(ts_val)
+            
+        html = f'<span style="color: #aaa;">{ts}</span> '
+        html += f'<span style="color: #eee;">开:</span> <span style="color: {color};">{o:,.2f}</span> '
+        html += f'<span style="color: #eee;">高:</span> <span style="color: {color};">{h:,.2f}</span> '
+        html += f'<span style="color: #eee;">低:</span> <span style="color: {color};">{l:,.2f}</span> '
+        html += f'<span style="color: #eee;">收:</span> <span style="color: {color};">{c:,.2f}</span> '
+        html += f'<span style="color: #eee;">幅:</span> <span style="color: {color};">{chg:+.2%}</span> '
+        html += f'<span style="color: #eee;">量:</span> <span style="color: #FFB300;">{v:,.2f}</span>'
+        
+        # 将文本放置在左上角适当位置
+        view_range = self.candle_plot.getViewBox().viewRange()
+        self.ohlc_text.setPos(view_range[0][0], view_range[1][1])
+        self.ohlc_text.setHtml(html)
+        
+        # 更新实时价格标签位置
+        last_c = self.df['close'].iloc[-1]
+        self.price_label.setPos(view_range[0][1], last_c)
+        self.price_label.setHtml(f'<div style="background-color: {color}; color: white; padding: 1px 4px; border-radius: 2px;">{last_c:,.2f}</div>')
     
     def get_data_time_range(self) -> Tuple[str, str]:
         """获取数据的时间范围"""
@@ -752,12 +917,22 @@ class ChartWidget(QtWidgets.QWidget):
                 start_ts = self.df[time_col].iloc[0]
                 end_ts = self.df[time_col].iloc[-1]
                 
-                if isinstance(start_ts, (int, float)):
-                    start_time = datetime.fromtimestamp(start_ts / 1000).strftime('%Y-%m-%d %H:%M')
-                    end_time = datetime.fromtimestamp(end_ts / 1000).strftime('%Y-%m-%d %H:%M')
+                if isinstance(start_ts, (int, float, np.integer, np.floating)):
+                    start_time = datetime.fromtimestamp(float(start_ts) / 1000, tz=_TZ_SHANGHAI).strftime('%Y-%m-%d %H:%M')
+                    end_time = datetime.fromtimestamp(float(end_ts) / 1000, tz=_TZ_SHANGHAI).strftime('%Y-%m-%d %H:%M')
                 else:
-                    start_time = pd.to_datetime(start_ts).strftime('%Y-%m-%d %H:%M')
-                    end_time = pd.to_datetime(end_ts).strftime('%Y-%m-%d %H:%M')
+                    start_dt = pd.to_datetime(start_ts)
+                    end_dt = pd.to_datetime(end_ts)
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.tz_localize(_TZ_SHANGHAI)
+                    else:
+                        start_dt = start_dt.tz_convert(_TZ_SHANGHAI)
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.tz_localize(_TZ_SHANGHAI)
+                    else:
+                        end_dt = end_dt.tz_convert(_TZ_SHANGHAI)
+                    start_time = start_dt.strftime('%Y-%m-%d %H:%M')
+                    end_time = end_dt.strftime('%Y-%m-%d %H:%M')
             except:
                 pass
         

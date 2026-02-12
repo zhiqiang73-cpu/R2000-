@@ -67,8 +67,9 @@ class MarketRegimeClassifier:
         self.dir_strong   = cfg.get("DIR_STRONG_THRESHOLD", 0.008)
         self.dir_weak     = cfg.get("DIR_WEAK_THRESHOLD", 0.002)
         self.str_strong   = cfg.get("STRENGTH_STRONG_THRESHOLD", 0.006)
-        self.lookback     = cfg.get("LOOKBACK_SWINGS", 6)
-
+        self.lookback     = cfg.get("LOOKBACK_SWINGS", 4)
+        self.min_swings_required = 3  # 调整为 3 个更合理
+        
     # ─── 核心分类 ───────────────────────────────────────
     def classify_at(self, idx: int) -> str:
         """
@@ -82,7 +83,7 @@ class MarketRegimeClassifier:
         """
         # 取 idx 之前的已确认摆动点
         relevant = [s for s in self.swings if s.index < idx]
-        if len(relevant) < 4:
+        if len(relevant) < self.min_swings_required:
             return MarketRegime.UNKNOWN
 
         recent = relevant[-self.lookback:] if len(relevant) >= self.lookback else relevant
@@ -93,8 +94,8 @@ class MarketRegimeClassifier:
 
         if len(highs) < 2 or len(lows) < 2:
             return MarketRegime.UNKNOWN
-
-        # ── 1. 方向 (direction) ──
+        
+        # ── 1. 方向 (direction) ── （与上帝视角训练完全一致）
         # 高点趋势：最近的高点比早期的高点高 → 向上
         high_trend = (highs[-1].price - highs[0].price) / highs[0].price
         # 低点趋势：最近的低点比早期的低点高 → 向上

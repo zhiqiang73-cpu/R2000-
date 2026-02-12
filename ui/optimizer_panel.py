@@ -229,6 +229,27 @@ class OptimizerPanel(QtWidgets.QWidget):
         if signed:
             return f"{x:+,.2f}"
         return f"{x:,.2f}"
+
+    @staticmethod
+    def _fmt_percent(v: float) -> str:
+        """
+        百分比格式化：极大值使用科学计数法 a × 10^b%
+        """
+        try:
+            x = float(v) * 100  # 转为百分比数值
+        except Exception:
+            return "--"
+        if not np.isfinite(x):
+            return "--"
+        ax = abs(x)
+        sign = "+" if x > 0 else ("-" if x < 0 else "")
+        if ax >= 1e6:
+            exp = int(np.floor(np.log10(ax)))
+            coeff = ax / (10 ** exp)
+            return f"{sign}{coeff:.3f} × 10^{exp}%"
+        if x > 0:
+            return f"+{x:.2f}%"
+        return f"{x:.2f}%"
     
     def reset(self):
         """重置面板"""
@@ -324,7 +345,7 @@ class OptimizerPanel(QtWidgets.QWidget):
         if 'total_return' in metrics:
             ret = metrics['total_return']
             color = UI_CONFIG['CHART_UP_COLOR'] if ret >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
-            self.total_return_label.setText(f"{ret*100:.2f}%")
+            self.total_return_label.setText(self._fmt_percent(ret))
             self.total_return_label.setStyleSheet(f"color: {color}; font-weight: bold;")
             
         if 'total_profit' in metrics:

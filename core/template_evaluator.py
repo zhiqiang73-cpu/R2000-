@@ -91,21 +91,32 @@ class TemplatePerformance:
         Returns:
             评级: "优质" / "合格" / "待观察" / "淘汰"
         """
+        from config import WALK_FORWARD_CONFIG
+        use_expected = WALK_FORWARD_CONFIG.get("EVAL_USE_EXPECTED_PROFIT", True)
+        
         # 匹配次数不足 → 待观察
         if self.match_count < min_matches:
             self.grade = "待观察"
             self.score = 20.0 + self.match_count * 5  # 有一些匹配但不够
             return self.grade
         
-        # 胜率和收益都达标 → 优质
-        if self.win_rate >= min_win_rate and self.avg_profit >= min_avg_profit:
-            # 计算评分：基础60分 + 胜率加成 + 收益加成
+        # 【核心改进】期望收益模式：avg_profit > 0 即正期望系统
+        is_qualified = False
+        if use_expected:
+            is_qualified = self.avg_profit > 0
+        else:
+            is_qualified = self.win_rate >= min_win_rate and self.avg_profit >= min_avg_profit
+        
+        if is_qualified:
+            # 计算评分：基础60分 + 期望收益加成 + 匹配次数加成
             base_score = 60.0
-            win_rate_bonus = (self.win_rate - min_win_rate) * 100  # 胜率超标部分
-            profit_bonus = min(20.0, self.avg_profit * 10)  # 收益加成，上限20分
-            match_bonus = min(10.0, (self.match_count - min_matches) * 2)  # 匹配次数加成
+            # 期望收益越高，加成越多（核心指标）
+            profit_bonus = min(25.0, self.avg_profit * 10)
+            # 胜率也给一定加分
+            win_rate_bonus = min(10.0, max(0.0, (self.win_rate - 0.4)) * 50)
+            match_bonus = min(10.0, (self.match_count - min_matches) * 2)
             
-            self.score = min(100.0, base_score + win_rate_bonus + profit_bonus + match_bonus)
+            self.score = min(100.0, base_score + profit_bonus + win_rate_bonus + match_bonus)
             
             if self.score >= 80:
                 self.grade = "优质"
@@ -113,9 +124,9 @@ class TemplatePerformance:
                 self.grade = "合格"
             return self.grade
         
-        # 胜率或收益不达标 → 淘汰
+        # 不达标 → 淘汰
         self.grade = "淘汰"
-        self.score = max(0.0, self.win_rate * 50 + self.avg_profit * 5)
+        self.score = max(0.0, self.win_rate * 30 + max(0.0, self.avg_profit) * 10)
         return self.grade
     
     def to_dict(self) -> dict:

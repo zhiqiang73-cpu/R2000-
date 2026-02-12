@@ -80,17 +80,54 @@ class TrajectoryMatcher:
             )
 
         # 1. z-score标准化并展平当前窗口
-        current_flat = self._zscore_flatten(current_window)
+        current_flat = self._zscore_flatten(current_window).astype(np.float32)
+        q_norm = np.linalg.norm(current_flat)
+        if q_norm < 1e-12:
+            return MatchResult(
+                matched=False, best_template=None,
+                cosine_sim=0.0, dtw_distance=999.0, dtw_similarity=0.0,
+                top_k_indices=[], all_dtw_results=[]
+            )
 
-        # 2. 余弦粗筛
+        # 2. 向量化余弦粗筛 (NumPy 矩阵运算)
+        # 预先检查是否有缓存的矩阵，如果没有则根据长度分组计算
+        # 注意：此处简化实现，优先处理长度一致的情况
+        q_len = len(current_flat)
+        
+        # 将相同长度的候选模板提取出来做批处理
+        potential_indices = []
+        templates_to_process = []
+        for i, t in enumerate(candidates):
+            if t.pre_entry_flat.size == q_len:
+                potential_indices.append(i)
+                templates_to_process.append(t.pre_entry_flat)
+        
         cosine_scores = []
-        for i, template in enumerate(candidates):
-            if template.pre_entry_flat.size == 0:
-                continue
-            # 如果长度不匹配，尝试截取或填充
-            t_flat = self._align_vectors(current_flat, template.pre_entry_flat)
-            sim = self._cosine_similarity(current_flat, t_flat)
-            cosine_scores.append((i, sim))
+        if templates_to_process:
+            # 转换为 (N, L) 矩阵
+            tpl_matrix = np.stack(templates_to_process).astype(np.float32)
+            # 批量计算点积
+            dots = np.dot(tpl_matrix, current_flat)
+            # 批量计算范数
+            tpl_norms = np.linalg.norm(tpl_matrix, axis=1)
+            # 计算余弦相似度
+            denom = tpl_norms * q_norm
+            valid = denom > 1e-12
+            sims = np.zeros(len(dots))
+            sims[valid] = dots[valid] / denom[valid]
+            
+            for idx_in_batch, sim in enumerate(sims):
+                cosine_scores.append((potential_indices[idx_in_batch], float(sim)))
+        
+        # 处理异常长度（回退到慢速循环，通常很少）
+        if len(cosine_scores) < len(candidates):
+            processed_indices = set(potential_indices)
+            for i, template in enumerate(candidates):
+                if i in processed_indices or template.pre_entry_flat.size == 0:
+                    continue
+                t_flat = self._align_vectors(current_flat, template.pre_entry_flat)
+                sim = self._cosine_similarity(current_flat, t_flat)
+                cosine_scores.append((i, sim))
 
         if not cosine_scores:
             return MatchResult(

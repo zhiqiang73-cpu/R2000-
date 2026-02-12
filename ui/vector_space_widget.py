@@ -124,6 +124,14 @@ class FingerprintWidget(QtWidgets.QWidget):
         self.count_spin.setMaximumWidth(50)
         self.count_spin.valueChanged.connect(self._refresh_plot)
         mode_layout.addWidget(self.count_spin)
+        
+        # 标准化显示选项（让变化更明显）
+        mode_layout.addSpacing(10)
+        self.normalize_checkbox = QtWidgets.QCheckBox("归一化")
+        self.normalize_checkbox.setToolTip("对每个模板单独做 z-score 标准化，使特征变化更明显")
+        self.normalize_checkbox.setChecked(False)
+        self.normalize_checkbox.stateChanged.connect(self._refresh_plot)
+        mode_layout.addWidget(self.normalize_checkbox)
 
         mode_layout.addStretch()
 
@@ -201,6 +209,25 @@ class FingerprintWidget(QtWidgets.QWidget):
             templates: List[TrajectoryTemplate]
         """
         self._templates = templates if templates else []
+
+        # 数据质量检查
+        if self._templates:
+            valid_count = 0
+            empty_count = 0
+            for t in self._templates[:10]:  # 只检查前10个
+                if hasattr(t, 'pre_entry') and t.pre_entry is not None:
+                    if t.pre_entry.size > 0 and t.pre_entry.ndim == 2:
+                        valid_count += 1
+                        print(f"[FingerprintWidget] 模板检查: pre_entry.shape={t.pre_entry.shape}, "
+                              f"range=[{t.pre_entry.min():.2f}, {t.pre_entry.max():.2f}]")
+                    else:
+                        empty_count += 1
+                        print(f"[FingerprintWidget] ⚠ 模板异常: pre_entry.size={t.pre_entry.size}, ndim={t.pre_entry.ndim}")
+                else:
+                    empty_count += 1
+                    print(f"[FingerprintWidget] ⚠ 模板缺少 pre_entry 属性")
+            if empty_count > 0:
+                print(f"[FingerprintWidget] ⚠ 警告: {empty_count} 个模板数据异常!")
 
         # 更新市场状态下拉框
         regimes = set()
@@ -336,6 +363,9 @@ class FingerprintWidget(QtWidgets.QWidget):
 
         long_idx = 0
         short_idx = 0
+        
+        # 调试：收集所有模板的数据统计
+        all_z_values = []
 
         for orig_idx, t in templates_to_show:
             if t.direction == "LONG":
@@ -346,11 +376,46 @@ class FingerprintWidget(QtWidgets.QWidget):
                 short_idx += 1
 
             # 使用pre_entry作为指纹（半透明+网格线）
-            self._draw_wireframe_surface(t.pre_entry, color=color, alpha=0.35)
+            matrix = t.pre_entry
+            if matrix is not None and matrix.size > 0:
+                # 调试输出
+                print(f"[Fingerprint] Template #{orig_idx}: shape={matrix.shape}, "
+                      f"min={matrix.min():.4f}, max={matrix.max():.4f}, "
+                      f"mean={matrix.mean():.4f}, std={matrix.std():.4f}")
+                
+                # 如果启用归一化，对每个模板单独做 z-score
+                if self.normalize_checkbox.isChecked():
+                    matrix = matrix.copy()
+                    std = matrix.std()
+                    if std > 1e-9:
+                        matrix = (matrix - matrix.mean()) / std
+                    else:
+                        matrix = matrix - matrix.mean()
+                
+                all_z_values.append(matrix)
+            self._draw_wireframe_surface(matrix, color=color, alpha=0.35)
 
         # 如果有当前K线指纹，用金色高亮显示
         if self._current_fingerprint is not None and self._current_fingerprint.size > 0:
             self._draw_wireframe_surface(self._current_fingerprint, color='#FFD700', alpha=0.7)
+        
+        # 调试：打印整体数据范围并设置合理的 z 轴范围
+        if all_z_values:
+            combined = np.concatenate([m.flatten() for m in all_z_values])
+            z_min, z_max = combined.min(), combined.max()
+            z_std = combined.std()
+            print(f"[Fingerprint] Combined stats: min={z_min:.4f}, "
+                  f"max={z_max:.4f}, std={z_std:.4f}")
+            
+            # 如果数据范围太小，尝试使用 percentile 排除异常值
+            if z_std > 0:
+                p5, p95 = np.percentile(combined, [5, 95])
+                # 仅当范围合理时设置 z 轴限制
+                z_range = p95 - p5
+                if z_range > 0.01:  # 避免除零
+                    margin = z_range * 0.1
+                    self.ax.set_zlim(p5 - margin, p95 + margin)
+                    print(f"[Fingerprint] Z轴范围: [{p5 - margin:.2f}, {p95 + margin:.2f}]")
 
         self.ax.set_title(f"Overlay: {len(templates_to_show)} templates",
                          color=UI_CONFIG['THEME_TEXT'], fontsize=10)
@@ -363,6 +428,15 @@ class FingerprintWidget(QtWidgets.QWidget):
 
         orig_idx, template = self._filtered_templates[self._selected_template_idx]
         matrix = template.pre_entry  # (60, 32)
+        
+        # 归一化选项
+        if matrix is not None and matrix.size > 0 and self.normalize_checkbox.isChecked():
+            matrix = matrix.copy()
+            std = matrix.std()
+            if std > 1e-9:
+                matrix = (matrix - matrix.mean()) / std
+            else:
+                matrix = matrix - matrix.mean()
 
         self._draw_wireframe_surface(matrix, color='#FFD700', alpha=0.6)
         self.ax.set_title(f"Template #{orig_idx}: {template.direction} {template.regime}",

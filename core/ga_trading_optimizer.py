@@ -678,11 +678,19 @@ class BayesianTradingOptimizer:
             if not cosine_scores:
                 return []
             
+            # 排序取 Top-K
             cosine_scores.sort(key=lambda x: x[1], reverse=True)
             top_candidates = cosine_scores[:top_k]
             
+            # 【优化】获取搜索空间中的最小余弦阈值 (默认0.3)
+            min_cos_th = TradingParams.RANGES["cosine_threshold"][0]
+            
             rows = []
             for tmpl, cos_sim in top_candidates:
+                # 如果余弦相似度连最低门槛都达不到，DTW 也没必要算了
+                if cos_sim < min_cos_th:
+                    continue
+                    
                 dtw_dist = float(matcher._compute_dtw_distance(current_traj, tmpl.pre_entry))
                 rows.append((
                     tmpl,                         # template
@@ -1224,11 +1232,33 @@ class BayesianTradingOptimizer:
         from core.template_clusterer import PrototypeMatcher
         
         # 初始化原型匹配器
+        # 【修正】原型模式下，原型是聚类中心(Centroids)，彼此相距较远。
+        # 强制 min_prototypes_agree 为 1，否则由于很难同时匹配多个中心而导致 0 交易。
         proto_matcher = PrototypeMatcher(
             library=self.prototype_library,
             cosine_threshold=params.cosine_threshold,
-            min_prototypes_agree=params.min_templates_agree,
+            min_prototypes_agree=1, 
         )
+        
+        # 【方案2】WF中加入 regime 过滤 ─────────────────────────
+        # 在验证数据上检测摆动点 → 推断市场状态 → 让原型只在自己对应的 regime 中被测试
+        regime_classifier_local = None
+        try:
+            from core.labeler import GodViewLabeler
+            from core.market_regime import MarketRegimeClassifier
+            from config import MARKET_REGIME_CONFIG
+            labeler = GodViewLabeler()
+            labeler.label(self.val_df)
+            if labeler.alternating_swings:
+                regime_classifier_local = MarketRegimeClassifier(
+                    labeler.alternating_swings, MARKET_REGIME_CONFIG
+                )
+                print(f"[GA_Sim] Regime过滤已启用: {len(labeler.alternating_swings)} 个摆动点")
+            else:
+                print("[GA_Sim] 无摆动点，Regime过滤跳过（匹配全部原型）")
+        except Exception as e:
+            print(f"[GA_Sim] Regime检测异常，回退到全量匹配: {e}")
+        # ──────────────────────────────────────────────────────
         
         pre_window = TRAJECTORY_CONFIG["PRE_ENTRY_WINDOW"]
         skip_bars = TRAJECTORY_CONFIG.get("EVAL_SKIP_BARS", 5) if fast_mode else 1
@@ -1237,6 +1267,8 @@ class BayesianTradingOptimizer:
         profits = []
         trades = []
         position = None
+
+        print(f"[GA_Sim] 开始原型回测: 数据长度={n}, 原型数量={len(self.prototype_library.get_all_prototypes())}, 阈值={params.cosine_threshold}")
         
         def calc_profit(entry_price, current_price, side):
             if side == 1:
@@ -1270,9 +1302,25 @@ class BayesianTradingOptimizer:
                     i += skip_bars
                     continue
                 
-                # 原型匹配（余弦相似度 + 投票）
-                match_result = proto_matcher.match_entry(current_traj, direction=None)
+                # 【方案2】推断当前bar的市场状态，传给match_entry做regime过滤
+                current_regime = None
+                if regime_classifier_local is not None:
+                    current_regime = regime_classifier_local.classify_at(i)
+                    # UNKNOWN 状态时回退到全量匹配（与实盘预热策略一致）
+                    from core.market_regime import MarketRegime
+                    if current_regime == MarketRegime.UNKNOWN:
+                        current_regime = None
                 
+                # 原型匹配（余弦相似度 + 投票 + regime过滤）
+                match_result = proto_matcher.match_entry(
+                    current_traj, direction=None, regime=current_regime
+                )
+                
+                # 每 2000 根线打一次 LOG 或 匹配成功时打 LOG
+                if i % 2000 == 0 or match_result["matched"]:
+                    sim = match_result.get("similarity", 0)
+                    print(f"  [Match_Debug] Bar {i}: Matched={match_result['matched']}, BestSim={sim:.3f}, Target={params.cosine_threshold}")
+
                 if match_result["matched"]:
                     side = 1 if match_result["direction"] == "LONG" else -1
                     best_proto = match_result["best_prototype"]
@@ -1323,8 +1371,9 @@ class BayesianTradingOptimizer:
                     i += skip_bars
                     continue
                 
-                # 持仓健康度检查（使用原型的 holding_centroid）
-                if hold_bars >= 10 and position["prototype"] is not None:
+                # 【性能优化】持仓健康度检查降频（由每根 K 线一次改为每 5 根一次）
+                HEALTH_CHECK_INTERVAL = 5
+                if hold_bars >= 10 and hold_bars % HEALTH_CHECK_INTERVAL == 0 and position["prototype"] is not None:
                     holding_traj = self.fv_engine.get_raw_matrix(
                         position["entry_idx"], i + 1
                     )

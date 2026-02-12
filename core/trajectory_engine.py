@@ -118,10 +118,15 @@ class TrajectoryMemory:
     """
 
     def __init__(self, pre_entry_window: int = None, pre_exit_window: int = None,
-                 min_profit_pct: float = None):
+                 min_profit_pct: float = None,
+                 source_symbol: str = "",
+                 source_interval: str = ""):
         self.pre_entry_window = pre_entry_window or TRAJECTORY_CONFIG["PRE_ENTRY_WINDOW"]
         self.pre_exit_window = pre_exit_window or TRAJECTORY_CONFIG["PRE_EXIT_WINDOW"]
         self.min_profit_pct = min_profit_pct if min_profit_pct is not None else TRAJECTORY_CONFIG["MIN_PROFIT_PCT"]
+        # 记忆库来源信息（用于和实时交易配置做一致性校验）
+        self.source_symbol = (source_symbol or "").upper()
+        self.source_interval = (source_interval or "").strip()
 
         # 模板存储：templates[regime][direction] = [TrajectoryTemplate, ...]
         self._templates: Dict[str, Dict[str, List[TrajectoryTemplate]]] = {}
@@ -157,8 +162,14 @@ class TrajectoryMemory:
                 skipped_short += 1
                 continue
 
-            regime = regime_map.get(i, "未知")
+            regime = regime_map.get(i, "")
             direction = "LONG" if trade.side == 1 else "SHORT"
+            
+            # 【消除 regime="未知"】如果 regime 为空或"未知"，根据盈利方向推断默认 regime
+            # 逻辑：LONG 盈利交易至少在偏多环境，SHORT 盈利交易至少在偏空环境
+            from core.market_regime import MarketRegime
+            if not regime or regime == MarketRegime.UNKNOWN:
+                regime = MarketRegime.RANGE_BULL if direction == "LONG" else MarketRegime.RANGE_BEAR
 
             # 提取三段轨迹
             pre_entry = fv_engine.get_raw_matrix(
@@ -295,6 +306,8 @@ class TrajectoryMemory:
                 "pre_entry_window": self.pre_entry_window,
                 "pre_exit_window": self.pre_exit_window,
                 "min_profit_pct": self.min_profit_pct,
+                "source_symbol": self.source_symbol,
+                "source_interval": self.source_interval,
             },
             "templates": {},
             "stats": {
@@ -348,6 +361,8 @@ class TrajectoryMemory:
             pre_entry_window=config.get("pre_entry_window"),
             pre_exit_window=config.get("pre_exit_window"),
             min_profit_pct=config.get("min_profit_pct"),
+            source_symbol=config.get("source_symbol", ""),
+            source_interval=config.get("source_interval", ""),
         )
 
         # 还原所有模板

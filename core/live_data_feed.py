@@ -15,9 +15,12 @@ import threading
 import queue
 from typing import Optional, Callable, Dict, List
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
+
+# UTC+8 上海时区
+_TZ_SHANGHAI = timezone(timedelta(hours=8))
 
 # WebSocket 库
 try:
@@ -147,6 +150,9 @@ class LiveDataFeed:
         self._kline_buffer: List[KlineData] = []
         self._current_kline: Optional[KlineData] = None
         self._lock = threading.Lock()
+        
+        # 上一个已触发回调的收线K线时间戳（用于避免WebSocket/REST重复触发）
+        self._last_emitted_closed_ts: int = 0
         
         # 消息队列（用于线程安全的回调）
         self._msg_queue = queue.Queue()
@@ -319,10 +325,18 @@ class LiveDataFeed:
             
             with self._lock:
                 self._kline_buffer.clear()
+                self._current_kline = None
                 for item in data:
                     kline = self._parse_rest_kline(item)
-                    if kline:
+                    if not kline:
+                        continue
+                    # 仅把已收线K放入历史缓存；未收线K放入 current
+                    if kline.is_closed:
                         self._kline_buffer.append(kline)
+                    else:
+                        self._current_kline = kline
+                if self._kline_buffer:
+                    self._last_emitted_closed_ts = self._kline_buffer[-1].timestamp
             
             print(f"[LiveDataFeed] 获取历史K线: {len(self._kline_buffer)} 根")
             
@@ -336,14 +350,14 @@ class LiveDataFeed:
         try:
             return KlineData(
                 timestamp=int(item[0]),
-                open_time=datetime.fromtimestamp(int(item[0]) / 1000),
+                open_time=datetime.fromtimestamp(int(item[0]) / 1000, tz=_TZ_SHANGHAI),
                 open=float(item[1]),
                 high=float(item[2]),
                 low=float(item[3]),
                 close=float(item[4]),
                 volume=float(item[5]),
                 close_time=int(item[6]),
-                is_closed=True,
+                is_closed=(int(time.time() * 1000) >= int(item[6])),
             )
         except Exception as e:
             print(f"[LiveDataFeed] 解析K线失败: {e}")
@@ -407,7 +421,7 @@ class LiveDataFeed:
 
         kline = KlineData(
             timestamp=open_ts,
-            open_time=datetime.fromtimestamp(open_ts / 1000),
+            open_time=datetime.fromtimestamp(open_ts / 1000, tz=_TZ_SHANGHAI),
             open=float(item[1]),
             high=float(item[2]),
             low=float(item[3]),
@@ -417,9 +431,9 @@ class LiveDataFeed:
             is_closed=is_closed,
         )
 
+        emit_kline = None
         with self._lock:
             if kline.is_closed:
-                # 仅修正缓存，不触发交易回调，避免重复触发策略逻辑
                 if self._kline_buffer and self._kline_buffer[-1].timestamp == kline.timestamp:
                     self._kline_buffer[-1] = kline
                 elif (not self._kline_buffer) or self._kline_buffer[-1].timestamp < kline.timestamp:
@@ -427,8 +441,18 @@ class LiveDataFeed:
                     if len(self._kline_buffer) > self.history_limit:
                         self._kline_buffer = self._kline_buffer[-self.history_limit:]
                 self._current_kline = None
+                # 【备用触发】按“是否已发出收线事件”去重，而不是按buffer插入去重
+                if kline.timestamp > self._last_emitted_closed_ts:
+                    self._last_emitted_closed_ts = kline.timestamp
+                    emit_kline = kline
             else:
                 self._current_kline = kline
+        if emit_kline is not None and self.on_kline:
+            print(f"[REST] 备用触发K线收线: {emit_kline.open_time} | 收盘={emit_kline.close:.2f}")
+            try:
+                self.on_kline(emit_kline)
+            except Exception as e:
+                print(f"[LiveDataFeed] REST备用回调异常: {e}")
     
     def _start_websocket(self):
         """启动 WebSocket 连接"""
@@ -447,6 +471,8 @@ class LiveDataFeed:
                 if 'k' in data:
                     kline = self._parse_ws_kline(data['k'])
                     if kline:
+                        if kline.is_closed:
+                            print(f"[WebSocket] K线收线: {kline.open_time} | 收盘={kline.close:.2f}")
                         self._handle_kline(kline)
             except Exception as e:
                 print(f"[LiveDataFeed] 解析消息失败: {e}")
@@ -577,7 +603,7 @@ class LiveDataFeed:
         try:
             return KlineData(
                 timestamp=int(k['t']),
-                open_time=datetime.fromtimestamp(int(k['t']) / 1000),
+                open_time=datetime.fromtimestamp(int(k['t']) / 1000, tz=_TZ_SHANGHAI),
                 open=float(k['o']),
                 high=float(k['h']),
                 low=float(k['l']),
@@ -606,6 +632,8 @@ class LiveDataFeed:
                     self._kline_buffer = self._kline_buffer[-self.history_limit:]
                 
                 self._current_kline = None
+                if kline.timestamp > self._last_emitted_closed_ts:
+                    self._last_emitted_closed_ts = kline.timestamp
             else:
                 # 未完成K线 → 更新当前K线
                 self._current_kline = kline

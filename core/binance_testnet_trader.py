@@ -8,6 +8,8 @@ R3000 Binance 测试网执行器
 import hashlib
 import hmac
 import time
+import os
+import json
 from datetime import datetime
 from typing import Optional, Dict, List, Callable
 from urllib.parse import urlencode
@@ -58,6 +60,11 @@ class BinanceTestnetTrader:
         self.current_position: Optional[PaperOrder] = None
         self.order_history: List[PaperOrder] = []
         self.template_performances: Dict[str, TemplateSimPerformance] = {}
+        
+        # 记录保存路径
+        self.history_dir = os.path.join(os.getcwd(), "data")
+        self.history_file = os.path.join(self.history_dir, "live_trade_history.json")
+        
         self.current_bar_idx: int = 0
         self._order_counter = 0
 
@@ -66,11 +73,13 @@ class BinanceTestnetTrader:
         self._price_tick = 0.1
         self._last_sync_ts = 0.0
         self._sync_interval_sec = 2.0
+        self._pending_close = None  # (price, bar_idx, reason) 若离场失败则记录待重试
 
         self._validate_credentials()
         self._load_symbol_filters()
         self._set_leverage(self.leverage)
         self._sync_from_exchange()
+        self._load_history()  # 【持久化】启动时加载历史记录
 
     def _validate_credentials(self):
         if not self.api_key or not self.api_secret:
@@ -127,6 +136,57 @@ class BinanceTestnetTrader:
             return value
         n = int(value / step)
         return max(step, n * step)
+
+    def _load_history(self):
+        """从 JSON 文件加载持久化的记录"""
+        if not os.path.exists(self.history_file):
+            return
+        
+        try:
+            with open(self.history_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                trades = data.get("trades", [])
+                
+                # 转换回 PaperOrder 对象
+                loaded_history = []
+                for t in trades:
+                    order = PaperOrder(
+                        order_id=t["order_id"],
+                        symbol=t["symbol"],
+                        side=OrderSide(t["side"]),
+                        quantity=t["quantity"],
+                        margin_used=t["margin_used"],
+                        entry_price=t["entry_price"],
+                        entry_time=datetime.fromisoformat(t["entry_time"]) if t.get("entry_time") else None,
+                        entry_bar_idx=t.get("entry_bar_idx", 0),
+                        take_profit=t.get("take_profit"),
+                        stop_loss=t.get("stop_loss"),
+                        status=OrderStatus(t["status"]),
+                        exit_price=t.get("exit_price"),
+                        exit_time=datetime.fromisoformat(t["exit_time"]) if t.get("exit_time") else None,
+                        exit_bar_idx=t.get("exit_bar_idx"),
+                        close_reason=CloseReason(t["close_reason"]) if t.get("close_reason") else None,
+                        realized_pnl=t.get("realized_pnl", 0.0),
+                        profit_pct=t.get("profit_pct", 0.0),
+                        template_fingerprint=t.get("template_fingerprint"),
+                        entry_similarity=t.get("entry_similarity", 0.0),
+                        entry_reason=t.get("entry_reason", ""),
+                        hold_bars=t.get("hold_bars", 0)
+                    )
+                    loaded_history.append(order)
+                    
+                    # 同时更新模板统计
+                    if order.template_fingerprint:
+                        self._record_template_performance(order)
+                
+                self.order_history = loaded_history
+                print(f"[BinanceTrader] 成功从本地加载 {len(self.order_history)} 条历史交易记录")
+                
+                # 更新账户统计
+                self._update_stats_from_exchange()
+                
+        except Exception as e:
+            print(f"[BinanceTrader] 加载历史记录失败: {e}")
 
     def _set_leverage(self, leverage: int):
         try:
@@ -234,11 +294,21 @@ class BinanceTestnetTrader:
         self._set_leverage(self.leverage)
         qty = self._calc_entry_quantity(price)
         side_str = "BUY" if side == OrderSide.LONG else "SELL"
+        
+        # 格式化数量，确保不超过精度限制
+        qty_str = f"{qty:.8f}".rstrip('0').rstrip('.')
+        if '.' in qty_str:
+            # 根据 _qty_step 自动判断精度
+            precision = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
+            qty_str = f"{qty:.{precision}f}"
+        else:
+            qty_str = str(int(qty))
+
         resp = self._place_order({
             "symbol": self.symbol,
             "side": side_str,
             "type": "MARKET",
-            "quantity": f"{qty:.8f}",
+            "quantity": qty_str,
             "newClientOrderId": self._new_client_order_id("ENTRY"),
         })
 
@@ -270,42 +340,83 @@ class BinanceTestnetTrader:
 
     def _marketable_limit_price(self, side: OrderSide, desired_price: float) -> float:
         mark = self._get_mark_price()
-        # 离场必须限价；使用可成交限价 + IOC，提高成交概率
+        # 使用更大的价格缓冲（0.1%），提高IOC成交概率
         if side == OrderSide.LONG:
             # 平多 = 卖出，设置略低于现价保证可成交
-            px = min(desired_price, mark * 0.9995)
+            px = min(desired_price, mark * 0.999)
         else:
             # 平空 = 买入，设置略高于现价保证可成交
-            px = max(desired_price, mark * 1.0005)
+            px = max(desired_price, mark * 1.001)
         px = self._round_step(px, self._price_tick)
         return max(self._price_tick, px)
+
+    def _force_market_close(self, order: 'PaperOrder', exit_side: str) -> dict:
+        """限价单失败后，降级为市价单强制平仓"""
+        print(f"[BinanceTrader] ⚠ 限价IOC未成交，降级为市价单强制平仓!")
+        # 格式化数量
+        precision = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
+        qty_str = f"{self._round_step(order.quantity, self._qty_step):.{precision}f}"
+
+        resp = self._place_order({
+            "symbol": self.symbol,
+            "side": exit_side,
+            "type": "MARKET",
+            "reduceOnly": "true",
+            "quantity": qty_str,
+            "newClientOrderId": self._new_client_order_id("FORCE"),
+        })
+        return resp
 
     def close_position(self,
                        price: float,
                        bar_idx: int,
                        reason: CloseReason) -> Optional[PaperOrder]:
+        """关闭持仓"""
+        # 在操作前先强制同步一次，确保本地 current_position 与交易所一致
+        self._sync_from_exchange(force=True)
+        
         if self.current_position is None:
+            print(f"[BinanceTrader] 尝试关闭仓位失败：交易所当前无持仓")
             return None
 
         order = self.current_position
         exit_side = "SELL" if order.side == OrderSide.LONG else "BUY"
+
+        # 第一步：尝试限价 IOC（低滑点）
         limit_price = self._marketable_limit_price(order.side, price)
+        
+        # 格式化精度
+        q_prec = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
+        p_prec = len(str(self._price_tick).split('.')[-1]) if '.' in str(self._price_tick) else 0
+        
+        qty_str = f"{self._round_step(order.quantity, self._qty_step):.{q_prec}f}"
+        price_str = f"{limit_price:.{p_prec}f}"
+
         resp = self._place_order({
             "symbol": self.symbol,
             "side": exit_side,
             "type": "LIMIT",
             "timeInForce": "IOC",
             "reduceOnly": "true",
-            "quantity": f"{order.quantity:.8f}",
-            "price": f"{limit_price:.8f}",
+            "quantity": qty_str,
+            "price": price_str,
             "newClientOrderId": self._new_client_order_id("EXIT"),
         })
 
         status = str(resp.get("status", ""))
         filled_qty = float(resp.get("executedQty", 0.0))
+
+        # 第二步：限价失败 → 立即降级为市价单（绝不让仓位悬空！）
         if status not in ("FILLED", "PARTIALLY_FILLED") or filled_qty <= 0:
-            print(f"[BinanceTrader] 限价离场未成交: status={status}")
-            return None
+            print(f"[BinanceTrader] 限价离场未成交(status={status})，启动市价降级...")
+            resp = self._force_market_close(order, exit_side)
+            status = str(resp.get("status", ""))
+            filled_qty = float(resp.get("executedQty", 0.0))
+            if status not in ("FILLED", "PARTIALLY_FILLED") or filled_qty <= 0:
+                # 市价也失败 —— 标记为待重试
+                print(f"[BinanceTrader] ❌ 市价强平也失败: status={status}")
+                self._pending_close = (price, bar_idx, reason)
+                return None
 
         exit_price = float(resp.get("avgPrice", 0.0)) or limit_price
         pnl = (exit_price - order.entry_price) * filled_qty if order.side == OrderSide.LONG else (order.entry_price - exit_price) * filled_qty
@@ -325,10 +436,15 @@ class BinanceTestnetTrader:
 
         self.order_history.append(order)
         self.current_position = None
+        self._pending_close = None  # 清除重试标记
 
         self._update_stats_from_exchange()
         if order.template_fingerprint:
             self._record_template_performance(order)
+        
+        # 【持久化】平仓后自动保存
+        self.save_history(self.history_file)
+        
         if self.on_trade_closed:
             self.on_trade_closed(order)
         return order
@@ -337,6 +453,16 @@ class BinanceTestnetTrader:
                      bar_idx: int = None) -> Optional[CloseReason]:
         if bar_idx is not None:
             self.current_bar_idx = bar_idx
+
+        # ── 重试未成交的平仓（每次 tick 都检查）──
+        if self._pending_close is not None and self.current_position is not None:
+            p_price, p_bar, p_reason = self._pending_close
+            print(f"[BinanceTrader] 🔄 重试挂起的平仓: reason={p_reason.value}")
+            closed = self.close_position(price, bar_idx or self.current_bar_idx, p_reason)
+            if closed:
+                return p_reason
+            # 仍然失败，继续等下一次tick重试
+
         if self.current_position is None:
             return None
 
@@ -376,6 +502,13 @@ class BinanceTestnetTrader:
                                derail_threshold: float = 0.3,
                                current_price: float = None,
                                bar_idx: int = None) -> Optional[CloseReason]:
+        """
+        三级追踪状态：
+          similarity >= safe_threshold  (0.7) → 安全（恢复原始止损）
+          similarity >= alert_threshold (0.5) → 警戒（止损移至成本价）
+          similarity >= derail_threshold(0.3) → 危险（加紧止损但不立刻平仓）
+          similarity <  derail_threshold(0.3) → 脱轨（立刻强制平仓）
+        """
         if self.current_position is None:
             return None
         order = self.current_position
@@ -391,7 +524,14 @@ class BinanceTestnetTrader:
             if not order.alert_mode:
                 order.alert_mode = True
                 order.stop_loss = order.entry_price
+        elif similarity >= derail_threshold:
+            # 危险区间：收紧止损到成本价，但还不立刻强平
+            order.tracking_status = "危险"
+            if not order.alert_mode:
+                order.alert_mode = True
+                order.stop_loss = order.entry_price
         else:
+            # 真正脱轨：similarity < derail_threshold → 强制平仓
             order.tracking_status = "脱轨"
             if current_price is not None:
                 closed = self.close_position(current_price, bar_idx or self.current_bar_idx, CloseReason.DERAIL)
@@ -462,11 +602,13 @@ class BinanceTestnetTrader:
         self._sync_from_exchange(force=force)
 
     def save_history(self, filepath: str):
-        # 复用原有接口，保持主流程不报错
-        import json
-        import os
+        # 确保路径存在
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
         data = {
             "symbol": self.symbol,
+            "save_time": datetime.now().isoformat(),
+            "leverage": self.leverage,
             "stats": {
                 "total_trades": self.stats.total_trades,
                 "win_rate": self.stats.win_rate,
@@ -476,6 +618,6 @@ class BinanceTestnetTrader:
             },
             "trades": [o.to_dict() for o in self.order_history],
         }
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[BinanceTrader] 交易记录已保存至: {filepath}")

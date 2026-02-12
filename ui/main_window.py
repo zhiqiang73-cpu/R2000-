@@ -6,6 +6,7 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 import numpy as np
 import pandas as pd
 import json
+import re
 from typing import Optional
 import sys
 import os
@@ -587,6 +588,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.paper_trading_tab.status_panel.delete_losing_requested.connect(
             self._on_delete_losing_templates
         )
+
+    def _infer_source_meta(self) -> tuple:
+        """从数据文件名推断来源交易对与时间框架（如 btcusdt_1m.parquet）"""
+        data_file = ""
+        if hasattr(self, "data_loader") and self.data_loader is not None:
+            data_file = getattr(self.data_loader, "data_file", "") or ""
+        if not data_file:
+            data_file = DATA_CONFIG.get("DATA_FILE", "")
+        base = os.path.basename(str(data_file)).lower()
+        m = re.search(r"([a-z0-9]+)_(\d+[mhd])", base)
+        if not m:
+            return "", ""
+        symbol = m.group(1).upper()
+        interval = m.group(2)
+        return symbol, interval
     
     def _on_load_data(self):
         """加载数据"""
@@ -594,6 +610,7 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _on_sample_requested(self, sample_size: int, seed):
         """处理采样请求"""
+        self._sampling_in_progress = True
         self.control_panel.set_status("正在加载数据...")
         self.control_panel.set_buttons_enabled(False)
         self.statusBar().showMessage("正在加载数据...")
@@ -608,28 +625,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_worker.error.connect(self._on_worker_error)
         self.data_worker.finished.connect(self.worker_thread.quit)
         self.data_worker.error.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self._on_sample_thread_finished)
         
         self.worker_thread.start()
     
     def _on_sample_finished(self, result):
         """采样完成"""
-        self.df = result['df']
-        self.mtf_data = result['mtf_data']
-        self.data_loader = result['loader']
-        self.labels = None
-        self.features = None
-        
-        # 更新图表
-        self.chart_widget.set_data(self.df, show_all=True)
-        
-        # 显示时间范围
-        start_time, end_time = self.chart_widget.get_data_time_range()
-        self.control_panel.set_time_range(start_time, end_time)
-        
-        self.control_panel.set_status(f"已加载 {len(self.df):,} 根 K 线")
-        self.control_panel.set_buttons_enabled(True)
-        self.statusBar().showMessage(f"数据加载完成: {len(self.df):,} 根 K 线 | {start_time} 至 {end_time}")
+        try:
+            self.df = result['df']
+            self.mtf_data = result['mtf_data']
+            self.data_loader = result['loader']
+            self.labels = None
+            self.features = None
+            
+            # 更新图表
+            self.chart_widget.set_data(self.df, show_all=True)
+            
+            # 显示时间范围
+            start_time, end_time = self.chart_widget.get_data_time_range()
+            self.control_panel.set_time_range(start_time, end_time)
+            
+            self.control_panel.set_status(f"已加载 {len(self.df):,} 根 K 线")
+            self.control_panel.set_buttons_enabled(True)
+            self.statusBar().showMessage(f"数据加载完成: {len(self.df):,} 根 K 线 | {start_time} 至 {end_time}")
+            self._sampling_in_progress = False
+        except Exception as e:
+            self._on_worker_error(str(e) + "\n" + traceback.format_exc())
     
+    def _on_sample_thread_finished(self):
+        """采样线程结束兜底处理，避免 UI 卡在加载态"""
+        if getattr(self, "_sampling_in_progress", False):
+            self._sampling_in_progress = False
+            self.control_panel.set_buttons_enabled(True)
+            self.control_panel.set_status("数据加载中断，请重试")
+            self.statusBar().showMessage("数据加载中断：未收到完成回调")
+
+    def _on_worker_error(self, error_msg: str):
+        """通用后台任务错误处理"""
+        self._sampling_in_progress = False
+        self.control_panel.set_buttons_enabled(True)
+        self.control_panel.set_status(f"错误: {error_msg}")
+        self.statusBar().showMessage(f"任务出错: {error_msg}")
+        QtWidgets.QMessageBox.critical(self, "错误", f"后台任务出错:\n{error_msg}")
+    
+
     def _on_label_requested(self, params: dict):
         """处理标注请求 - 开始动画播放"""
         if self.df is None:
@@ -824,12 +863,20 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _on_labeling_step(self, idx: int):
         """标注步骤完成"""
-        # 前进一根 K 线
-        self.chart_widget.advance_one_candle()
-        
-        # 更新进度
-        total = len(self.df) if self.df is not None else 0
-        self.control_panel.update_play_progress(idx + 1, total)
+        try:
+            # 前进一根 K 线
+            self.chart_widget.advance_one_candle()
+            
+            # 更新进度
+            total = len(self.df) if self.df is not None else 0
+            self.control_panel.update_play_progress(idx + 1, total)
+        except Exception as e:
+            self._on_worker_error(str(e) + "\n" + traceback.format_exc())
+            if self.labeling_worker:
+                self.labeling_worker.stop()
+            self.is_playing = False
+            self.control_panel.set_playing_state(False)
+            return
 
         # 实时回测统计
         if self.df is not None and self.labels is not None and self._labels_ready and self.rt_backtester is not None:
@@ -948,7 +995,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 # 初始化轨迹记忆体（用于实时积累指纹模板）
                 if self.trajectory_memory is None:
-                    self.trajectory_memory = TrajectoryMemory()
+                    src_symbol, src_interval = self._infer_source_meta()
+                    self.trajectory_memory = TrajectoryMemory(
+                        source_symbol=src_symbol,
+                        source_interval=src_interval,
+                    )
                     print("[TrajectoryMemory] 轨迹记忆体就绪（实时积累模式）")
             except Exception as e:
                 print(f"[FeatureVector] 初始化失败: {e}")
@@ -1197,7 +1248,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # 检查是否已有记忆体，如果有则合并，否则新建
             if hasattr(self, 'trajectory_memory') and self.trajectory_memory is not None:
                 # 提取新模板到临时记忆体
-                new_memory = TrajectoryMemory()
+                src_symbol, src_interval = self._infer_source_meta()
+                new_memory = TrajectoryMemory(
+                    source_symbol=src_symbol,
+                    source_interval=src_interval,
+                )
                 n_new = new_memory.extract_from_trades(
                     trades, self.fv_engine, self.regime_map, verbose=False
                 )
@@ -1214,7 +1269,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     n_templates = self.trajectory_memory.total_count
             else:
                 # 新建记忆体
-                self.trajectory_memory = TrajectoryMemory()
+                src_symbol, src_interval = self._infer_source_meta()
+                self.trajectory_memory = TrajectoryMemory(
+                    source_symbol=src_symbol,
+                    source_interval=src_interval,
+                )
                 n_templates = self.trajectory_memory.extract_from_trades(
                     trades, self.fv_engine, self.regime_map
                 )
@@ -1613,10 +1672,33 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # 获取最终评估结果
+        from config import WALK_FORWARD_CONFIG
+        wf_counts = None
         if self._batch_wf_engine is not None:
-            # 原型模式：记录已验证原型集合，供模拟交易优先使用
+            # 原型模式：将验证结果回写到原型库
             if getattr(self._batch_wf_engine, "use_prototypes", False):
                 self._last_verified_prototype_fps = self._batch_wf_engine.get_verified_prototype_fingerprints()
+                
+                # 回写验证状态到原型库
+                if self._prototype_library is not None:
+                    proto_stats = self._batch_wf_engine.get_prototype_stats()
+                    min_matches = WALK_FORWARD_CONFIG.get("EVAL_MIN_MATCHES", 3)
+                    min_win_rate = WALK_FORWARD_CONFIG.get("EVAL_MIN_WIN_RATE", 0.6)
+                    wf_counts = self._prototype_library.apply_wf_verification(
+                        proto_stats, min_matches, min_win_rate
+                    )
+                    
+                    # 刷新原型表格（会显示验证标记）
+                    self.analysis_panel.trajectory_widget.update_prototype_stats(
+                        self._prototype_library
+                    )
+                    
+                    # 自动保存带验证状态的原型库
+                    try:
+                        save_path = self._prototype_library.save(verbose=True)
+                        print(f"[BatchWF] 已保存带验证标记的原型库: {save_path}")
+                    except Exception as e:
+                        print(f"[BatchWF] 原型库保存失败: {e}")
 
             eval_result = self._batch_wf_engine.get_evaluation_result()
             if eval_result is not None:
@@ -1630,20 +1712,26 @@ class MainWindow(QtWidgets.QMainWindow):
         elapsed_sec = int(result.total_elapsed % 60)
         time_str = f"{elapsed_min}分{elapsed_sec}秒" if elapsed_min > 0 else f"{elapsed_sec}秒"
 
+        # 构建验证摘要
+        if wf_counts:
+            verify_summary = (
+                f"\n验证结果回写:\n"
+                f"  合格: {wf_counts['qualified']}\n"
+                f"  待观察: {wf_counts['pending']}\n"
+                f"  淘汰: {wf_counts['eliminated']}\n"
+                f"  保留: {wf_counts['total_verified']} / {result.unique_templates_matched}\n"
+            )
+        else:
+            verify_summary = ""
+
         msg = (
             f"批量 Walk-Forward 验证完成!\n\n"
             f"完成轮数: {result.completed_rounds} / {result.n_rounds}\n"
             f"总耗时: {time_str}\n"
             f"累计匹配事件: {result.total_match_events}\n"
-            f"涉及模板: {result.unique_templates_matched}\n\n"
-            f"已验证模板:\n"
-            f"  LONG: {result.verified_long}\n"
-            f"  SHORT: {result.verified_short}\n"
-            f"  优质: {result.excellent_count}\n"
-            f"  合格: {result.qualified_count}\n"
-            f"  待观察: {result.pending_count}\n"
-            f"  淘汰: {result.eliminated_count}\n\n"
-            f"可点击'应用筛选'保留有价值模板用于实盘。"
+            f"涉及原型: {result.unique_templates_matched}\n"
+            f"{verify_summary}\n"
+            f"合格+待观察的原型已标记为\"已验证\"。"
         )
 
         self.statusBar().showMessage(
@@ -1652,6 +1740,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"耗时{time_str}"
         )
         QtWidgets.QMessageBox.information(self, "批量验证完成", msg)
+
 
     # ══════════════════════════════════════════════════════════════════════════
     # 记忆持久化管理
@@ -1731,6 +1820,16 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             
             library = clusterer.fit(self.trajectory_memory, verbose=True)
+
+            # 绑定来源信息（交易对 + 时间框架）
+            src_symbol = getattr(self.trajectory_memory, "source_symbol", "")
+            src_interval = getattr(self.trajectory_memory, "source_interval", "")
+            if not src_symbol or not src_interval:
+                infer_symbol, infer_interval = self._infer_source_meta()
+                src_symbol = src_symbol or infer_symbol
+                src_interval = src_interval or infer_interval
+            library.source_symbol = (src_symbol or "").upper()
+            library.source_interval = (src_interval or "").strip()
             
             # 保存原型库
             save_path = library.save(verbose=True)
@@ -1970,11 +2069,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if has_prototypes:
                 verified = len(getattr(self, "_last_verified_prototype_fps", set()))
                 active_count = verified if verified > 0 else self._prototype_library.total_count
-                self.paper_trading_tab.control_panel.update_template_count(active_count)
+                long_n = len(self._prototype_library.long_prototypes)
+                short_n = len(self._prototype_library.short_prototypes)
+                detail = f"LONG={long_n}, SHORT={short_n}" if verified == 0 else f"已验证={verified}"
+                self.paper_trading_tab.control_panel.update_template_count(
+                    active_count, mode="prototype", detail=detail
+                )
             elif has_templates:
-                self.paper_trading_tab.control_panel.update_template_count(self.trajectory_memory.total_count)
+                self.paper_trading_tab.control_panel.update_template_count(
+                    self.trajectory_memory.total_count, mode="template"
+                )
             else:
-                self.paper_trading_tab.control_panel.update_template_count(0)
+                self.paper_trading_tab.control_panel.update_template_count(0, mode="prototype")
         except Exception as e:
             print(f"[UI] 同步可用聚合指纹图数量失败: {e}")
 
@@ -2352,6 +2458,50 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
+        # 时间框架/交易对一致性校验（不允许错配）
+        selected_symbol = (config.get("symbol") or "").upper()
+        selected_interval = (config.get("interval") or "").strip()
+        if has_prototypes:
+            lib = self._prototype_library
+            lib_symbol = (getattr(lib, "source_symbol", "") or "").upper()
+            lib_interval = (getattr(lib, "source_interval", "") or "").strip()
+            if not lib_symbol or not lib_interval:
+                QtWidgets.QMessageBox.warning(
+                    self, "原型库缺少来源信息",
+                    "当前原型库没有记录来源的交易对/时间框架，\n"
+                    "为了避免错误匹配，系统已阻止启动。\n\n"
+                    "请使用最新版本重新生成原型库，或在正确的K线周期下重建记忆库再聚类。"
+                )
+                return
+            if lib_symbol != selected_symbol or lib_interval != selected_interval:
+                QtWidgets.QMessageBox.warning(
+                    self, "时间框架/交易对不匹配",
+                    f"原型库来源: {lib_symbol} {lib_interval}\n"
+                    f"当前选择: {selected_symbol} {selected_interval}\n\n"
+                    "原型与时间框架不一致会导致错误匹配，系统已阻止启动。"
+                )
+                return
+        else:
+            mem = self.trajectory_memory
+            mem_symbol = (getattr(mem, "source_symbol", "") or "").upper()
+            mem_interval = (getattr(mem, "source_interval", "") or "").strip()
+            if not mem_symbol or not mem_interval:
+                QtWidgets.QMessageBox.warning(
+                    self, "记忆库缺少来源信息",
+                    "当前模板记忆库没有记录来源的交易对/时间框架，\n"
+                    "为了避免错误匹配，系统已阻止启动。\n\n"
+                    "请在正确的K线周期下重新生成记忆库。"
+                )
+                return
+            if mem_symbol != selected_symbol or mem_interval != selected_interval:
+                QtWidgets.QMessageBox.warning(
+                    self, "时间框架/交易对不匹配",
+                    f"记忆库来源: {mem_symbol} {mem_interval}\n"
+                    f"当前选择: {selected_symbol} {selected_interval}\n\n"
+                    "记忆库与时间框架不一致会导致错误匹配，系统已阻止启动。"
+                )
+                return
+
         # 模板模式下的合格模板指纹
         qualified_fingerprints = set()
         if (not has_prototypes) and config.get("use_qualified_only", True) and self._last_eval_result:
@@ -2375,12 +2525,19 @@ class MainWindow(QtWidgets.QMainWindow):
             verified_proto_fps = set(self._last_verified_prototype_fps)
             use_verified_protos = len(verified_proto_fps) > 0
             active_count = len(verified_proto_fps) if use_verified_protos else self._prototype_library.total_count
-            self.paper_trading_tab.control_panel.update_template_count(active_count)
+            long_n = len(self._prototype_library.long_prototypes)
+            short_n = len(self._prototype_library.short_prototypes)
+            detail = f"LONG={long_n}, SHORT={short_n}" if (not use_verified_protos) else f"已验证={len(verified_proto_fps)}"
+            self.paper_trading_tab.control_panel.update_template_count(
+                active_count, mode="prototype", detail=detail
+            )
         else:
             verified_proto_fps = set()
             use_verified_protos = False
             template_count = len(qualified_fingerprints) if config.get("use_qualified_only") else self.trajectory_memory.total_count
-            self.paper_trading_tab.control_panel.update_template_count(template_count)
+            self.paper_trading_tab.control_panel.update_template_count(
+                template_count, mode="template"
+            )
         
         # 创建交易引擎
         from core.live_trading_engine import LiveTradingEngine
@@ -2407,9 +2564,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 socks_proxy=socks_proxy,
                 on_state_update=self._on_live_state_update,
                 on_kline=self._on_live_kline,
-                on_trade_opened=self._on_live_trade_opened,
-                on_trade_closed=self._on_live_trade_closed,
-                on_error=self._on_live_error,
+                on_trade_opened=self._handle_live_trade_opened,
+                on_trade_closed=self._handle_live_trade_closed,
+                on_error=self._handle_live_error,
             )
             
             success = self._live_engine.start()
@@ -2417,6 +2574,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._live_running = True
                 self.paper_trading_tab.control_panel.set_running(True)
                 self.paper_trading_tab.reset()
+                
+                # 【持久化】加载历史记录到 UI
+                history = self._live_engine.paper_trader.order_history
+                if history:
+                    self.paper_trading_tab.load_historical_trades(history)
+                    self.paper_trading_tab.status_panel.append_event(f"成功恢复 {len(history)} 条历史交易记录")
+                
                 self._live_chart_timer.start()
                 if has_prototypes:
                     mode_msg = f"聚合指纹图模式({ '已验证原型' if use_verified_protos else '全原型' })"
@@ -2492,12 +2656,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 state.decision_reason,
                 matched_fp,
                 matched_sim,
+                swing_points_count=getattr(state, "swing_points_count", 0),
+            )
+            # 更新持仓监控 (NEW)
+            self.paper_trading_tab.status_panel.update_monitoring(
+                state.hold_reason,
+                state.danger_level,
+                state.exit_reason
             )
             self.paper_trading_tab.control_panel.update_match_preview(
                 matched_fp,
                 matched_sim,
                 state.fingerprint_status,
             )
+            
+            # 检查并显示最新事件到日志
+            last_event = getattr(state, "last_event", "")
+            if last_event and last_event != getattr(self, "_last_logged_event", ""):
+                self._last_logged_event = last_event
+                self.paper_trading_tab.status_panel.append_event(last_event)
     
     def _on_live_kline(self, kline):
         """实时K线更新"""
@@ -2531,15 +2708,113 @@ class MainWindow(QtWidgets.QMainWindow):
             if df.empty:
                 return
             
-            # 更新模拟交易Tab的图表
-            self.paper_trading_tab.chart_widget.set_data(df, show_all=True)
-            # 视图聚焦到最近区间，便于观察时间流动
+            # 更新模拟交易Tab的图表 (使用增量更新，避免重置信号标记)
+            self.paper_trading_tab.chart_widget.update_kline(df)
+            
+            # 视图随K线滚动更新（保持右侧留白）
             n = len(df)
+            visible = 50
             self.paper_trading_tab.chart_widget.candle_plot.setXRange(
-                max(0, n - 120), n + 2, padding=0
+                n - visible, n + 5, padding=0
             )
         except Exception as e:
             print(f"[MainWindow] 更新实时图表失败: {e}")
+    
+    def _on_live_trade_opened(self, order):
+        """实时交易开仓回调"""
+        # 在主线程中处理
+        QtCore.QMetaObject.invokeMethod(
+            self, "_handle_live_trade_opened",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(object, order)
+        )
+    
+    @QtCore.pyqtSlot(object)
+    def _handle_live_trade_opened(self, order):
+        """处理实时交易开仓（主线程）"""
+        try:
+            # 添加图表标记
+            side = order.side.value
+            self.paper_trading_tab.add_trade_marker(
+                bar_idx=order.entry_bar_idx,
+                price=order.entry_price,
+                side=side,
+                is_entry=True
+            )
+            
+            # 绘制止盈止损线
+            self.paper_trading_tab.update_tp_sl_lines(
+                tp_price=order.take_profit,
+                sl_price=order.stop_loss
+            )
+            
+            # 记录事件
+            fp_short = order.template_fingerprint[:12] if order.template_fingerprint else "-"
+            event_msg = (
+                f"[开仓] {side} @ {order.entry_price:.2f} | "
+                f"TP={order.take_profit:.2f} SL={order.stop_loss:.2f} | "
+                f"原型={fp_short} (相似度={order.entry_similarity:.2%})"
+            )
+            self.paper_trading_tab.status_panel.append_event(event_msg)
+            
+            # 添加到交易记录表格（开仓时即显示，状态为持仓中）
+            self.paper_trading_tab.trade_log.add_trade(order)
+            
+            print(f"[MainWindow] 实时交易开仓: {event_msg}")
+        except Exception as e:
+            print(f"[MainWindow] 处理开仓失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _on_live_trade_closed(self, order):
+        """实时交易平仓回调"""
+        # 在主线程中处理
+        QtCore.QMetaObject.invokeMethod(
+            self, "_handle_live_trade_closed",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(object, order)
+        )
+    
+    @QtCore.pyqtSlot(object)
+    def _handle_live_trade_closed(self, order):
+        """处理实时交易平仓（主线程）"""
+        try:
+            # 添加平仓标记
+            side = order.side.value
+            self.paper_trading_tab.add_trade_marker(
+                bar_idx=order.exit_bar_idx,
+                price=order.exit_price,
+                side=side,
+                is_entry=False
+            )
+            
+            # 清除止盈止损线
+            self.paper_trading_tab.update_tp_sl_lines(None, None)
+            
+            # 添加到交易记录表格
+            self.paper_trading_tab.trade_log.add_trade(order)
+            
+            # 记录事件
+            reason = order.close_reason.value if order.close_reason else "未知"
+            profit_color = "盈利" if order.profit_pct >= 0 else "亏损"
+            event_msg = (
+                f"[平仓] {side} @ {order.exit_price:.2f} | "
+                f"{profit_color} {order.profit_pct:+.2f}% ({order.profit_usdt:+.2f} USDT) | "
+                f"原因={reason} | 持仓={order.hold_bars}根K线"
+            )
+            self.paper_trading_tab.status_panel.append_event(event_msg)
+            
+            print(f"[MainWindow] 实时交易平仓: {event_msg}")
+        except Exception as e:
+            print(f"[MainWindow] 处理平仓失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _on_live_error(self, msg: str):
+        """实时交易错误回调"""
+        print(f"[MainWindow] 实时交易错误: {msg}")
+        self.statusBar().showMessage(f"模拟交易错误: {msg}", 5000)
+        self.paper_trading_tab.status_panel.append_event(f"[错误] {msg}")
     
     def _get_proxy_settings(self):
         """获取代理设置"""
