@@ -114,10 +114,9 @@ class CandlestickItem(pg.GraphicsObject):
         start_idx = indices[0]
         end_idx = indices[-1]
         
-        # K线宽度 —— 更粗更清晰
         w = 0.8
         if len(self.data) > 1:
-            w = min((self.data[1][0] - self.data[0][0]) * 0.85, 6.0)
+            w = (self.data[1][0] - self.data[0][0]) * 0.8  # 增加 K 线之间间隙
         
         visible_data = self.data[start_idx:end_idx + 1]
         
@@ -125,8 +124,11 @@ class CandlestickItem(pg.GraphicsObject):
             t, open_, close, low, high = row[:5]
             color = self.up_color if close >= open_ else self.down_color
             
-            # 绘制影线（极细，更专业）
-            p.setPen(pg.mkPen(color, width=1.0))
+            # 使用 antialiasing 绘制高质量线条
+            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            
+            # 绘制影线（极细，1.2px，更专业）
+            p.setPen(pg.mkPen(color, width=1.2))
             p.drawLine(QtCore.QPointF(t, low), QtCore.QPointF(t, high))
             
             # 绘制实体（币安风格：无边框实心）
@@ -134,12 +136,11 @@ class CandlestickItem(pg.GraphicsObject):
             p.setBrush(pg.mkBrush(color))
             
             body_height = close - open_
-            # 即使平价也给一个极小的厚度，保证可见
-            if abs(body_height) < 1e-6:
-                body_height = 0.01 * (high - low + 1e-9)
+            # 即使平价也给一个可见高度
+            if abs(body_height) < 1e-8:
+                body_height = (high - low) * 0.05 + 1e-9
             
-            rect_w = w * 0.9
-            p.drawRect(QtCore.QRectF(t - rect_w/2, open_, rect_w, body_height))
+            p.drawRect(QtCore.QRectF(t - w/2, open_, w, body_height))
         
         p.end()
     
@@ -283,19 +284,22 @@ class SignalMarker(pg.ScatterPlotItem):
             sp = view_box.mapViewToScene(QtCore.QPointF(x, y))
             wp = view.mapFromScene(sp)
 
-            # 样式优化：不仅显示文字，还增加背景框增加专业感
+            # 样式：专业小方块/背景
             color = QtGui.QColor(item['brush'].color())
             painter.setPen(QtGui.QPen(color, 1))
-            painter.setBrush(QtGui.QBrush(QtGui.QColor(20, 20, 20, 200))) # 半透明深色背景
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(15, 15, 15, 220))) 
 
-            offset_y = -22 if ("LONG" in label or (label == "EXIT" and item['symbol'] == 't1')) else 12
+            # 根据信号类型决定标签是在上方还是下方
+            # 标记点 (x, y) 已经是精确的 High (SHORT) 或 Low (LONG)
+            is_above = "SHORT" in label or (label == "EXIT" and item['symbol'] == 't')
+            offset_y = 10 if is_above else -24
             
             painter.save()
             painter.resetTransform()
             
-            # 计算背景框
-            rect = QtCore.QRectF(float(wp.x() - 20), float(wp.y() + offset_y), 40, 14)
-            painter.drawRoundedRect(rect, 3, 3)
+            # 绘制圆角标签背景
+            rect = QtCore.QRectF(float(wp.x() - 18), float(wp.y() + offset_y), 36, 14)
+            painter.drawRoundedRect(rect, 2, 2)
             
             # 绘制文字
             painter.setPen(QtGui.QPen(color))
@@ -361,12 +365,14 @@ class ChartWidget(QtWidgets.QWidget):
             row=0, col=0,
             axisItems={'bottom': self.date_axis}
         )
-        self.candle_plot.setLabel('left', '价格', color=UI_CONFIG['THEME_TEXT'])
+        self.candle_plot.setLabel('right', '价格', color=UI_CONFIG['THEME_TEXT'])
+        self.candle_plot.showAxis('left', False)
+        self.candle_plot.showAxis('right', True)
         self.candle_plot.showGrid(x=True, y=True, alpha=0.3)
         self.candle_plot.setMouseEnabled(x=True, y=True)
         
         # 设置轴颜色
-        for axis in ['left', 'bottom']:
+        for axis in ['right', 'bottom']:
             self.candle_plot.getAxis(axis).setTextPen(pg.mkPen(UI_CONFIG['THEME_TEXT']))
             self.candle_plot.getAxis(axis).setPen(pg.mkPen(UI_CONFIG['CHART_GRID_COLOR']))
         
@@ -381,21 +387,77 @@ class ChartWidget(QtWidgets.QWidget):
         
         # 成交量图区域
         self.volume_plot = self.graphics_layout.addPlot(row=1, col=0)
-        self.volume_plot.setLabel('left', '成交量', color=UI_CONFIG['THEME_TEXT'])
+        self.volume_plot.setLabel('right', '成交量', color=UI_CONFIG['THEME_TEXT'])
+        self.volume_plot.showAxis('left', False)
+        self.volume_plot.showAxis('right', True)
         self.volume_plot.showGrid(x=True, y=True, alpha=0.3)
         self.volume_plot.setMaximumHeight(100)
         
         # 设置成交量轴颜色
-        for axis in ['left', 'bottom']:
+        for axis in ['right', 'bottom']:
             self.volume_plot.getAxis(axis).setTextPen(pg.mkPen(UI_CONFIG['THEME_TEXT']))
             self.volume_plot.getAxis(axis).setPen(pg.mkPen(UI_CONFIG['CHART_GRID_COLOR']))
         
         # 链接 X 轴
         self.volume_plot.setXLink(self.candle_plot)
         
-        # 成交量柱状图
+        # 成交量柱状图（红绿色区分）
         self.volume_bars = pg.BarGraphItem(x=[], height=[], width=0.6, brush='gray')
         self.volume_plot.addItem(self.volume_bars)
+
+        # === 独立 KDJ 面板（币安风格）===
+        self.kdj_plot = self.graphics_layout.addPlot(row=2, col=0)
+        self.kdj_plot.setLabel('right', 'KDJ', color=UI_CONFIG['THEME_TEXT'])
+        self.kdj_plot.showAxis('left', False)
+        self.kdj_plot.showAxis('right', True)
+        self.kdj_plot.showAxis('bottom', False)
+        self.kdj_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.kdj_plot.setMaximumHeight(80)
+        self.kdj_plot.setXLink(self.candle_plot)
+        self.kdj_plot.setYRange(0, 100, padding=0.05)
+        for axis in ['right']:
+            self.kdj_plot.getAxis(axis).setTextPen(pg.mkPen(UI_CONFIG['THEME_TEXT']))
+            self.kdj_plot.getAxis(axis).setPen(pg.mkPen(UI_CONFIG['CHART_GRID_COLOR']))
+        
+        # KDJ 曲线：K(白/浅蓝) D(黄) J(紫)
+        self.k_curve = pg.PlotDataItem(pen=pg.mkPen('#87CEEB', width=1.2))  # 浅蓝
+        self.d_curve = pg.PlotDataItem(pen=pg.mkPen('#FFD700', width=1.2))  # 金黄
+        self.j_curve = pg.PlotDataItem(pen=pg.mkPen('#FF00FF', width=1.2))  # 紫色
+        self.kdj_plot.addItem(self.k_curve)
+        self.kdj_plot.addItem(self.d_curve)
+        self.kdj_plot.addItem(self.j_curve)
+        
+        # 超买超卖参考线
+        self.kdj_plot.addItem(pg.InfiniteLine(pos=80, angle=0, pen=pg.mkPen('#555', width=0.5, style=QtCore.Qt.PenStyle.DashLine)))
+        self.kdj_plot.addItem(pg.InfiniteLine(pos=20, angle=0, pen=pg.mkPen('#555', width=0.5, style=QtCore.Qt.PenStyle.DashLine)))
+
+        # === 独立 MACD 面板（币安风格）===
+        self.macd_plot = self.graphics_layout.addPlot(row=3, col=0)
+        self.macd_plot.setLabel('right', 'MACD', color=UI_CONFIG['THEME_TEXT'])
+        self.macd_plot.showAxis('left', False)
+        self.macd_plot.showAxis('right', True)
+        self.macd_plot.showAxis('bottom', False)
+        self.macd_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.macd_plot.setMaximumHeight(80)
+        self.macd_plot.setXLink(self.candle_plot)
+        for axis in ['right']:
+            self.macd_plot.getAxis(axis).setTextPen(pg.mkPen(UI_CONFIG['THEME_TEXT']))
+            self.macd_plot.getAxis(axis).setPen(pg.mkPen(UI_CONFIG['CHART_GRID_COLOR']))
+        
+        # MACD 柱状图（红绿色）- 使用两个 BarGraphItem
+        self.macd_hist_pos = pg.BarGraphItem(x=[], height=[], width=0.6, brush='#089981')  # 绿色
+        self.macd_hist_neg = pg.BarGraphItem(x=[], height=[], width=0.6, brush='#f23645')  # 红色
+        self.macd_plot.addItem(self.macd_hist_pos)
+        self.macd_plot.addItem(self.macd_hist_neg)
+        
+        # MACD 曲线：DIF(白) DEA(黄)
+        self.macd_curve = pg.PlotDataItem(pen=pg.mkPen('#FFFFFF', width=1.2))     # DIF 白色
+        self.macd_signal_curve = pg.PlotDataItem(pen=pg.mkPen('#FFD700', width=1.2))  # DEA 金黄
+        self.macd_plot.addItem(self.macd_curve)
+        self.macd_plot.addItem(self.macd_signal_curve)
+        
+        # 零轴线
+        self.macd_plot.addItem(pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen('#555', width=0.5)))
         
         # TP / SP 短线段 + 文字（清晰但不遮挡K线）
         tp_color = QtGui.QColor(UI_CONFIG["CHART_TAKE_PROFIT_COLOR"])
@@ -536,32 +598,36 @@ class ChartWidget(QtWidgets.QWidget):
         target_min = actual_min - padding
         target_max = actual_max + padding
         
-        # 稳定性检查：如果当前范围已经包含了目标范围，且余量充足(>30%)，则不更新
+        # 稳定性检查：回滞机制 (Hysteresis)
         curr_min, curr_max = y_range
-        margin_top = (curr_max - actual_max) / (actual_max - actual_min + 1e-5)
-        margin_bottom = (actual_min - curr_min) / (actual_max - actual_min + 1e-5)
         
-        # 如果价格超出了当前范围，或者余量太小(<5%)，则需要平滑调整
-        if actual_max > curr_max or actual_min < curr_min or margin_top < 0.05 or margin_bottom < 0.05:
-            # 立即调整到目标范围，带上充足余量
-            self.candle_plot.setYRange(target_min, target_max, padding=0)
-        elif margin_top > 0.5 or margin_bottom > 0.5:
-            # 如果余量实在太大，也收紧一下
+        # 如果当前价格已经超出当前视图，或者余量严重不足 (<5%)，则触发缩放
+        # 或者如果余量过于宽敞 (>60%)，为了美观也适当收紧
+        margin_top = (curr_max - actual_max) / (actual_max - actual_min + 1e-9)
+        margin_bottom = (actual_min - curr_min) / (actual_max - actual_min + 1e-9)
+        
+        needs_upscale = actual_max > curr_max * 0.98 or actual_min < curr_min * 1.02
+        needs_downscale = margin_top > 0.6 or margin_bottom > 0.6
+        
+        if needs_upscale or needs_downscale:
+            # 引入平滑因子或直接设置目标范围并带上 15% 缓冲区
             self.candle_plot.setYRange(target_min, target_max, padding=0)
     
     def _display_range(self, start_idx: int, end_idx: int):
-        """显示指定范围的 K 线"""
+        """显示指定范围的 K 线 (已优化：移除激进截断，支持历史滚动)"""
         if self.df is None or end_idx <= start_idx:
             return
         
-        visible_range = 40
-        display_start = max(start_idx, end_idx - visible_range + 1)
-        df_slice = self.df.iloc[display_start:end_idx]
+        # 渲染最近 1000 根 K 线，保证用户可以回滚查看，同时兼顾性能
+        history_limit = 1000
+        actual_start = max(0, end_idx - history_limit)
+        df_slice = self.df.iloc[actual_start:end_idx]
         n = len(df_slice)
         
         # 准备K线数据: [index, open, close, low, high]
         candle_data = np.zeros((n, 5))
-        candle_data[:, 0] = np.arange(display_start, display_start + n)
+        # 使用真实的整数索引
+        candle_data[:, 0] = np.arange(actual_start, actual_start + n)
         candle_data[:, 1] = df_slice['open'].values
         candle_data[:, 2] = df_slice['close'].values
         candle_data[:, 3] = df_slice['low'].values
@@ -572,7 +638,7 @@ class ChartWidget(QtWidgets.QWidget):
         
         # 更新成交量
         if 'volume' in df_slice.columns:
-            x = np.arange(display_start, display_start + n)
+            x = np.arange(actual_start, actual_start + n)
             height = df_slice['volume'].values
             colors = []
             for i in range(len(df_slice)):
@@ -589,11 +655,47 @@ class ChartWidget(QtWidgets.QWidget):
         last_price = self.df['close'].iloc[-1]
         self.price_line.setPos(last_price)
         self._update_ohlc_text(len(self.df)-1)
+
+        # === 实时渲染 KDJ 指标（独立面板）===
+        if 'k' in df_slice.columns:
+            indices = np.arange(actual_start, actual_start + n)
+            self.k_curve.setData(x=indices, y=df_slice['k'].values)
+            self.d_curve.setData(x=indices, y=df_slice['d'].values)
+            self.j_curve.setData(x=indices, y=df_slice['j'].values)
+        
+        # === 实时渲染 MACD 指标（独立面板）===
+        if 'macd' in df_slice.columns and 'macd_hist' in df_slice.columns:
+            indices = np.arange(actual_start, actual_start + n)
+            macd_vals = df_slice['macd'].values
+            signal_vals = df_slice['macd_signal'].values
+            hist_vals = df_slice['macd_hist'].values
+            
+            # MACD DIF/DEA 曲线
+            self.macd_curve.setData(x=indices, y=macd_vals)
+            self.macd_signal_curve.setData(x=indices, y=signal_vals)
+            
+            # MACD 柱状图（红绿分离）
+            pos_mask = hist_vals >= 0
+            neg_mask = hist_vals < 0
+            
+            pos_x = indices[pos_mask]
+            pos_h = hist_vals[pos_mask]
+            neg_x = indices[neg_mask]
+            neg_h = hist_vals[neg_mask]
+            
+            self.macd_hist_pos.setOpts(x=pos_x, height=pos_h, width=0.6)
+            self.macd_hist_neg.setOpts(x=neg_x, height=neg_h, width=0.6)
+            
+            # 自动调整 MACD 面板 Y 轴范围
+            all_vals = np.concatenate([macd_vals, signal_vals, hist_vals])
+            y_min, y_max = all_vals.min(), all_vals.max()
+            margin = (y_max - y_min) * 0.1 if y_max != y_min else 1
+            self.macd_plot.setYRange(y_min - margin, y_max + margin, padding=0)
         
         # 更新信号标记
         if self.labels is not None:
             if not self._incremental_signals:
-                self._update_signal_markers_range(display_start, end_idx)
+                self._update_signal_markers_range(actual_start, end_idx)
         self._update_tp_sp_segment()
         
         self.current_display_index = end_idx
@@ -630,16 +732,10 @@ class ChartWidget(QtWidgets.QWidget):
         )
         self._update_tp_sp_segment()
         
-        # 自动调整Y轴范围（降低频率减少卡顿）
+        # 自动调整Y轴范围：使用 smart 缩放替代简单的 setYRange
         self._y_range_tick += 1
-        if self.current_display_index > 0 and (self._y_range_tick % 5 == 0 or self.current_display_index <= visible_range):
-            start = max(0, self.current_display_index - visible_range)
-            end = self.current_display_index
-            df_visible = self.df.iloc[start:end]
-            if len(df_visible) > 0:
-                y_min = df_visible['low'].min() * 0.999
-                y_max = df_visible['high'].max() * 1.001
-                self.candle_plot.setYRange(y_min, y_max, padding=0.02)
+        if self.current_display_index > 0 and (self._y_range_tick % 10 == 0 or self.current_display_index <= visible_range):
+            self._smart_auto_scale()
         
         return self.current_display_index < len(self.df)
 
@@ -856,46 +952,37 @@ class ChartWidget(QtWidgets.QWidget):
         # 计算涨跌幅
         if index > 0:
             pc = self.df.iloc[index-1]['close']
-            chg = (c - pc) / pc
+            chg = (c - pc) / (pc + 1e-9)
         else:
             chg = 0
             
-        # 币安风格色码
         color = UI_CONFIG["CHART_UP_COLOR"] if c >= o else UI_CONFIG["CHART_DOWN_COLOR"]
         
-        # 格式化文本
         ts = ""
         if 'timestamp' in self.df.columns:
             ts_val = self.df.iloc[index]['timestamp']
             try:
-                if isinstance(ts_val, (int, float, np.integer, np.floating)):
-                    dt = datetime.fromtimestamp(float(ts_val) / 1000, tz=_TZ_SHANGHAI)
-                else:
-                    dt = pd.to_datetime(ts_val)
-                    if dt.tzinfo is None:
-                        dt = dt.tz_localize(_TZ_SHANGHAI)
-                    else:
-                        dt = dt.tz_convert(_TZ_SHANGHAI)
+                dt = datetime.fromtimestamp(float(ts_val) / 1000, tz=_TZ_SHANGHAI)
                 ts = dt.strftime('%Y/%m/%d %H:%M')
-            except Exception:
+            except:
                 ts = str(ts_val)
             
-        html = f'<span style="color: #aaa;">{ts}</span> '
-        html += f'<span style="color: #eee;">开:</span> <span style="color: {color};">{o:,.2f}</span> '
-        html += f'<span style="color: #eee;">高:</span> <span style="color: {color};">{h:,.2f}</span> '
-        html += f'<span style="color: #eee;">低:</span> <span style="color: {color};">{l:,.2f}</span> '
-        html += f'<span style="color: #eee;">收:</span> <span style="color: {color};">{c:,.2f}</span> '
-        html += f'<span style="color: #eee;">幅:</span> <span style="color: {color};">{chg:+.2%}</span> '
-        html += f'<span style="color: #eee;">量:</span> <span style="color: #FFB300;">{v:,.2f}</span>'
+        html = f'<span style="color: #888;">{ts}</span> '
+        html += f'<span style="color: #aaa;">O:</span><span style="color: {color};">{o:,.2f}</span> '
+        html += f'<span style="color: #aaa;">H:</span><span style="color: {color};">{h:,.2f}</span> '
+        html += f'<span style="color: #aaa;">L:</span><span style="color: {color};">{l:,.2f}</span> '
+        html += f'<span style="color: #aaa;">C:</span><span style="color: {color};">{c:,.2f}</span> '
+        html += f'<span style="color: #aaa;">Chg:</span><span style="color: {color};">{chg:+.2%}</span> '
+        html += f'<span style="color: #aaa;">V:</span><span style="color: #888;">{v:,.0f}</span>'
         
-        # 将文本放置在左上角适当位置
-        view_range = self.candle_plot.getViewBox().viewRange()
-        self.ohlc_text.setPos(view_range[0][0], view_range[1][1])
+        # 固定在当前视图左上角
+        rect = self.candle_plot.viewRect()
+        self.ohlc_text.setPos(rect.left(), rect.top())
         self.ohlc_text.setHtml(html)
         
-        # 更新实时价格标签位置
+        # 实时价格线标签放在右侧轴上
         last_c = self.df['close'].iloc[-1]
-        self.price_label.setPos(view_range[0][1], last_c)
+        self.price_label.setPos(rect.right(), last_c)
         self.price_label.setHtml(f'<div style="background-color: {color}; color: white; padding: 1px 4px; border-radius: 2px;">{last_c:,.2f}</div>')
     
     def get_data_time_range(self) -> Tuple[str, str]:

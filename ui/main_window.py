@@ -183,6 +183,115 @@ class DataLoaderWorker(QtCore.QObject):
             self.error.emit(str(e) + "\n" + traceback.format_exc())
 
 
+class QuickLabelWorker(QtCore.QObject):
+    """仅标注工作者 - 在后台计算标注与回测，避免UI卡死"""
+    finished = QtCore.pyqtSignal(object)
+    progress = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, df, params):
+        super().__init__()
+        self.df = df
+        self.params = params
+
+    @QtCore.pyqtSlot()
+    def process(self):
+        try:
+            from core.labeler import GodViewLabeler
+            from core.backtester import Backtester
+            from core.market_regime import MarketRegimeClassifier
+            from core.feature_vector import FeatureVectorEngine
+            from core.vector_memory import VectorMemory
+            from utils.indicators import calculate_all_indicators
+
+            self.progress.emit("正在计算指标...")
+            df = calculate_all_indicators(self.df.copy())
+
+            self.progress.emit("正在执行上帝视角标注...")
+            labeler = GodViewLabeler(
+                swing_window=self.params.get('swing_window')
+            )
+            labels = labeler.label(df, use_dp_optimization=False)
+
+            self.progress.emit("正在进行回测统计...")
+            bt_cfg = LABEL_BACKTEST_CONFIG
+            backtester = Backtester(
+                initial_capital=bt_cfg["INITIAL_CAPITAL"],
+                leverage=bt_cfg["LEVERAGE"],
+                fee_rate=bt_cfg["FEE_RATE"],
+                slippage=bt_cfg["SLIPPAGE"],
+                position_size_pct=bt_cfg["POSITION_SIZE_PCT"],
+            )
+            bt_result = backtester.run_with_labels(df, labels)
+
+            metrics = {
+                "initial_capital": bt_result.initial_capital,
+                "total_trades": bt_result.total_trades,
+                "win_rate": bt_result.win_rate,
+                "total_return": bt_result.total_return_pct / 100.0,
+                "total_profit": bt_result.total_profit,
+                "max_drawdown": bt_result.max_drawdown,
+                "sharpe_ratio": bt_result.sharpe_ratio,
+                "profit_factor": bt_result.profit_factor,
+                "long_win_rate": bt_result.long_win_rate,
+                "long_profit": bt_result.long_profit,
+                "short_win_rate": bt_result.short_win_rate,
+                "short_profit": bt_result.short_profit,
+                "current_pos": bt_result.current_pos,
+                "last_trade": bt_result.trades[-1] if bt_result.trades else None
+            }
+
+            regime_classifier = None
+            regime_map = {}
+            fv_engine = None
+            vector_memory = None
+
+            if labeler.alternating_swings:
+                self.progress.emit("正在生成市场状态与向量空间...")
+                classifier = MarketRegimeClassifier(
+                    labeler.alternating_swings, MARKET_REGIME_CONFIG
+                )
+                regime_classifier = classifier
+
+                fv_engine = FeatureVectorEngine()
+                fv_engine.precompute(df)
+                vector_memory = VectorMemory(
+                    k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
+                    min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
+                )
+
+                for ti, trade in enumerate(bt_result.trades):
+                    regime = classifier.classify_at(trade.entry_idx)
+                    trade.market_regime = regime
+                    regime_map[ti] = regime
+
+                    regime_name = regime or '未知'
+                    direction = "LONG" if trade.side == 1 else "SHORT"
+
+                    entry_abc = fv_engine.get_abc(trade.entry_idx)
+                    trade.entry_abc = entry_abc
+                    vector_memory.add_point(regime_name, direction, "ENTRY", *entry_abc)
+
+                    exit_abc = fv_engine.get_abc(trade.exit_idx)
+                    trade.exit_abc = exit_abc
+                    vector_memory.add_point(regime_name, direction, "EXIT", *exit_abc)
+
+            self.finished.emit({
+                "df": df,
+                "labels": labels,
+                "labeler": labeler,
+                "backtester": backtester,
+                "bt_result": bt_result,
+                "metrics": metrics,
+                "regime_classifier": regime_classifier,
+                "regime_map": regime_map,
+                "fv_engine": fv_engine,
+                "vector_memory": vector_memory
+            })
+        except Exception as e:
+            self.error.emit(str(e) + "\n" + traceback.format_exc())
+
+
 class AnalyzeWorker(QtCore.QObject):
     """分析工作者"""
     finished = QtCore.pyqtSignal(object)
@@ -750,116 +859,86 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vector_memory = None
         self._fv_ready = False
 
-        try:
-            from core.labeler import GodViewLabeler
-            from core.backtester import Backtester
-            from core.market_regime import MarketRegimeClassifier
-            from core.feature_vector import FeatureVectorEngine
-            from core.vector_memory import VectorMemory
-            from utils.indicators import calculate_all_indicators
+        self.quick_label_thread = QtCore.QThread()
+        self.quick_label_worker = QuickLabelWorker(self.df, params)
+        self.quick_label_worker.moveToThread(self.quick_label_thread)
 
-            # 计算指标
-            self.df = calculate_all_indicators(self.df)
+        self.quick_label_thread.started.connect(self.quick_label_worker.process)
+        self.quick_label_worker.progress.connect(self._on_quick_label_progress, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.quick_label_worker.finished.connect(self._on_quick_label_finished, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.quick_label_worker.error.connect(self._on_quick_label_error, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.quick_label_worker.finished.connect(self.quick_label_thread.quit)
+        self.quick_label_worker.error.connect(self.quick_label_thread.quit)
 
-            # 上帝视角标注
-            self.labeler = GodViewLabeler(
-                swing_window=params.get('swing_window')
-            )
-            self.labels = self.labeler.label(self.df)
-            self._labels_ready = True
+        self.quick_label_thread.start()
 
-            # 显示全部数据和标注
-            self.chart_widget.set_data(self.df, self.labels, show_all=True)
+    def _on_quick_label_progress(self, msg: str):
+        """快速标注进度更新"""
+        self.control_panel.set_status(msg)
+        self.statusBar().showMessage(msg)
 
-            # 统计
-            long_count = int((self.labels == 1).sum())
-            short_count = int((self.labels == -1).sum())
-            stats = self.labeler.get_statistics() if self.labeler else {}
+    def _on_quick_label_error(self, msg: str):
+        """快速标注失败"""
+        QtWidgets.QMessageBox.critical(self, "标注失败", msg)
+        self.control_panel.set_buttons_enabled(True)
 
-            status_text = f"快速标注完成: {long_count} LONG + {short_count} SHORT"
-            if stats:
-                status_text += f" | 平均收益: {stats.get('avg_profit_pct', 0):.2f}%"
+    def _on_quick_label_finished(self, result: dict):
+        """快速标注完成"""
+        self.df = result["df"]
+        self.labels = result["labels"]
+        self.labeler = result["labeler"]
+        self._labels_ready = True
 
-            self.control_panel.set_status(status_text)
-            self.statusBar().showMessage(status_text)
+        # 显示全部数据和标注
+        self.chart_widget.set_data(self.df, self.labels, show_all=True)
 
-            # 回测
-            bt_cfg = LABEL_BACKTEST_CONFIG
-            backtester = Backtester(
-                initial_capital=bt_cfg["INITIAL_CAPITAL"],
-                leverage=bt_cfg["LEVERAGE"],
-                fee_rate=bt_cfg["FEE_RATE"],
-                slippage=bt_cfg["SLIPPAGE"],
-                position_size_pct=bt_cfg["POSITION_SIZE_PCT"],
-            )
-            bt_result = backtester.run_with_labels(self.df, self.labels)
+        # 统计
+        long_count = int((self.labels == 1).sum())
+        short_count = int((self.labels == -1).sum())
+        stats = self.labeler.get_statistics() if self.labeler else {}
 
-            metrics = {
-                "initial_capital": bt_result.initial_capital,
-                "total_trades": bt_result.total_trades,
-                "win_rate": bt_result.win_rate,
-                "total_return": bt_result.total_return_pct / 100.0,
-                "total_profit": bt_result.total_profit,
-                "max_drawdown": bt_result.max_drawdown,
-                "sharpe_ratio": bt_result.sharpe_ratio,
-                "profit_factor": bt_result.profit_factor,
-                "long_win_rate": bt_result.long_win_rate,
-                "long_profit": bt_result.long_profit,
-                "short_win_rate": bt_result.short_win_rate,
-                "short_profit": bt_result.short_profit,
-                "current_pos": bt_result.current_pos,
-                "last_trade": bt_result.trades[-1] if bt_result.trades else None
-            }
-            self.optimizer_panel.update_backtest_metrics(metrics)
+        status_text = f"快速标注完成: {long_count} LONG + {short_count} SHORT"
+        if stats:
+            status_text += f" | 平均收益: {stats.get('avg_profit_pct', 0):.2f}%"
 
-            # 市场状态分类
-            if self.labeler and self.labeler.alternating_swings:
-                classifier = MarketRegimeClassifier(
-                    self.labeler.alternating_swings, MARKET_REGIME_CONFIG
-                )
-                self.regime_classifier = classifier
-                self.regime_map = {}
+        self.control_panel.set_status(status_text)
+        self.statusBar().showMessage(status_text)
 
-                # 初始化向量引擎
-                self.fv_engine = FeatureVectorEngine()
-                self.fv_engine.precompute(self.df)
-                self.vector_memory = VectorMemory(
-                    k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
-                    min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
-                )
-                self._fv_ready = True
+        # 回测指标
+        bt_result = result.get("bt_result")
+        metrics = result.get("metrics", {})
+        self.optimizer_panel.update_backtest_metrics(metrics)
 
-                for ti, trade in enumerate(bt_result.trades):
-                    regime = classifier.classify_at(trade.entry_idx)
-                    trade.market_regime = regime
-                    self.regime_map[ti] = regime
-                    if self._fv_ready and self.fv_engine:
-                        self._record_trade_vectors(trade)
+        # 市场状态分类 / 向量空间
+        self.regime_classifier = result.get("regime_classifier")
+        self.regime_map = result.get("regime_map", {})
+        self.fv_engine = result.get("fv_engine")
+        self.vector_memory = result.get("vector_memory")
+        self._fv_ready = self.fv_engine is not None
 
-                self.rt_backtester = backtester
-                self._update_regime_stats()
-                self._update_vector_space_plot()
-                self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
+        if bt_result is not None:
+            self.rt_backtester = result.get("backtester")
+            self._update_regime_stats()
+            self._update_vector_space_plot()
+            self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
 
-                # 轨迹模板提取
-                self._extract_trajectory_templates(bt_result.trades)
+            # 轨迹模板提取
+            self._extract_trajectory_templates(bt_result.trades)
 
-            # 启用批量验证
-            self.analysis_panel.enable_batch_wf(True)
+        # 启用批量验证
+        self.analysis_panel.enable_batch_wf(True)
 
-            QtWidgets.QMessageBox.information(
-                self, "快速标注完成",
+        if bt_result:
+            msg = (
                 f"标注完成！共 {bt_result.total_trades} 笔交易\n"
                 f"胜率: {bt_result.win_rate:.1%}\n"
                 f"总收益: {bt_result.total_return_pct:.2f}%\n\n"
                 f"现在可以运行 Walk-Forward 验证了"
             )
-
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "标注失败", str(e))
-            traceback.print_exc()
-        finally:
-            self.control_panel.set_buttons_enabled(True)
+        else:
+            msg = "标注完成！\n\n现在可以运行 Walk-Forward 验证了"
+        QtWidgets.QMessageBox.information(self, "快速标注完成", msg)
+        self.control_panel.set_buttons_enabled(True)
     
     def _on_labeling_step(self, idx: int):
         """标注步骤完成"""
@@ -2661,6 +2740,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 matched_sim,
                 swing_points_count=getattr(state, "swing_points_count", 0),
                 entry_threshold=getattr(state, "entry_threshold", None),
+                macd_ready=getattr(state, "macd_ready", False),
+                kdj_ready=getattr(state, "kdj_ready", False),
             )
             # 更新持仓监控 (NEW)
             self.paper_trading_tab.status_panel.update_monitoring(
@@ -2715,12 +2796,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # 更新模拟交易Tab的图表 (使用增量更新，避免重置信号标记)
             self.paper_trading_tab.chart_widget.update_kline(df)
             
-            # 视图随K线滚动更新（保持右侧留白）
+            # 视图随K线滚动更新（仅在 K 线增加时滚动，避免每秒抖动）
             n = len(df)
-            visible = 50
-            self.paper_trading_tab.chart_widget.candle_plot.setXRange(
-                n - visible, n + 5, padding=0
-            )
+            if not hasattr(self, "_last_live_n") or n > self._last_live_n:
+                self._last_live_n = n
+                visible = 50
+                self.paper_trading_tab.chart_widget.candle_plot.setXRange(
+                    n - visible, n + 5, padding=0
+                )
         except Exception as e:
             print(f"[MainWindow] 更新实时图表失败: {e}")
     

@@ -86,6 +86,9 @@ class PaperOrder:
     # 持仓时长
     hold_bars: int = 0
     
+    # 逻辑开关
+    is_partial_tp_done: bool = False  # 是否已执行保本减仓
+    
     # 限价单相关
     pending_limit_order: bool = False      # 是否有待成交限价单
     limit_order_price: Optional[float] = None  # 限价单价格
@@ -308,6 +311,9 @@ class PaperTrader:
         
         # 订单ID计数器
         self._order_counter = 0
+
+        # 待成交的止损单 (Resting/Stop Orders)
+        self.pending_stop_orders: List[dict] = []  # List of {side, trigger_price, qty, ...}
     
     def has_position(self) -> bool:
         """是否有持仓"""
@@ -319,6 +325,10 @@ class PaperTrader:
             return self.current_position.side
         return None
     
+    def has_pending_stop_orders(self) -> bool:
+        """检查是否有待成交的止损单"""
+        return len(self.pending_stop_orders) > 0
+    
     def open_position(self,
                       side: OrderSide,
                       price: float,
@@ -329,19 +339,7 @@ class PaperTrader:
                       entry_similarity: float = 0.0,
                       entry_reason: str = "") -> Optional[PaperOrder]:
         """
-        开仓
-        
-        Args:
-            side: 方向
-            price: 入场价
-            bar_idx: K线索引
-            take_profit: 止盈价
-            stop_loss: 止损价
-            template_fingerprint: 匹配的模板指纹
-            entry_similarity: 入场相似度
-        
-        Returns:
-            PaperOrder 或 None（如果已有持仓）
+        开仓 (市价/直接成交)
         """
         if self.current_position is not None:
             print("[PaperTrader] 已有持仓，无法开仓")
@@ -349,52 +347,90 @@ class PaperTrader:
         
         # 计算开仓数量
         margin = self.balance * self.position_size_pct
-        
-        # 【市价单开仓 - 无滑点】
-        actual_price = price  # 直接使用当前价格
-        
-        # 计算数量（名义价值 / 价格）
+        actual_price = price
         notional = margin * self.leverage
         quantity = notional / actual_price
         
-        # 扣除Taker手续费
+        # 扣除手续费
         fee = notional * self.taker_fee_rate
         self.balance -= fee
         
-        # 创建订单
+        # 创建并返回订单
+        return self._create_filled_order(
+            side=side, price=actual_price, qty=quantity, margin=margin,
+            bar_idx=bar_idx, tp=take_profit, sl=stop_loss,
+            fp=template_fingerprint, sim=entry_similarity, reason=entry_reason
+        )
+
+    def place_stop_order(self,
+                        side: OrderSide,
+                        trigger_price: float,
+                        bar_idx: int,
+                        take_profit: Optional[float] = None,
+                        stop_loss: Optional[float] = None,
+                        template_fingerprint: Optional[str] = None,
+                        entry_similarity: float = 0.0,
+                        entry_reason: str = "",
+                        timeout_bars: int = 5) -> str:
+        """
+        放置条件触发单 (Stop Order)
+        """
+        self._order_counter += 1
+        order_id = f"STOP_{self._order_counter:06d}"
+        
+        stop_order = {
+            "order_id": order_id,
+            "side": side,
+            "trigger_price": trigger_price,
+            "start_bar": bar_idx,
+            "expire_bar": bar_idx + timeout_bars,
+            "tp": take_profit,
+            "sl": stop_loss,
+            "fp": template_fingerprint,
+            "sim": entry_similarity,
+            "reason": entry_reason
+        }
+        
+        self.pending_stop_orders.append(stop_order)
+        print(f"[PaperTrader] 放置止损触发单: {side.value} @ 触发价 {trigger_price:.2f} (有效至 Bar {bar_idx + timeout_bars})")
+        return order_id
+
+    def cancel_stop_order(self, order_id: str):
+        """撤销待处理的触发单"""
+        self.pending_stop_orders = [o for o in self.pending_stop_orders if o["order_id"] != order_id]
+        print(f"[PaperTrader] 已撤销触发单: {order_id}")
+
+    def _create_filled_order(self, side, price, qty, margin, bar_idx, tp, sl, fp, sim, reason) -> PaperOrder:
+        """辅助方法：创建已成交订单对象"""
         self._order_counter += 1
         order = PaperOrder(
             order_id=f"SIM_{self._order_counter:06d}",
             symbol=self.symbol,
             side=side,
-            quantity=quantity,
+            quantity=qty,
             margin_used=margin,
-            entry_price=actual_price,
+            entry_price=price,
             entry_time=datetime.now(),
             entry_bar_idx=bar_idx,
-            take_profit=take_profit,
-            stop_loss=stop_loss,
-            original_stop_loss=stop_loss,
-            template_fingerprint=template_fingerprint,
-            entry_similarity=entry_similarity,
-            entry_reason=entry_reason,
+            take_profit=tp,
+            stop_loss=sl,
+            original_stop_loss=sl,
+            template_fingerprint=fp,
+            entry_similarity=sim,
+            entry_reason=reason,
         )
-        
         self.current_position = order
         self.current_bar_idx = bar_idx
-        
-        print(f"[PaperTrader] 开仓: {side.value} {quantity:.6f} @ {actual_price:.2f}")
-        
         if self.on_order_update:
             self.on_order_update(order)
-        
         return order
     
     def close_position(self,
                        price: float,
                        bar_idx: int,
                        reason: CloseReason,
-                       use_limit_order: bool = True) -> Optional[PaperOrder]:
+                       use_limit_order: bool = True,
+                       quantity: Optional[float] = None) -> Optional[PaperOrder]:
         """
         平仓（默认使用限价单策略）
         
@@ -403,6 +439,7 @@ class PaperTrader:
             bar_idx: K线索引
             reason: 平仓原因
             use_limit_order: 是否使用限价单（止损/脱轨时应为False）
+            quantity: 平仓数量（None 表示全平）
         
         Returns:
             关闭的订单 或 None（限价单未成交时）
@@ -411,10 +448,11 @@ class PaperTrader:
             return None
         
         order = self.current_position
+        close_qty = quantity if quantity is not None else order.quantity
         
         # 紧急情况（止损/脱轨）立即市价平仓
         if not use_limit_order or reason in [CloseReason.STOP_LOSS, CloseReason.DERAIL]:
-            return self._market_close(price, bar_idx, reason)
+            return self._market_close(price, bar_idx, reason, quantity=close_qty)
         
         # 【限价单策略】计算限价价格
         if order.side == OrderSide.LONG:
@@ -428,9 +466,10 @@ class PaperTrader:
         order.pending_limit_order = True
         order.limit_order_price = limit_price
         order.limit_order_start_bar = bar_idx
+        order.limit_order_quantity = close_qty # 记录本次挂单数量
         order.close_reason = reason  # 保存平仓原因
         
-        print(f"[PaperTrader] 挂限价单: {reason.value} @ {limit_price:.2f} (等待成交...)")
+        print(f"[PaperTrader] 挂限价单: {reason.value} @ {limit_price:.2f} (数量: {close_qty:.6f}, 等待成交...)")
         
         return None  # 返回None表示未立即平仓
     
@@ -439,11 +478,16 @@ class PaperTrader:
         """
         更新价格，检查止盈止损和限价单成交
         """
+        if bar_idx is not None:
+            self.current_bar_idx = bar_idx
+
+        # 1. 检查待成交的止损入场单 (Entry Stop Orders)
+        self._check_pending_stop_orders(price, high, low, bar_idx)
+
         if self.current_position is None:
             return None
         
         if bar_idx is not None:
-            self.current_bar_idx = bar_idx
             self.current_position.hold_bars = bar_idx - self.current_position.entry_bar_idx
         
         order = self.current_position
@@ -513,6 +557,62 @@ class PaperTrader:
             self.on_order_update(order)
         
         return None
+
+    def _check_pending_stop_orders(self, price, high, low, bar_idx):
+        """检查并执行止损入场单的成交"""
+        if self.current_position is not None:
+            # 已有持仓，不在此处理入场单（由外部逻辑决定是否撤销）
+            return
+
+        high = high or price
+        low = low or price
+        activated_orders = []
+        
+        for stop_order in self.pending_stop_orders:
+            # 检查是否超时
+            if bar_idx is not None and bar_idx > stop_order["expire_bar"]:
+                print(f"[PaperTrader] 止损触发单已超时: {stop_order['order_id']}")
+                continue
+            
+            triggered = False
+            if stop_order["side"] == OrderSide.LONG:
+                if high >= stop_order["trigger_price"]:
+                    triggered = True
+            else: # SHORT
+                if low <= stop_order["trigger_price"]:
+                    triggered = True
+            
+            if triggered:
+                print(f"[PaperTrader] 🔥 止损触发单成交! Price={price} Trigger={stop_order['trigger_price']}")
+                # 记录为已激活，稍后转换
+                activated_orders.append(stop_order)
+            else:
+                # 保留未成交且未超时的单子
+                pass
+
+        # 清理已成交或超时的单子（重新构建列表）
+        self.pending_stop_orders = [o for o in self.pending_stop_orders 
+                                   if (o not in activated_orders) and 
+                                   (bar_idx is None or bar_idx <= o["expire_bar"])]
+        
+        # 将第一个触发的单子转换为持仓（假设同一时间只允许一个触发）
+        if activated_orders:
+            # 执行开仓
+            o = activated_orders[0]
+            # 计算数量
+            margin = self.balance * self.position_size_pct
+            notional = margin * self.leverage
+            quantity = notional / o["trigger_price"]
+            
+            # 扣除手续费
+            fee = notional * self.taker_fee_rate
+            self.balance -= fee
+            
+            self._create_filled_order(
+                side=o["side"], price=o["trigger_price"], qty=quantity, margin=margin,
+                bar_idx=bar_idx or self.current_bar_idx, tp=o["tp"], sl=o["sl"],
+                fp=o["fp"], sim=o["sim"], reason=o["reason"]
+            )
     
     def update_tracking_status(self, similarity: float,
                                safe_threshold: float = 0.7,

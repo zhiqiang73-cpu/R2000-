@@ -15,7 +15,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import UI_CONFIG, VECTOR_SPACE_CONFIG
+from config import UI_CONFIG, VECTOR_SPACE_CONFIG, MARKET_REGIME_CONFIG
 
 
 class PaperTradingControlPanel(QtWidgets.QWidget):
@@ -495,9 +495,9 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.market_regime_label = QtWidgets.QLabel("未知")
         market_layout.addRow("市场状态:", self.market_regime_label)
         
-        self.swing_points_label = QtWidgets.QLabel("0 / 4")
+        self.swing_points_label = QtWidgets.QLabel(f"0 / {MARKET_REGIME_CONFIG.get('LOOKBACK_SWINGS', 4)}")
         self.swing_points_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
-        self.swing_points_label.setToolTip("已检测到的摆动点数量 / 激活分类所需的最少点数(4: 2高+2低)")
+        self.swing_points_label.setToolTip(f"已检测到的摆动点数量 / 激活分类所需的最少点数({MARKET_REGIME_CONFIG.get('LOOKBACK_SWINGS', 4)}: 3高+3低)")
         market_layout.addRow("摆动点检测:", self.swing_points_label)
         
         self.fingerprint_status_label = QtWidgets.QLabel("待匹配")
@@ -526,6 +526,25 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.reason_label.setWordWrap(True)
         self.reason_label.setStyleSheet("color: #bbb;")
         market_layout.addRow("决策说明:", self.reason_label)
+        
+        # 动能门控 (Aim/Exit)
+        self.indicators_container = QtWidgets.QWidget()
+        indicators_h_layout = QtWidgets.QHBoxLayout(self.indicators_container)
+        indicators_h_layout.setContentsMargins(0, 5, 0, 5)
+        indicators_h_layout.setSpacing(8)
+        
+        self.macd_status_badge = QtWidgets.QLabel(" MACD ")
+        self.macd_status_badge.setStyleSheet(self._badge_style(False))
+        self.macd_status_badge.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        indicators_h_layout.addWidget(self.macd_status_badge)
+        
+        self.kdj_status_badge = QtWidgets.QLabel(" KDJ ")
+        self.kdj_status_badge.setStyleSheet(self._badge_style(False))
+        self.kdj_status_badge.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        indicators_h_layout.addWidget(self.kdj_status_badge)
+        indicators_h_layout.addStretch()
+        
+        market_layout.addRow("动能门控:", self.indicators_container)
         
         layout.addWidget(market_group)
 
@@ -654,14 +673,19 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
     def update_matching_context(self, market_regime: str, fp_status: str, reason: str,
                                 matched_fp: str = "", matched_similarity: float = None,
                                 swing_points_count: int = 0,
-                                entry_threshold: float = None):
+                                entry_threshold: float = None,
+                                macd_ready: bool = False,
+                                kdj_ready: bool = False):
         """更新匹配状态和因果说明"""
+        self.macd_status_badge.setStyleSheet(self._badge_style(macd_ready))
+        self.kdj_status_badge.setStyleSheet(self._badge_style(kdj_ready))
         regime = market_regime or "未知"
         self.market_regime_label.setText(regime)
         
         # 更新摆动点计数显示
-        sp_text = f"{swing_points_count} / 4"
-        if swing_points_count >= 4:
+        lookback = MARKET_REGIME_CONFIG.get("LOOKBACK_SWINGS", 4)
+        sp_text = f"{swing_points_count} / {lookback}"
+        if swing_points_count >= lookback:
             sp_color = "#089981"  # 绿色 - 已激活分类
             sp_text += "  [已激活]"
         elif swing_points_count >= 1:
@@ -755,6 +779,24 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         """更新当前价格"""
         self.position_current_label.setText(f"${price:,.2f}")
 
+    def _badge_style(self, active: bool) -> str:
+        """生成指标徽章样式"""
+        bg_color = "#089981" if active else "#333"
+        text_color = "#fff" if active else "#777"
+        border_color = "#0ab090" if active else "#555"
+        return f"""
+            QLabel {{
+                background-color: {bg_color};
+                color: {text_color};
+                border: 1px solid {border_color};
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 10px;
+                padding: 2px 6px;
+                min-width: 45px;
+            }}
+        """
+
     @staticmethod
     def _fmt_percent(value: float) -> str:
         """百分比格式化：极大值使用科学计数法 a × 10^b%"""
@@ -798,9 +840,9 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
-            "时间", "方向", "入场价", "出场价", "盈亏%", "原因", "模板", "相似度", "持仓"
+            "时间", "方向", "入场价", "出场价", "盈亏%", "盈亏(USDT)", "原因", "模板", "相似度", "持仓"
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
@@ -869,24 +911,30 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{exit_price:.2f}" if isinstance(exit_price, float) else exit_price))
         
         # 盈亏%
-        pnl_item = QtWidgets.QTableWidgetItem(f"{order.profit_pct:+.2f}%")
+        pnl_pct_item = QtWidgets.QTableWidgetItem(f"{order.profit_pct:+.2f}%")
         pnl_color = QtGui.QColor("#089981") if order.profit_pct >= 0 else QtGui.QColor("#f23645")
-        pnl_item.setForeground(pnl_color)
-        self.table.setItem(row, 4, pnl_item)
+        pnl_pct_item.setForeground(pnl_color)
+        self.table.setItem(row, 4, pnl_pct_item)
+        
+        # 盈亏(USDT)
+        pnl_val = getattr(order, "realized_pnl", 0.0)
+        pnl_usdt_item = QtWidgets.QTableWidgetItem(f"{pnl_val:+,.2f}")
+        pnl_usdt_item.setForeground(pnl_color)
+        self.table.setItem(row, 5, pnl_usdt_item)
         
         # 原因
         reason = order.close_reason.value if order.close_reason else "-"
-        self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(reason))
+        self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(reason))
         
         # 模板
         template = order.template_fingerprint[:8] if order.template_fingerprint else "-"
-        self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(template))
+        self.table.setItem(row, 7, QtWidgets.QTableWidgetItem(template))
         
         # 相似度
-        self.table.setItem(row, 7, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
+        self.table.setItem(row, 8, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
         
         # 持仓时长
-        self.table.setItem(row, 8, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
+        self.table.setItem(row, 9, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
         
         # 滚动到最新
         self.table.scrollToBottom()

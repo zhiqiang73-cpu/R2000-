@@ -61,8 +61,8 @@ class BinanceTestnetTrader:
         self.order_history: List[PaperOrder] = []
         self.template_performances: Dict[str, TemplateSimPerformance] = {}
         
-        # 记录保存路径
-        self.history_dir = os.path.join(os.getcwd(), "data")
+        # 记录保存路径 (使用绝对路径避免当前工作目录切换带来的问题)
+        self.history_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
         self.history_file = os.path.join(self.history_dir, "live_trade_history.json")
         
         self.current_bar_idx: int = 0
@@ -166,11 +166,18 @@ class BinanceTestnetTrader:
         try:
             with open(self.history_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                trades = data.get("trades", [])
+                trades_data = data.get("trades", [])
+                
+                # 恢复全局统计（尤其是初始资金，防止盈利率错误）
+                saved_stats = data.get("stats", {})
+                if saved_stats:
+                    self.stats.initial_balance = float(data.get("initial_balance", self.initial_balance))
+                    self.stats.max_balance = float(saved_stats.get("max_balance", self.stats.initial_balance))
+                    self.stats.total_trades = int(saved_stats.get("total_trades", 0))
                 
                 # 转换回 PaperOrder 对象
                 loaded_history = []
-                for t in trades:
+                for t in trades_data:
                     order = PaperOrder(
                         order_id=t["order_id"],
                         symbol=t["symbol"],
@@ -196,18 +203,20 @@ class BinanceTestnetTrader:
                     )
                     loaded_history.append(order)
                     
-                    # 同时更新模板统计
+                    # 恢复模板性能统计
                     if order.template_fingerprint:
                         self._record_template_performance(order)
                 
                 self.order_history = loaded_history
-                print(f"[BinanceTrader] 成功从本地加载 {len(self.order_history)} 条历史交易记录")
+                print(f"[BinanceTrader] 成功从本地加载 {len(self.order_history)} 条历史交易记录 (数据底座: ${self.stats.initial_balance:.2f})")
                 
                 # 更新账户统计
                 self._update_stats_from_exchange()
                 
         except Exception as e:
             print(f"[BinanceTrader] 加载历史记录失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _set_leverage(self, leverage: int):
         try:
@@ -289,6 +298,36 @@ class BinanceTestnetTrader:
     def has_position(self) -> bool:
         return self.current_position is not None
 
+    def has_pending_stop_orders(self) -> bool:
+        """检查是否有活跃的止损开仓挂单"""
+        try:
+            # 获取所有挂单
+            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            # 查找带有 ENTRY_STOP 前缀的挂单
+            for o in open_orders:
+                client_id = o.get("clientOrderId", "")
+                if "ENTRY_STOP" in client_id:
+                    return True
+            return False
+        except Exception as e:
+            print(f"[BinanceTrader] 检查挂单失败: {e}")
+            return False
+
+    def cancel_entry_stop_orders(self):
+        """取消所有挂起的入场止损单"""
+        try:
+            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            for o in open_orders:
+                client_id = o.get("clientOrderId", "")
+                if "ENTRY_STOP" in client_id:
+                    print(f"[BinanceTrader] 正在撤销过期/替换入场单: {client_id}")
+                    self._signed_request("DELETE", "/fapi/v1/order", {
+                        "symbol": self.symbol,
+                        "orderId": o["orderId"]
+                    })
+        except Exception as e:
+            print(f"[BinanceTrader] 撤销入场单失败: {e}")
+
     def _new_client_order_id(self, prefix: str) -> str:
         self._order_counter += 1
         return f"R3000_{prefix}_{int(time.time())}_{self._order_counter}"
@@ -314,6 +353,43 @@ class BinanceTestnetTrader:
             if qty < self._qty_min:
                 qty = self._qty_min
         return qty
+
+    def place_stop_order(self,
+                         side: OrderSide,
+                         trigger_price: float,
+                         bar_idx: int,
+                         take_profit: Optional[float] = None,
+                         stop_loss: Optional[float] = None,
+                         template_fingerprint: Optional[str] = None,
+                         entry_similarity: float = 0.0,
+                         entry_reason: str = "",
+                         timeout_bars: int = 5) -> Optional[str]:
+        """放置止损开仓单 (STOP_MARKET)"""
+        self._sync_from_exchange(force=True)
+        if self.current_position is not None:
+            return None
+
+        qty = self._calc_entry_quantity(trigger_price)
+        side_str = "BUY" if side == OrderSide.LONG else "SELL"
+        
+        # 格式化
+        precision = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
+        qty_str = f"{qty:.{precision}f}"
+        p_prec = len(str(self._price_tick).split('.')[-1]) if '.' in str(self._price_tick) else 0
+        trigger_str = f"{trigger_price:.{p_prec}f}"
+
+        print(f"[BinanceTrader] 放置开仓止损单: {side_str} {qty_str} @ 触发价 {trigger_str}")
+
+        resp = self._place_order({
+            "symbol": self.symbol,
+            "side": side_str,
+            "type": "STOP_MARKET",
+            "quantity": qty_str,
+            "stopPrice": trigger_str,
+            "newClientOrderId": self._new_client_order_id("ENTRY_STOP"),
+        })
+        
+        return resp.get("orderId")
 
     def open_position(self,
                       side: OrderSide,
@@ -419,7 +495,8 @@ class BinanceTestnetTrader:
     def close_position(self,
                        price: float,
                        bar_idx: int,
-                       reason: CloseReason) -> Optional[PaperOrder]:
+                       reason: CloseReason,
+                       quantity: Optional[float] = None) -> Optional[PaperOrder]:
         """关闭持仓"""
         # 在操作前先强制同步一次，确保本地 current_position 与交易所一致
         self._sync_from_exchange(force=True)
@@ -429,6 +506,7 @@ class BinanceTestnetTrader:
             return None
 
         order = self.current_position
+        close_qty = quantity if quantity is not None else order.quantity
         exit_side = "SELL" if order.side == OrderSide.LONG else "BUY"
 
         # 第一步：尝试限价 IOC（低滑点）
@@ -438,7 +516,7 @@ class BinanceTestnetTrader:
         q_prec = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
         p_prec = len(str(self._price_tick).split('.')[-1]) if '.' in str(self._price_tick) else 0
         
-        qty_str = f"{self._round_step(order.quantity, self._qty_step):.{q_prec}f}"
+        qty_str = f"{self._round_step(close_qty, self._qty_step):.{q_prec}f}"
         price_str = f"{limit_price:.{p_prec}f}"
 
         resp = self._place_order({
@@ -659,6 +737,7 @@ class BinanceTestnetTrader:
         data = {
             "symbol": self.symbol,
             "save_time": datetime.now().isoformat(),
+            "initial_balance": self.stats.initial_balance,
             "leverage": self.leverage,
             "stats": {
                 "total_trades": self.stats.total_trades,
@@ -666,6 +745,7 @@ class BinanceTestnetTrader:
                 "total_pnl": self.stats.total_pnl,
                 "total_pnl_pct": self.stats.total_pnl_pct,
                 "max_drawdown_pct": self.stats.max_drawdown_pct,
+                "max_balance": self.stats.max_balance,
             },
             "trades": [o.to_dict() for o in self.order_history],
         }

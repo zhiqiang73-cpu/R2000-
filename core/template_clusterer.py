@@ -774,15 +774,36 @@ class PrototypeMatcher:
             return self._empty_result()
         current_unit = current_vec / c_norm
         
+        # 【关键修复】Regime-Direction 强制约束
+        # 多头市场（强多头/弱多头/震荡偏多）→ 只允许做 LONG
+        # 空头市场（强空头/弱空头/震荡偏空）→ 只允许做 SHORT
+        BULL_REGIMES = {"强多头", "弱多头", "震荡偏多", "Strong Bull", "Weak Bull", "Range Bull"}
+        BEAR_REGIMES = {"强空头", "弱空头", "震荡偏空", "Strong Bear", "Weak Bear", "Range Bear"}
+        
+        regime_str = str(regime) if regime else ""
+        allowed_direction = None
+        if regime_str in BULL_REGIMES:
+            allowed_direction = "LONG"
+        elif regime_str in BEAR_REGIMES:
+            allowed_direction = "SHORT"
+        
         # 分别匹配 LONG 和 SHORT（传入 regime 过滤）
         # 如果 regime 为 None，直接走向量化矩阵运算
         if regime is None:
             long_matches = self._match_direction_vectorized(current_unit, "LONG")
             short_matches = self._match_direction_vectorized(current_unit, "SHORT")
         else:
-            # 维持原有 regime 库过滤逻辑（因为 regime 过滤后的候选集通常很小，向量化优势不明显）
-            long_matches = self._match_direction(current_vec, "LONG", regime)
-            short_matches = self._match_direction(current_vec, "SHORT", regime)
+            # 根据 regime 强制限定方向
+            if allowed_direction == "LONG":
+                long_matches = self._match_direction(current_vec, "LONG", regime)
+                short_matches = []  # 多头市场不匹配 SHORT
+            elif allowed_direction == "SHORT":
+                long_matches = []   # 空头市场不匹配 LONG
+                short_matches = self._match_direction(current_vec, "SHORT", regime)
+            else:
+                # 未知 regime 类型，保持双向匹配
+                long_matches = self._match_direction(current_vec, "LONG", regime)
+                short_matches = self._match_direction(current_vec, "SHORT", regime)
         
         # 投票统计
         vote_long = len([m for m in long_matches if m[1] >= self.cosine_threshold])

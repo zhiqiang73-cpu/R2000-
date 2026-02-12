@@ -57,6 +57,8 @@ class EngineState:
     swing_points_count: int = 0       # 已识别的摆动点数量
     last_event: str = ""              # 最新事件（用于UI日志显示）
     entry_threshold: float = 0.7      # 运行时真实开仓阈值
+    macd_ready: bool = False          # MACD 指标对齐
+    kdj_ready: bool = False           # KDJ 指标对齐
 
 
 class LiveTradingEngine:
@@ -235,6 +237,9 @@ class LiveTradingEngine:
         # 线程控制
         self._running = False
         self._lock = threading.Lock()
+        
+        # 实时挂单信号 (待价格确认)
+        self.pending_signal = None  # Dict with {side, trigger_price, expire_idx, fingerprint, similarity, reason}
     
     @property
     def paper_trader(self) -> BinanceTestnetTrader:
@@ -501,6 +506,9 @@ class LiveTradingEngine:
             else:
                 self.state.position_side = "-"
             
+            # 更新动能指标状态
+            self._update_indicator_state()
+            
             # 回调
             if self.on_kline:
                 self.on_kline(kline)
@@ -597,9 +605,16 @@ class LiveTradingEngine:
         return float(self._df_buffer['atr'].iloc[-1])
     
     def _process_entry(self, kline: KlineData, atr: float):
-        """处理入场逻辑"""
-        self.state.matching_phase = "匹配入场"
-        self.state.market_regime = self._infer_market_regime()
+        """处理入场逻辑：实现 Ready-Aim-Fire 三重过滤 (已优化：支持信号动态替换)"""
+        try:
+            # 准备阶段
+            self.state.matching_phase = "匹配入场"
+            self.state.market_regime = self._infer_market_regime()
+        except Exception as e:
+            print(f"[LiveEngine] 入场前置流程失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return
         
         if self._fv_engine is None:
             return
@@ -628,13 +643,14 @@ class LiveTradingEngine:
                 # 关键：传入当前市场状态
                 current_regime = self.state.market_regime
                 
-                # 【预热期降级逻辑】
-                # 如果摆动点不足 4 个，市场状态为 UNKNOWN。
-                # 此时 match_entry 如果传入 regime="未知"，通常会因为原型库中没有该状态而返回未匹配。
-                # 我们将其改为 None，让 matcher 跳过状态过滤，直接匹配所有原型。
+                # 【严格市场状态过滤】
+                # 用户要求：regime 必须一致，不允许 UNKNOWN 状态下开仓
                 match_regime = current_regime
                 if current_regime == MarketRegime.UNKNOWN:
-                    match_regime = None
+                    # UNKNOWN 状态下，不进行入场匹配，等待市场状态明确
+                    self.state.decision_reason = "[等待] 市场状态未明确 (需 ≥4 个摆动点)，暂不入场。"
+                    self.state.fingerprint_status = "状态未知"
+                    return
                 
                 long_result = self._proto_matcher.match_entry(
                     pre_entry_traj, direction="LONG", regime=match_regime
@@ -710,33 +726,30 @@ class LiveTradingEngine:
                     self._current_prototype = None
 
             if direction is not None and chosen_fp:
-                self.state.best_match_similarity = similarity
-                self.state.best_match_template = chosen_fp
-                
-                # 【动态止盈止损】基于原型历史表现计算
-                price = kline.close
-                if direction == "LONG":
-                    side = OrderSide.LONG
-                else:
-                    side = OrderSide.SHORT
-                
-                try:
-                    # 使用原型的历史表现计算动态TP/SL
-                    take_profit, stop_loss = self._calculate_dynamic_tp_sl(
-                        entry_price=price,
-                        direction=direction,
-                        prototype=chosen_proto if self.use_prototypes else None,
-                        atr=atr
-                    )
-                except Exception as e:
-                    print(f"[LiveEngine] TP/SL计算失败: {e}，使用固定ATR")
-                    if direction == "LONG":
-                        take_profit = price + atr * self.take_profit_atr
-                        stop_loss = price - atr * self.stop_loss_atr
+                # 【新增：动态信号管理】
+                # 如果已经有挂单，检查是否需要“更新”或“撤销”
+                has_pending = self._paper_trader.has_pending_stop_orders()
+                if has_pending:
+                    # 只有当指纹变化，或者相似度显著提升（>1%）时，才重新布防
+                    is_different = (chosen_fp != self.state.best_match_template)
+                    sim_improved = (similarity > (self.state.best_match_similarity + 0.01))
+                    
+                    if is_different or sim_improved:
+                        print(f"[LiveEngine] 检测到更佳或更符合当下的信号，正在替换挂单: {self.state.best_match_template} -> {chosen_fp}")
+                        self._paper_trader.cancel_entry_stop_orders()
                     else:
-                        take_profit = price - atr * self.take_profit_atr
-                        stop_loss = price + atr * self.stop_loss_atr
-                
+                        # 维持原样，不重复下单
+                        return
+
+                price = kline.close
+                side = OrderSide.LONG if direction == "LONG" else OrderSide.SHORT
+                take_profit, stop_loss = self._calculate_dynamic_tp_sl(
+                    entry_price=price,
+                    direction=direction,
+                    prototype=chosen_proto if self.use_prototypes else None,
+                    atr=atr
+                )
+
                 # 构建详细的开仓原因说明
                 tp_pct = ((take_profit / price) - 1) * 100 if direction == "LONG" else ((price / take_profit) - 1) * 100
                 sl_pct = ((price / stop_loss) - 1) * 100 if direction == "LONG" else ((stop_loss / price) - 1) * 100
@@ -757,47 +770,60 @@ class LiveTradingEngine:
                     f"TP={take_profit:.2f}(+{tp_pct:.1f}%) SL={stop_loss:.2f}(-{sl_pct:.1f}%)"
                 )
                 
-                # 【执行开仓】
-                try:
-                    order = self._paper_trader.open_position(
-                        side=side,
-                        price=price,
-                        bar_idx=self._current_bar_idx,
-                        take_profit=take_profit,
-                        stop_loss=stop_loss,
-                        template_fingerprint=chosen_fp,
-                        entry_similarity=similarity,
-                        entry_reason=reason,
-                    )
-                except Exception as e:
-                    # 开仓失败（网络/API错误）— 必须在UI上显示！
-                    error_msg = f"开仓失败: {e}"
-                    print(f"[LiveEngine] {error_msg}")
-                    import traceback
-                    traceback.print_exc()
-                    self.state.decision_reason = f"[❌开仓失败] {direction} {chosen_fp} | {error_msg}"
-                    self.state.last_event = f"❌开仓失败 {direction} | {str(e)[:60]}"
+                # 【三重确认逻辑】
+                from config import VECTOR_SPACE_CONFIG
+                confirm_pct = VECTOR_SPACE_CONFIG.get("ENTRY_CONFIRM_PCT", 0.001)
+                timeout = VECTOR_SPACE_CONFIG.get("TRIGGER_TIMEOUT_BARS", 5)
+                
+                # A. 检查指标闸门 (Aim 瞄准)
+                if not self._check_indicator_gate(self._df_buffer, direction):
+                    if has_pending: 
+                        # 如果指标变了不再满足，撤掉之前的单子
+                        self._paper_trader.cancel_entry_stop_orders()
+                    self.state.decision_reason = f"[等待瞄准] 指纹匹配成功({similarity:.1%}), 但 MACD/KDJ 动能未对齐。"
+                    self.state.best_match_similarity = similarity
+                    self.state.best_match_template = chosen_fp
                     return
                 
-                if order is None:
-                    # open_position返回None（已有持仓等）
-                    self.state.decision_reason = f"[❌开仓被拒] {direction} | 交易所返回空（可能已有持仓或余额不足）"
-                    self.state.last_event = f"❌开仓被拒 {direction} | 交易所返回空"
-                    return
+                # B. 计算触发价格 (Fire 开火指令)
+                trigger_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
                 
-                if self.on_trade_opened:
-                    self.on_trade_opened(order)
+                # C. 直接向交易器下达“预埋开火单” (Exchange-side Stop Order)
+                order_id = self._paper_trader.place_stop_order(
+                    side=side,
+                    trigger_price=trigger_price,
+                    bar_idx=self._current_bar_idx,
+                    take_profit=take_profit,
+                    stop_loss=stop_loss,
+                    template_fingerprint=chosen_fp,
+                    entry_similarity=similarity,
+                    entry_reason=reason,
+                    timeout_bars=timeout
+                )
                 
-                self.state.matching_phase = "持仓中"
-                self.state.tracking_status = "安全"
-                self.state.fingerprint_status = "匹配成功"
-                self.state.decision_reason = reason
-                self.state.hold_reason = "已开仓，正在按持仓轨迹持续监控。"
-                self.state.danger_level = 0.0
-                self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
-                self.state.position_side = direction
-                self.state.last_event = f"✅开仓 {direction} @ ${price:,.2f} | {chosen_fp}"
+                self.state.best_match_similarity = similarity
+                self.state.best_match_template = chosen_fp
+                self.state.matching_phase = "待定执行"
+                self.state.fingerprint_status = "等待触发"
+                self.state.decision_reason = f"[🎯瞄准中] 指纹已布防({similarity:.1%})，等待价格触碰 {trigger_price:.2f}"
+                self.state.last_event = f"🎯瞄准信号 {direction} | 预埋触发 {trigger_price:.2f}"
                 return
+            else:
+                # 如果当前没有匹配到任何符合门槛的信号，但手里还有挂单
+                if self._paper_trader.has_pending_stop_orders():
+                    print(f"[LiveEngine] 信号已失效或走势变坏，主动撤销挂单。")
+                    self._paper_trader.cancel_entry_stop_orders()
+                    self.state.best_match_template = None
+                    self.state.best_match_similarity = 0.0
+                    self.state.matching_phase = "等待"
+                    self.state.fingerprint_status = "待匹配"
+                    self.state.decision_reason = "之前的指纹信号已消失或不再符合相似度要求，重回扫描模式。"
+                    return
+                
+                self.state.matching_phase = "等待"
+                self.state.fingerprint_status = "未匹配"
+                self.state.best_match_similarity = 0.0
+                self.state.best_match_template = None
             
             # 没有匹配
             self.state.matching_phase = "等待"
@@ -827,6 +853,56 @@ class LiveTradingEngine:
             import traceback
             traceback.print_exc()
     
+    def _update_indicator_state(self):
+        """实时更新动能指标对齐状态"""
+        if self._df_buffer is None or len(self._df_buffer) < 5:
+            self.state.macd_ready = False
+            self.state.kdj_ready = False
+            return
+
+        direction = None
+        is_exit_gate = False
+        
+        # 1. 确定当前关注的方向
+        if self._paper_trader.has_position():
+            direction = self._paper_trader.current_position.side.value # LONG / SHORT
+            is_exit_gate = True
+        elif self.state.best_match_template:
+            # 从当前原型或匹配中的模板推断方向
+            if self._current_prototype:
+                direction = self._current_prototype.direction
+            elif "LONG" in self.state.best_match_template:
+                direction = "LONG"
+            elif "SHORT" in self.state.best_match_template:
+                direction = "SHORT"
+
+        if not direction:
+            self.state.macd_ready = False
+            self.state.kdj_ready = False
+            return
+
+        # 2. 计算指标状态
+        df = self._df_buffer
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        if not is_exit_gate:
+            # 入场逻辑 (Aim 瞄准阶段)
+            if direction == "LONG":
+                self.state.macd_ready = curr['macd_hist'] > prev['macd_hist']
+                self.state.kdj_ready = (curr['j'] < 85) and (curr['j'] > prev['j'])
+            else: # SHORT
+                self.state.macd_ready = curr['macd_hist'] < prev['macd_hist']
+                self.state.kdj_ready = (curr['j'] > 15) and (curr['j'] < prev['j'])
+        else:
+            # 离场逻辑 (Ready 表示门控已打开，允许平仓)
+            if direction == "LONG":
+                self.state.macd_ready = curr['macd_hist'] < prev['macd_hist'] or curr['macd_hist'] < 0
+                self.state.kdj_ready = curr['j'] < prev['j']
+            else: # SHORT
+                self.state.macd_ready = curr['macd_hist'] > prev['macd_hist'] or curr['macd_hist'] > 0
+                self.state.kdj_ready = curr['j'] > prev['j']
+
     def _preview_match(self, kline: KlineData):
         """K线未收线时的预匹配展示（不下单，仅更新UI状态供用户参考）"""
         # 【关键】更新市场状态，确保UI始终显示最新市场状态
@@ -850,117 +926,111 @@ class LiveTradingEngine:
             best_sim = 0.0
             best_fp = ""
             best_dir = ""
-            long_sim = 0.0 # Initialize for the no-match message
-            short_sim = 0.0 # Initialize for the no-match message
+            long_sim = 0.0 
+            short_sim = 0.0
 
             if self.use_prototypes:
-                # 预匹配时也使用当前市场状态过滤
-                current_regime = self.state.market_regime
-                
-                # 【预热期降级逻辑】与入场逻辑一致：UNKNOWN 时跳过 regime 过滤
-                match_regime = current_regime
-                if current_regime == MarketRegime.UNKNOWN:
-                    match_regime = None
-                
-                long_r = self._proto_matcher.match_entry(
-                    pre_entry_traj, direction="LONG", regime=match_regime
-                )
-                short_r = self._proto_matcher.match_entry(
-                    pre_entry_traj, direction="SHORT", regime=match_regime
-                )
-                long_sim = long_r.get("similarity", 0.0)
-                short_sim = short_r.get("similarity", 0.0)
-                long_votes = long_r.get("vote_long", 0)
-                short_votes = short_r.get("vote_short", 0)
-                long_matched = long_r.get("matched", False)
-                short_matched = short_r.get("matched", False)
-                
-                if long_sim >= short_sim and long_sim > 0:
-                    best_sim = long_sim
-                    best_votes = long_votes
-                    best_matched = long_matched
-                    proto = long_r.get("best_prototype")
-                    regime_short = proto.regime[:2] if proto and proto.regime else ""
-                    best_fp = f"proto_{proto.direction}_{proto.prototype_id}_{regime_short}" if proto else ""
-                    best_dir = "LONG"
-                elif short_sim > 0:
-                    best_sim = short_sim
-                    best_votes = short_votes
-                    best_matched = short_matched
-                    proto = short_r.get("best_prototype")
-                    regime_short = proto.regime[:2] if proto and proto.regime else ""
-                    best_fp = f"proto_{proto.direction}_{proto.prototype_id}_{regime_short}" if proto else ""
-                    best_dir = "SHORT"
+                match_regime = self.state.market_regime
+                if match_regime == MarketRegime.UNKNOWN:
+                    # 与 _process_entry 保持一致：UNKNOWN 状态不匹配
+                    self.state.fingerprint_status = "状态未知"
+                    self.state.decision_reason = "[等待] 市场状态未明确 (需 ≥4 个摆动点)，暂不入场。"
+                    return
+                lp = self._proto_matcher.match_entry(pre_entry_traj, direction="LONG", regime=match_regime)
+                sp = self._proto_matcher.match_entry(pre_entry_traj, direction="SHORT", regime=match_regime)
+                long_sim = lp.get("similarity", 0.0)
+                short_sim = sp.get("similarity", 0.0)
+                if long_sim > short_sim:
+                    best_sim, best_dir = long_sim, "LONG"
+                    p = lp.get("best_prototype")
+                    best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
                 else:
-                    best_votes = 0
-                    best_matched = False
-            else:
-                # For non-prototype matching, we still need long_sim and short_sim for the decision reason
-                long_candidates = self.trajectory_memory.get_templates_by_direction("LONG")
-                short_candidates = self.trajectory_memory.get_templates_by_direction("SHORT")
-                
-                long_r = self._matcher.match_entry(
-                    pre_entry_traj,
-                    long_candidates,
-                    cosine_threshold=self.cosine_threshold,
-                    dtw_threshold=self.dtw_threshold,
-                )
-                short_r = self._matcher.match_entry(
-                    pre_entry_traj,
-                    short_candidates,
-                    cosine_threshold=self.cosine_threshold,
-                    dtw_threshold=self.dtw_threshold,
-                )
-                long_sim = long_r.dtw_similarity
-                short_sim = short_r.dtw_similarity
-
-                # The rest of the logic for best_sim, best_fp, best_dir would go here if needed for non-prototype preview
-                # However, the user's instruction only modified the prototype branch for best_sim/fp/dir.
-                # For the non-prototype case, the original code didn't update best_sim/fp/dir in preview.
-                # So, we only calculate long_sim/short_sim here for the decision reason.
-
-
-            # 更新状态（预览，不触发交易）
-            self.state.matching_phase = "预匹配(等待收线)"
-            self.state.fingerprint_status = "实时预览"
-            self.state.best_match_similarity = best_sim
-            self.state.best_match_template = best_fp if best_fp else None
+                    best_sim, best_dir = short_sim, "SHORT"
+                    p = sp.get("best_prototype")
+                    best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
             
-            if self.use_prototypes and best_sim > 0 and best_fp:
-                # 判断收线后是否会开仓
-                will_open = best_matched
-                status_icon = "✅可开仓" if will_open else "⏳待确认"
-                vote_info = f"投票={best_votes}/{self.min_templates_agree}"
-                threshold_info = f"阈值={self.cosine_threshold:.0%}"
-                
-                self.state.decision_reason = (
-                    f"[预匹配] 市场={self.state.market_regime} | {best_dir} | "
-                    f"相似度={best_sim:.1%} | {vote_info} | {threshold_info} | "
-                    f"{status_icon} — 等K线收线"
-                )
-            elif best_sim > 0 and best_fp:
-                self.state.decision_reason = (
-                    f"[预匹配] 市场={self.state.market_regime} | 最佳={best_dir} | "
-                    f"原型={best_fp} | 相似度={best_sim:.2%} — 等待K线收线后确认入场"
-                )
-            else:
-                if self.use_prototypes:
-                    self.state.decision_reason = (
-                        f"[观望] 市场={self.state.market_regime} | "
-                        f"LONG={long_sim:.1%}(投票{long_votes}) | SHORT={short_sim:.1%}(投票{short_votes}) | "
-                        f"❌未达阈值{self.cosine_threshold:.0%}"
-                    )
+            self.state.best_match_similarity = best_sim
+            self.state.best_match_template = best_fp
+            
+            # 【新增】实时决策说明
+            if best_sim >= self.cosine_threshold:
+                self.state.fingerprint_status = "匹配达标"
+                # 检查指标状态
+                macd_ok = self.state.macd_ready
+                kdj_ok = self.state.kdj_ready
+                if macd_ok and kdj_ok:
+                    self.state.decision_reason = f"匹配成功({best_sim:.1%})，动能已对齐。等待本K线收线确认开仓..."
                 else:
-                    self.state.decision_reason = (
-                        f"[观望] 市场={self.state.market_regime} | "
-                        f"未找到匹配原型（LONG={long_sim:.1%}, SHORT={short_sim:.1%}）"
-                    )
-
+                    missing = []
+                    if not macd_ok: missing.append("MACD")
+                    if not kdj_ok: missing.append("KDJ")
+                    self.state.decision_reason = f"指纹匹配达标({best_sim:.1%})，正在等待 {' & '.join(missing)} 动能对齐。"
+            elif best_sim > 0.3:
+                self.state.fingerprint_status = "扫描中"
+                self.state.decision_reason = f"正在扫描潜在信号({best_sim:.1%})..."
+            else:
+                self.state.fingerprint_status = "待匹配"
+                self.state.decision_reason = "扫描市场中，寻找符合历史特征的极值点走势..."
+            
         except Exception as e:
-            # 预匹配失败不影响主流程
             print(f"[LiveEngine] 预匹配失败: {e}")
 
+    def _check_indicator_gate(self, df: pd.DataFrame, direction: str) -> bool:
+        """
+        第二层确认：技术指标共振 (Aim)
+        检查 MACD 和 KDJ 是否配合指纹图方向
+        """
+        if df is None or len(df) < 5:
+            return False
+            
+        # 获取最新两根数据进行对比
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        if direction == "LONG":
+            # 1. MACD 扳机：柱状图不再变深 (下跌动能衰竭)
+            macd_ok = curr['macd_hist'] > prev['macd_hist']
+            
+            # 2. KDJ 扳机：J 线不在超买区，且方向向上
+            kdj_ok = (curr['j'] < 85) and (curr['j'] > prev['j'])
+            
+            return macd_ok and kdj_ok
+            
+        elif direction == "SHORT":
+            # 1. MACD 扳机：柱状图不再变浅 (上涨动能衰竭)
+            macd_ok = curr['macd_hist'] < prev['macd_hist']
+            
+            # 2. KDJ 扳机：J 线不在超卖区，且方向向下
+            kdj_ok = (curr['j'] > 15) and (curr['j'] < prev['j'])
+            
+            return macd_ok and kdj_ok
+            
+        return False
 
+    def _check_price_trigger(self, current_price: float) -> bool:
+        """
+        第三层确认：价格突破 (Fire)
+        """
+        if not self.pending_signal:
+            return False
+            
+        sig = self.pending_signal
+        
+        # 检查是否超时
+        if self._current_bar_idx > sig['expire_idx']:
+            print(f"[LiveEngine] 信号超时过期: {sig['side']} {sig['fingerprint']}")
+            self.pending_signal = None
+            return False
+            
+        # 检查价格是否触碰到触发价格
+        if sig['side'] == OrderSide.LONG:
+            if current_price >= sig['trigger_price']:
+                return True
+        else: # SHORT
+            if current_price <= sig['trigger_price']:
+                return True
+                
+        return False
     def _process_holding(self, kline: KlineData, atr: float):
         """处理持仓逻辑"""
         self.state.matching_phase = "持仓中"
@@ -978,6 +1048,10 @@ class LiveTradingEngine:
             self.state.danger_level = default_danger.get(order.tracking_status, 5.0)
         if not self.state.exit_reason:
             self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
+        
+        # 【新增】更新详细的离场/持有说明
+        pnl_pct = order.profit_pct
+        self.state.decision_reason = f"[持仓中] {order.side.value} | 相似度={order.current_similarity:.1%} | 收益={pnl_pct:+.2f}%"
         
         # 更新价格，检查止盈止损
         close_reason = self._paper_trader.update_price(
@@ -997,6 +1071,12 @@ class LiveTradingEngine:
             return
         
         # 【删除】最大持仓时间限制 - 完全依赖轨迹相似度追踪
+        
+        # 【新增】保本减仓逻辑：一旦浮盈覆盖交易手续费，减仓一半
+        self._check_partial_take_profit(kline)
+        
+        # 【新增】ATR 移动止损逻辑
+        self._update_trailing_stop(order, kline, atr)
         
         # 动态追踪检查
         if order.hold_bars > 0 and order.hold_bars % self.hold_check_interval == 0:
@@ -1068,6 +1148,18 @@ class LiveTradingEngine:
                         
                         # 更新订单的模板指纹
                         order.template_fingerprint = f"proto_{direction}_{new_proto.prototype_id}"
+
+                        # 【新增】同步更新 TP/SL 目标
+                        atr = self._get_current_atr()
+                        new_tp, new_sl = self._calculate_dynamic_tp_sl(
+                            entry_price=order.entry_price,
+                            direction=direction,
+                            prototype=new_proto,
+                            atr=atr
+                        )
+                        order.take_profit = new_tp
+                        order.stop_loss = new_sl
+                        print(f"[LiveEngine] TP/SL 已随原型同步更新: TP={new_tp:.2f}, SL={new_sl:.2f}")
                 
                 # ══════════════════════════════════════════════════════════
                 # 阶段3：离场模式检测
@@ -1088,30 +1180,37 @@ class LiveTradingEngine:
                     current_regime=self.state.market_regime,
                 )
                 
-                # 如果离场模式检测建议离场
+                # 如果离场模式检测建议离场，且通过指标确认闸门
                 if exit_check["should_exit"]:
-                    exit_reason_str = exit_check["exit_reason"]
-                    print(f"[LiveEngine] 离场模式触发: {exit_reason_str} "
-                          f"(信号强度: {exit_check['exit_signal_strength']:.0%})")
-                    
-                    # 执行信号离场
-                    self._paper_trader.close_position(
-                        exit_price=kline.close,
-                        exit_time=datetime.now(),
-                        reason=CloseReason.SIGNAL,
-                        bar_idx=self._current_bar_idx,
-                    )
-                    
-                    self.state.matching_phase = "等待"
-                    self.state.tracking_status = "-"
-                    self.state.hold_reason = ""
-                    self.state.danger_level = 0.0
-                    self.state.exit_reason = ""
-                    self._current_template = None
-                    self._current_prototype = None
-                    self.state.position_side = "-"
-                    self.state.decision_reason = self._build_exit_reason(f"信号({exit_reason_str})", order)
-                    return
+                    # 【新增】离场指标确认 (Triple Verification - Exit)
+                    # 包含 MACD 动能 + KDJ J线翻转
+                    if not self._check_exit_indicator_gate(self._df_buffer, direction):
+                        msg = "形态拟出场，但指标动能支撑(MACD/KDJ)，暂缓离场。"
+                        self.state.exit_reason = msg
+                        self.state.decision_reason = f"[持仓中] {msg}"
+                    else:
+                        exit_reason_str = exit_check["exit_reason"]
+                        print(f"[LiveEngine] 离场模式触发: {exit_reason_str} "
+                              f"(信号强度: {exit_check['exit_signal_strength']:.0%})")
+                        
+                        # 执行信号离场
+                        self._paper_trader.close_position(
+                            exit_price=kline.close,
+                            exit_time=datetime.now(),
+                            reason=CloseReason.SIGNAL,
+                            bar_idx=self._current_bar_idx,
+                        )
+                        
+                        self.state.matching_phase = "等待"
+                        self.state.tracking_status = "-"
+                        self.state.hold_reason = ""
+                        self.state.danger_level = 0.0
+                        self.state.exit_reason = ""
+                        self._current_template = None
+                        self._current_prototype = None
+                        self.state.position_side = "-"
+                        self.state.decision_reason = self._build_exit_reason(f"信号({exit_reason_str})", order)
+                        return
                 
                 # 更新状态中的出场预估
                 if exit_check["exit_signal_strength"] > 0.3:
@@ -1477,6 +1576,89 @@ class LiveTradingEngine:
         """保存交易结果"""
         self._paper_trader.save_history(filepath)
 
+
+    def _check_partial_take_profit(self, kline: KlineData):
+        """检查并执行保本减仓"""
+        if self._paper_trader is None or not self._paper_trader.has_position():
+            return
+        
+        order = self._paper_trader.current_position
+        if order is None or order.is_partial_tp_done:
+            return
+
+        # 计算浮盈是否足以覆盖预估手续费
+        # 预估总手续费 = (入场名义价值 + 现价名义价值) * 手续费率
+        # 为了更保险，我们要求利润是手续费的 1.5 倍以上再执行减仓
+        entry_notional = order.entry_price * order.quantity
+        current_notional = kline.close * order.quantity
+        estimated_fees = (entry_notional + current_notional) * getattr(self._paper_trader, 'fee_rate', 0.0004)
+        
+        if order.unrealized_pnl > estimated_fees * 1.5:
+            print(f"[LiveEngine] 触发保本减仓! 浮盈({order.unrealized_pnl:.2f}) > 预估手续费x1.5({estimated_fees*1.5:.2f})")
+            
+            # 减仓一半
+            partial_qty = self._round_to_step(order.quantity * 0.5)
+            
+            # 执行减仓
+            self._paper_trader.close_position(
+                price=kline.close,
+                bar_idx=self._current_bar_idx,
+                reason=CloseReason.SIGNAL, # 使用 SIGNAL 子类型
+                quantity=partial_qty
+            )
+            
+            # 标记已执行
+            order.is_partial_tp_done = True
+            self.state.last_event = "✅保本减仓已执行"
+
+    def _update_trailing_stop(self, order: PaperOrder, kline: KlineData, atr: float):
+        """
+        ATR 移动止损逻辑
+        当浮盈 > 1.5% 时启动，止损位跟随价格上移（多）或下移（空）
+        """
+        if order.profit_pct < 1.5:
+            return
+            
+        # 移动止损距离：1.5 倍 ATR
+        trailing_dist = atr * 1.5
+        
+        if order.side == OrderSide.LONG:
+            new_sl = kline.high - trailing_dist
+            if new_sl > (order.stop_loss or 0):
+                order.stop_loss = new_sl
+        else:
+            new_sl = kline.low + trailing_dist
+            if new_sl < (order.stop_loss or float('inf')):
+                order.stop_loss = new_sl
+
+    def _check_exit_indicator_gate(self, df: pd.DataFrame, direction: str) -> bool:
+        """
+        离场指标确认门槛 (MACD + KDJ 共振)
+        只有当指标也显示反向动能时，才允许基于形态的离场
+        """
+        if df is None or len(df) < 3:
+            return True
+            
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        if direction == "LONG":
+            # 1. MACD 柱状图在收缩或转负
+            macd_exit = curr['macd_hist'] < prev['macd_hist'] or curr['macd_hist'] < 0
+            # 2. KDJ J线不再创新高（已经掉头或走平）
+            kdj_exit = curr['j'] < prev['j']
+            return macd_exit and kdj_exit
+        else:
+            # 1. MACD 柱状图在回升或转正
+            macd_exit = curr['macd_hist'] > prev['macd_hist'] or curr['macd_hist'] > 0
+            # 2. KDJ J线不再创新低（已经拉升或走平）
+            kdj_exit = curr['j'] > prev['j']
+            return macd_exit and kdj_exit
+
+    def _round_to_step(self, qty: float) -> float:
+        """按交易所最小步进对齐数量"""
+        step = getattr(self._paper_trader, '_qty_step', 0.001)
+        return max(step, (qty // step) * step)
 
 # 简单测试
 if __name__ == "__main__":

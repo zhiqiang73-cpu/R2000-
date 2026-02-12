@@ -136,6 +136,8 @@ VECTOR_SPACE_CONFIG = {
     "LOST_THRESHOLD": 20.0,      # 迷失信号阈值 (%) - entry和exit都低于此值
     "EXIT_CONFIRM_BARS": 3,      # 出场信号需连续确认的K线数
     "PRECISION": 3,              # 坐标精度（小数位）
+    "ENTRY_CONFIRM_PCT": 0.0001, # 入场价格确认比例 (0.01%)
+    "TRIGGER_TIMEOUT_BARS": 5,   # 信号触发超时（K线数）
     # GA权重搜索范围
     "WEIGHT_MIN": -10.0,
     "WEIGHT_MAX": 10.0,
@@ -150,7 +152,7 @@ TRAJECTORY_CONFIG = {
     "MIN_PROFIT_PCT": 0.5,       # 只提取收益率>0.5%的交易作为模板
     "FEATURE_DIM": 32,           # 特征维度 (16+10+6)
     # 匹配阈值默认值（由贝叶斯优化）
-    "COSINE_THRESHOLD": 0.6,     # 余弦相似度阈值
+    "COSINE_THRESHOLD": 0.95,    # 余弦相似度阈值 (95%)
     "DTW_THRESHOLD": 0.5,        # DTW归一化距离阈值（越小越严格）
     "HOLD_DIVERGENCE_LIMIT": 0.7,# 持仓偏离上限
     "EXIT_MATCH_THRESHOLD": 0.5, # 离场匹配阈值
@@ -195,7 +197,7 @@ PROTOTYPE_CONFIG = {
     "PROTOTYPE_DIR": "data/prototypes",  # 原型存储目录
     "AUTO_LOAD_PROTOTYPE": True,      # 启动时自动加载最新原型库
     # 原型匹配参数
-    "COSINE_THRESHOLD": 0.5,          # 余弦相似度阈值
+    "COSINE_THRESHOLD": 0.95,         # 余弦相似度阈值 (95%，更严格)
     "MIN_PROTOTYPES_AGREE": 2,        # 最少原型同意数（投票）
     "HOLDING_SAFE_THRESHOLD": 0.7,    # 持仓健康阈值
     "HOLDING_ALERT_THRESHOLD": 0.5,   # 持仓警告阈值
@@ -205,9 +207,9 @@ PROTOTYPE_CONFIG = {
 # ==================== 市场状态分类配置 ====================
 MARKET_REGIME_CONFIG = {
     "DIR_STRONG_THRESHOLD": 0.008,       # 方向强趋势阈值 (0.8%)
-    "DIR_WEAK_THRESHOLD": 0.002,         # 方向弱趋势阈值 (0.2%)
+    "DIR_WEAK_THRESHOLD": 0.001,         # 方向弱趋势阈值 (0.1%，更灵敏)
     "STRENGTH_STRONG_THRESHOLD": 0.006,  # 强度阈值 (振幅/均价 > 0.6%)
-    "LOOKBACK_SWINGS": 4,               # 回看摆动点数量
+    "LOOKBACK_SWINGS": 6,               # 回看摆动点数量 (增加到6个，更全面)
 }
 
 # ==================== UI 配置 ====================
@@ -263,7 +265,7 @@ PAPER_TRADING_CONFIG = {
     "MARKET_TYPE": "futures",  # "spot" / "futures"
     
     # 匹配参数
-    "COSINE_THRESHOLD": 0.6,
+    "COSINE_THRESHOLD": 0.95,         # 余弦相似度阈值 (95%)
     "DTW_THRESHOLD": 0.5,
     "MIN_TEMPLATES_AGREE": 1,
     
