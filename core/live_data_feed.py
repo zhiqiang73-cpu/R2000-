@@ -618,6 +618,7 @@ class LiveDataFeed:
     
     def _handle_kline(self, kline: KlineData):
         """处理收到的K线数据"""
+        emit_callback = True
         with self._lock:
             if kline.is_closed:
                 # 完整K线 → 加入缓存
@@ -634,12 +635,17 @@ class LiveDataFeed:
                 self._current_kline = None
                 if kline.timestamp > self._last_emitted_closed_ts:
                     self._last_emitted_closed_ts = kline.timestamp
+                    emit_callback = True
+                else:
+                    # 同一根收线K线已触发过（例如REST先到、WS后到），跳过重复回调
+                    emit_callback = False
             else:
                 # 未完成K线 → 更新当前K线
                 self._current_kline = kline
+                emit_callback = True
         
         # 回调
-        if self.on_kline:
+        if emit_callback and self.on_kline:
             try:
                 self.on_kline(kline)
             except Exception as e:

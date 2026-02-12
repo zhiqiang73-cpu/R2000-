@@ -351,7 +351,7 @@ class BatchWalkForwardEngine:
         
         # 串行模式：逐轮执行，支持 trial 级细粒度进度
         # 注：CPU密集计算在Python GIL下无法通过多线程加速，
-        #     并行模式反而引起UI进度显示混乱和锁竞争，故统一使用串行。
+        #     并行模式反而引起UI进度显示混乱和锁竞争，固定串行更稳。
         if True:
             for round_idx in range(self.n_rounds):
                 if self._stopped:
@@ -383,13 +383,20 @@ class BatchWalkForwardEngine:
                 def trial_progress_cb(trial_idx, trial_total, _):
                     if not callback:
                         return
-                    # 【优化】降低信号发射频率，避免UI阻塞（每5个trial或最后一个trial才发送）
-                    if trial_idx % 5 != 0 and trial_idx != trial_total:
-                        return
                     
-                    frac = min(1.0, max(0.0, trial_idx / max(1, trial_total)))
-                    # 5% 启动 + 90% 贝叶斯优化 + 5% 收尾（在apply_round_result里补齐）
-                    round_progress[round_idx] = max(round_progress[round_idx], 0.05 + 0.90 * frac)
+                    # 5% 启动 + 90% (构建缓存或贝叶斯优化) + 5% 收尾（在apply_round_result里补齐）
+                    if trial_idx == -1:  # 特殊标识：正在预构建缓存
+                        phase = "build_cache"
+                        frac = min(1.0, max(0.0, trial_total / max(1, _))) # 此处 _ 是 total_bars
+                        round_progress[round_idx] = max(round_progress[round_idx], 0.05 + 0.45 * frac) # 缓存占据前一半进度
+                    else:
+                        phase = "bayes_opt"
+                        frac = min(1.0, max(0.0, trial_idx / max(1, trial_total)))
+                        # 如果有缓存构建，则从 50% 开始；如果没有，则从 5% 开始
+                        base = 0.50 if self._evaluator is not None else 0.05
+                        span = 0.45 if self._evaluator is not None else 0.90
+                        round_progress[round_idx] = max(round_progress[round_idx], base + span * frac)
+                    
                     elapsed = time.time() - start_time
                     cumulative_stats = {
                         "total_match_events": result.total_match_events,
@@ -402,9 +409,9 @@ class BatchWalkForwardEngine:
                         "eliminated": result.eliminated_count,
                         "eta_seconds": 0,
                         "running": True,
-                        "phase": "bayes_opt",
-                        "trial_idx": trial_idx,
-                        "trial_total": trial_total,
+                        "phase": phase,
+                        "trial_idx": trial_idx if trial_idx >= 0 else trial_total,
+                        "trial_total": trial_total if trial_idx >= 0 else _,
                         "elapsed": elapsed,
                         "global_progress_pct": current_global_progress_pct(),
                     }

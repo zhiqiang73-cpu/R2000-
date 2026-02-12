@@ -56,6 +56,7 @@ class EngineState:
     position_side: str = "-"
     swing_points_count: int = 0       # 已识别的摆动点数量
     last_event: str = ""              # 最新事件（用于UI日志显示）
+    entry_threshold: float = 0.7      # 运行时真实开仓阈值
 
 
 class LiveTradingEngine:
@@ -192,19 +193,25 @@ class LiveTradingEngine:
             socks_proxy=socks_proxy,
         )
         
+        # 执行参数固定：每次开仓 50% 仓位，杠杆 10x
+        self.fixed_position_size_pct = 0.5
+        self.fixed_leverage = 10
+
         # Binance 测试网真实执行器（不再使用本地虚拟模式）
         self._paper_trader = BinanceTestnetTrader(
             symbol=symbol,
             api_key=api_key,
             api_secret=api_secret,
             initial_balance=initial_balance,
-            leverage=leverage,
+            leverage=self.fixed_leverage,
+            position_size_pct=self.fixed_position_size_pct,
             on_order_update=self._on_order_update,
             on_trade_closed=self._on_trade_closed_internal,
         )
         
         # 引擎状态
         self.state = EngineState()
+        self.state.entry_threshold = self.cosine_threshold
         
         # 特征引擎和匹配器（延迟初始化）
         self._fv_engine = None
@@ -247,6 +254,10 @@ class LiveTradingEngine:
             return True
         
         print(f"[LiveEngine] 启动引擎: {self.symbol} {self.interval}")
+        print(
+            f"[LiveEngine] 执行参数固定: 杠杆={self.fixed_leverage}x | "
+            f"单次仓位={self.fixed_position_size_pct:.0%}"
+        )
         if self.use_prototypes:
             proto_count = self._active_prototype_library.total_count if self._active_prototype_library is not None else 0
             print(f"[LiveEngine] 模式: 聚合指纹图（原型）")
@@ -709,59 +720,83 @@ class LiveTradingEngine:
                 else:
                     side = OrderSide.SHORT
                 
-                # 使用原型的历史表现计算动态TP/SL
-                take_profit, stop_loss = self._calculate_dynamic_tp_sl(
-                    entry_price=price,
-                    direction=direction,
-                    prototype=chosen_proto,
-                    atr=atr
-                )
+                try:
+                    # 使用原型的历史表现计算动态TP/SL
+                    take_profit, stop_loss = self._calculate_dynamic_tp_sl(
+                        entry_price=price,
+                        direction=direction,
+                        prototype=chosen_proto if self.use_prototypes else None,
+                        atr=atr
+                    )
+                except Exception as e:
+                    print(f"[LiveEngine] TP/SL计算失败: {e}，使用固定ATR")
+                    if direction == "LONG":
+                        take_profit = price + atr * self.take_profit_atr
+                        stop_loss = price - atr * self.stop_loss_atr
+                    else:
+                        take_profit = price - atr * self.take_profit_atr
+                        stop_loss = price + atr * self.stop_loss_atr
                 
-                # 构建详细的开仓原因说明（包含原型历史表现和动态TP/SL）
+                # 构建详细的开仓原因说明
                 tp_pct = ((take_profit / price) - 1) * 100 if direction == "LONG" else ((price / take_profit) - 1) * 100
                 sl_pct = ((price / stop_loss) - 1) * 100 if direction == "LONG" else ((stop_loss / price) - 1) * 100
                 
-                if chosen_proto and getattr(chosen_proto, 'member_count', 0) >= 10:
-                    # 有足够数据的原型
-                    reason = (
-                        f"[开仓逻辑] 市场={self.state.market_regime} | 信号={direction} | "
+                proto_info = ""
+                if self.use_prototypes and chosen_proto and getattr(chosen_proto, 'member_count', 0) >= 10:
+                    proto_info = (
                         f"原型={chosen_fp}(胜率={chosen_proto.win_rate:.1%}, "
-                        f"历史平均收益={chosen_proto.avg_profit_pct:.2f}%, "
-                        f"样本={chosen_proto.member_count}笔) | "
-                        f"相似度={similarity:.2%} | "
-                        f"动态TP={take_profit:.2f}(+{tp_pct:.2f}%) "
-                        f"动态SL={stop_loss:.2f}(-{sl_pct:.2f}%)"
+                        f"平均收益={chosen_proto.avg_profit_pct:.2f}%, "
+                        f"样本={chosen_proto.member_count}笔)"
                     )
                 else:
-                    # 数据不足，使用固定ATR
-                    reason = (
-                        f"[开仓逻辑] 市场={self.state.market_regime} | 信号={direction} | "
-                        f"原型={chosen_fp}(数据不足,使用固定ATR) | "
-                        f"相似度={similarity:.2%} | "
-                        f"TP={take_profit:.2f}(+{tp_pct:.2f}%) "
-                        f"SL={stop_loss:.2f}(-{sl_pct:.2f}%)"
-                    )
-
+                    proto_info = f"原型={chosen_fp}"
                 
-                order = self._paper_trader.open_position(
-                    side=side,
-                    price=price,
-                    bar_idx=self._current_bar_idx,
-                    take_profit=take_profit,
-                    stop_loss=stop_loss,
-                    template_fingerprint=chosen_fp,
-                    entry_similarity=similarity,
-                    entry_reason=reason,
+                reason = (
+                    f"[开仓] 市场={self.state.market_regime} | {direction} | "
+                    f"{proto_info} | 相似度={similarity:.1%} | "
+                    f"TP={take_profit:.2f}(+{tp_pct:.1f}%) SL={stop_loss:.2f}(-{sl_pct:.1f}%)"
                 )
                 
-                if order and self.on_trade_opened:
+                # 【执行开仓】
+                try:
+                    order = self._paper_trader.open_position(
+                        side=side,
+                        price=price,
+                        bar_idx=self._current_bar_idx,
+                        take_profit=take_profit,
+                        stop_loss=stop_loss,
+                        template_fingerprint=chosen_fp,
+                        entry_similarity=similarity,
+                        entry_reason=reason,
+                    )
+                except Exception as e:
+                    # 开仓失败（网络/API错误）— 必须在UI上显示！
+                    error_msg = f"开仓失败: {e}"
+                    print(f"[LiveEngine] {error_msg}")
+                    import traceback
+                    traceback.print_exc()
+                    self.state.decision_reason = f"[❌开仓失败] {direction} {chosen_fp} | {error_msg}"
+                    self.state.last_event = f"❌开仓失败 {direction} | {str(e)[:60]}"
+                    return
+                
+                if order is None:
+                    # open_position返回None（已有持仓等）
+                    self.state.decision_reason = f"[❌开仓被拒] {direction} | 交易所返回空（可能已有持仓或余额不足）"
+                    self.state.last_event = f"❌开仓被拒 {direction} | 交易所返回空"
+                    return
+                
+                if self.on_trade_opened:
                     self.on_trade_opened(order)
                 
                 self.state.matching_phase = "持仓中"
                 self.state.tracking_status = "安全"
                 self.state.fingerprint_status = "匹配成功"
                 self.state.decision_reason = reason
+                self.state.hold_reason = "已开仓，正在按持仓轨迹持续监控。"
+                self.state.danger_level = 0.0
+                self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
                 self.state.position_side = direction
+                self.state.last_event = f"✅开仓 {direction} @ ${price:,.2f} | {chosen_fp}"
                 return
             
             # 没有匹配
@@ -934,6 +969,15 @@ class LiveTradingEngine:
         order = self._paper_trader.current_position
         if order is None:
             return
+
+        # 刚开仓到首次相似度巡检前，避免UI显示“未持仓/0%”
+        if not self.state.hold_reason:
+            self.state.hold_reason = "已开仓，等待下一次持仓相似度巡检。"
+        if self.state.danger_level <= 0:
+            default_danger = {"安全": 5.0, "警戒": 55.0, "危险": 80.0, "脱轨": 100.0}
+            self.state.danger_level = default_danger.get(order.tracking_status, 5.0)
+        if not self.state.exit_reason:
+            self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
         
         # 更新价格，检查止盈止损
         close_reason = self._paper_trader.update_price(
@@ -1409,6 +1453,7 @@ class LiveTradingEngine:
         return {
             "initial_balance": stats.initial_balance,
             "current_balance": stats.current_balance,
+            "available_margin": getattr(stats, "available_margin", 0.0),
             "total_pnl": stats.total_pnl,
             "total_pnl_pct": stats.total_pnl_pct,
             "total_trades": stats.total_trades,

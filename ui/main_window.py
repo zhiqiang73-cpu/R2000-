@@ -1640,19 +1640,22 @@ class MainWindow(QtWidgets.QMainWindow):
         progress_pct = cumulative_stats.get("global_progress_pct", None)
         if is_running:
             phase = cumulative_stats.get("phase", "")
-            if phase == "bayes_opt":
-                trial_idx = cumulative_stats.get("trial_idx", 0)
-                trial_total = cumulative_stats.get("trial_total", 0)
-                pct_text = f" | {int(progress_pct)}%" if progress_pct is not None else ""
+            pct_text = f" | {int(progress_pct)}%" if progress_pct is not None else ""
+            if phase == "build_cache":
+                i_idx = cumulative_stats.get("trial_idx", 0)
+                n_total = cumulative_stats.get("trial_total", 1)
                 self.statusBar().showMessage(
-                    f"批量WF: 第 {round_idx + 1}/{n_rounds} 轮 | 贝叶斯优化 "
-                    f"{trial_idx}/{trial_total}{pct_text} ..."
+                    f"批量WF: 第 {round_idx + 1}/{n_rounds} 轮 | 预构建匹配缓存 ({i_idx}/{n_total}){pct_text} ..."
+                )
+            elif phase == "bayes_opt":
+                trial_idx = cumulative_stats.get("trial_idx", 0)
+                trial_total = cumulative_stats.get("trial_total", 20)
+                self.statusBar().showMessage(
+                    f"批量WF: 第 {round_idx + 1}/{n_rounds} 轮 | 贝叶斯优化 ({trial_idx}/{trial_total}){pct_text} ..."
                 )
             else:
-                pct_text = f" | {int(progress_pct)}%" if progress_pct is not None else ""
                 self.statusBar().showMessage(
-                    f"批量WF: 第 {round_idx + 1}/{n_rounds} 轮运行中... "
-                    f"(每轮约需3-5分钟){pct_text}"
+                    f"批量WF: 第 {round_idx + 1}/{n_rounds} 轮运行中... {pct_text}"
                 )
         else:
             self.statusBar().showMessage(
@@ -2657,6 +2660,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 matched_fp,
                 matched_sim,
                 swing_points_count=getattr(state, "swing_points_count", 0),
+                entry_threshold=getattr(state, "entry_threshold", None),
             )
             # 更新持仓监控 (NEW)
             self.paper_trading_tab.status_panel.update_monitoring(

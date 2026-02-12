@@ -568,6 +568,10 @@ class BayesianTradingOptimizer:
         self._cache_pre_window = TRAJECTORY_CONFIG["PRE_ENTRY_WINDOW"]
         self._cache_min_candidates = 50
         
+        # 原型模式下的 regime 分类器缓存（避免每个 trial 重复构建导致“卡住”）
+        self._cached_regime_classifier = None
+        self._regime_cache_ready = False
+        
         # 预计算验证集数据
         self._prepare_validation_data()
     
@@ -580,6 +584,44 @@ class BayesianTradingOptimizer:
         
         self.val_atr = self.val_df['atr'].values if 'atr' in self.val_df.columns else np.ones(len(self.val_df))
         self.val_close = self.val_df['close'].values
+
+    def _ensure_regime_classifier_cache(self, sub_callback: Optional[Callable] = None):
+        """
+        原型模式：构建并缓存 regime 分类器（仅一次）。
+        解决每个 trial 都重新标注导致 long stall（UI 长时间卡在 1%）问题。
+        """
+        if self._regime_cache_ready:
+            return self._cached_regime_classifier
+        
+        if sub_callback:
+            # trial 内预处理阶段心跳，避免UI看起来“假死”
+            sub_callback(0.02)
+        
+        regime_classifier_local = None
+        try:
+            from core.labeler import GodViewLabeler
+            from core.market_regime import MarketRegimeClassifier
+            from config import MARKET_REGIME_CONFIG
+            labeler = GodViewLabeler()
+            # 仅用于WF中的regime过滤，使用快速标注路径，避免DP路径导致长时间卡在1%
+            labeler.label(self.val_df, use_dp_optimization=False)
+            if labeler.alternating_swings:
+                regime_classifier_local = MarketRegimeClassifier(
+                    labeler.alternating_swings, MARKET_REGIME_CONFIG
+                )
+                print(f"[GA_Sim] Regime缓存构建完成: {len(labeler.alternating_swings)} 个摆动点")
+            else:
+                print("[GA_Sim] Regime缓存: 无摆动点，回退全量匹配")
+        except Exception as e:
+            print(f"[GA_Sim] Regime缓存构建异常，回退全量匹配: {e}")
+        
+        self._cached_regime_classifier = regime_classifier_local
+        self._regime_cache_ready = True
+        
+        if sub_callback:
+            sub_callback(0.08)
+        
+        return self._cached_regime_classifier
     
     def _get_direction_candidates(self, direction: str):
         """获取方向候选模板（候选不足时回退全量）"""
@@ -591,7 +633,7 @@ class BayesianTradingOptimizer:
             candidates = self.memory.get_templates_by_direction(direction)
         return candidates
     
-    def _build_entry_match_cache(self):
+    def _build_entry_match_cache(self, callback: Optional[Callable] = None):
         """
         预计算每个bar的入场匹配Top-K（与参数无关）：
         后续trial只做阈值判断，避免重复DTW。
@@ -700,12 +742,20 @@ class BayesianTradingOptimizer:
                 ))
             return rows
         
+        if callback:
+            callback(0, n, n)  # 初始信号
+            
         for i in range(pre_window, n - 1):
             current_traj = self.fv_engine.get_raw_matrix(i - pre_window, i)
             if current_traj.shape[0] < pre_window:
                 continue
             cache["long"][i] = compute_topk(current_traj, long_candidates, long_store)
             cache["short"][i] = compute_topk(current_traj, short_candidates, short_store)
+            
+            # 进度汇报
+            if callback and i % 500 == 0:
+                # 使用负值或特殊标识表示是在构建缓存阶段
+                callback(-1, i, n)
         
         self._entry_match_cache = cache
     
@@ -750,7 +800,8 @@ class BayesianTradingOptimizer:
         # 预构建入场匹配缓存（多trial复用）
         # 原型模式不使用模板DTW缓存，避免访问 self.memory(None)
         if (not self.use_prototypes) and self._entry_match_cache is None:
-            self._build_entry_match_cache()
+            # 只有在第一轮构建缓存时才需要此进度
+            self._build_entry_match_cache(callback=sub_callback)
         
         def objective(trial: optuna.Trial) -> float:
             """Optuna 目标函数 — 搜索 7 个交易参数（回测优化）"""
@@ -783,8 +834,14 @@ class BayesianTradingOptimizer:
                 use_dynamic_tracking=False,  # Walk-Forward 不用动态追踪
             )
             
-            # 评估
-            fitness = self._evaluate(params)
+            # 评估（带 intra-trial 进度）
+            def intra_trial_cb(p: float):
+                if sub_callback:
+                    # p 是当前 trial 的进度 (0.0~1.0)
+                    # 我们上报 trial_idx + p 为 float，BatchWF 会处理
+                    sub_callback(self._trial_count + p, self.n_trials, self.n_trials)
+            
+            fitness = self._evaluate(params, sub_callback=intra_trial_cb)
             
             # 更新最佳结果
             if fitness > self._best_fitness:
@@ -843,40 +900,24 @@ class BayesianTradingOptimizer:
         
         return best_params, study.best_value
     
-    def _evaluate(self, params: TradingParams) -> float:
+    def _evaluate(self, params: TradingParams, sub_callback: Optional[Callable] = None) -> float:
         """评估适应度"""
-        result = self._simulate_trading(params)
+        result = self._simulate_trading(params, sub_callback=sub_callback)
         if result.n_trades < 5:
             return -10.0
         return result.sharpe_ratio
     
     def _simulate_trading(self, params: TradingParams,
                           record_templates: bool = False,
-                          fast_mode: bool = True) -> SimulatedTradeResult:
+                          fast_mode: bool = True,
+                          sub_callback: Optional[Callable] = None) -> SimulatedTradeResult:
         """
         在验证集上模拟交易
-        
-        三种模式：
-          A. use_prototypes=True（原型匹配模式）
-             → 使用 PrototypeMatcher 匹配 52 个原型
-             → 速度快 200 倍，统计更稳健
-          
-          B. use_dynamic_tracking=False（模板 Walk-Forward回测）
-             → 简化逻辑：TP/SL + 单一偏离度 hold_divergence_limit
-             → 交易数多，统计可靠，适合参数优化
-          
-          C. use_dynamic_tracking=True（模拟盘/实盘）
-             → 完整逻辑：动态追踪 + 3阈值 + 模板切换
-             → 保守管理，风险控制，适合真实交易
-        
-        Args:
-            params: 交易参数
-            record_templates: 是否记录模板/原型信息
-            fast_mode: 快速模式（入场跳跃采样）
+        ... (省略 docstring，保持一致)
         """
         # ── 原型模式：使用 PrototypeMatcher ──
         if self.use_prototypes:
-            return self._simulate_trading_prototypes(params, record_templates, fast_mode)
+            return self._simulate_trading_prototypes(params, record_templates, fast_mode, sub_callback)
         
         from core.trajectory_matcher import TrajectoryMatcher
 
@@ -1212,7 +1253,8 @@ class BayesianTradingOptimizer:
 
     def _simulate_trading_prototypes(self, params: TradingParams,
                                       record_templates: bool = False,
-                                      fast_mode: bool = True) -> SimulatedTradeResult:
+                                      fast_mode: bool = True,
+                                      sub_callback: Optional[Callable] = None) -> SimulatedTradeResult:
         """
         使用原型进行模拟交易（速度快 200 倍）
         
@@ -1240,25 +1282,9 @@ class BayesianTradingOptimizer:
             min_prototypes_agree=1, 
         )
         
-        # 【方案2】WF中加入 regime 过滤 ─────────────────────────
-        # 在验证数据上检测摆动点 → 推断市场状态 → 让原型只在自己对应的 regime 中被测试
-        regime_classifier_local = None
-        try:
-            from core.labeler import GodViewLabeler
-            from core.market_regime import MarketRegimeClassifier
-            from config import MARKET_REGIME_CONFIG
-            labeler = GodViewLabeler()
-            labeler.label(self.val_df)
-            if labeler.alternating_swings:
-                regime_classifier_local = MarketRegimeClassifier(
-                    labeler.alternating_swings, MARKET_REGIME_CONFIG
-                )
-                print(f"[GA_Sim] Regime过滤已启用: {len(labeler.alternating_swings)} 个摆动点")
-            else:
-                print("[GA_Sim] 无摆动点，Regime过滤跳过（匹配全部原型）")
-        except Exception as e:
-            print(f"[GA_Sim] Regime检测异常，回退到全量匹配: {e}")
-        # ──────────────────────────────────────────────────────
+        # 【方案2】WF中加入 regime 过滤（缓存版）
+        # 在同一轮优化内只构建一次，后续 trial 复用，避免长时间无进度反馈。
+        regime_classifier_local = self._ensure_regime_classifier_cache(sub_callback=sub_callback)
         
         pre_window = TRAJECTORY_CONFIG["PRE_ENTRY_WINDOW"]
         skip_bars = TRAJECTORY_CONFIG.get("EVAL_SKIP_BARS", 5) if fast_mode else 1
@@ -1295,6 +1321,9 @@ class BayesianTradingOptimizer:
         
         i = pre_window
         while i < n - 1:
+            if sub_callback and i % 500 == 0:
+                # 高频心跳：无论是否入场/持仓，都让UI持续前进
+                sub_callback(float(i) / n)
             if position is None:
                 # ── 入场检查 ──
                 current_traj = self.fv_engine.get_raw_matrix(i - pre_window, i)
@@ -1316,8 +1345,8 @@ class BayesianTradingOptimizer:
                     current_traj, direction=None, regime=current_regime
                 )
                 
-                # 每 2000 根线打一次 LOG 或 匹配成功时打 LOG
-                if i % 2000 == 0 or match_result["matched"]:
+                # 降低日志频率，避免大量IO拖慢WF
+                if i % 10000 == 0:
                     sim = match_result.get("similarity", 0)
                     print(f"  [Match_Debug] Bar {i}: Matched={match_result['matched']}, BestSim={sim:.3f}, Target={params.cosine_threshold}")
 

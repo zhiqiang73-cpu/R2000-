@@ -154,15 +154,24 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         account_layout.addRow("初始资金:", self.balance_spin)
         
         self.leverage_spin = QtWidgets.QSpinBox()
-        self.leverage_spin.setRange(1, 125)
+        self.leverage_spin.setRange(10, 10)
         self.leverage_spin.setValue(10)
         self.leverage_spin.setSuffix("x")
+        self.leverage_spin.setToolTip("实时执行固定为 10x")
         account_layout.addRow("杠杆:", self.leverage_spin)
+
+        self.position_size_hint_label = QtWidgets.QLabel("50%")
+        self.position_size_hint_label.setStyleSheet("color: #9ad1ff;")
+        account_layout.addRow("单次仓位:", self.position_size_hint_label)
         
         # 实时统计（合并展示）
         self.snapshot_balance_label = QtWidgets.QLabel("-")
         self.snapshot_balance_label.setStyleSheet("color: #ccc; font-weight: bold;")
         account_layout.addRow("当前权益:", self.snapshot_balance_label)
+
+        self.snapshot_available_margin_label = QtWidgets.QLabel("-")
+        self.snapshot_available_margin_label.setStyleSheet("color: #9ad1ff;")
+        account_layout.addRow("可用保证金:", self.snapshot_available_margin_label)
         
         self.snapshot_pnl_label = QtWidgets.QLabel("-")
         account_layout.addRow("累计盈亏:", self.snapshot_pnl_label)
@@ -360,9 +369,11 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
     def update_account_stats(self, stats: dict):
         """更新合并的账户统计快照"""
         bal = stats.get("current_balance", 0.0)
+        available = stats.get("available_margin", 0.0)
         pnl = stats.get("total_pnl", 0.0)
         win_rate = stats.get("win_rate", 0.0)
         self.snapshot_balance_label.setText(f"{bal:,.2f} USDT")
+        self.snapshot_available_margin_label.setText(f"{available:,.2f} USDT")
         pnl_color = "#089981" if pnl >= 0 else "#f23645"
         self.snapshot_pnl_label.setText(f"{pnl:+,.2f} USDT")
         self.snapshot_pnl_label.setStyleSheet(f"color: {pnl_color};")
@@ -642,7 +653,8 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         
     def update_matching_context(self, market_regime: str, fp_status: str, reason: str,
                                 matched_fp: str = "", matched_similarity: float = None,
-                                swing_points_count: int = 0):
+                                swing_points_count: int = 0,
+                                entry_threshold: float = None):
         """更新匹配状态和因果说明"""
         regime = market_regime or "未知"
         self.market_regime_label.setText(regime)
@@ -694,8 +706,11 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.matched_fingerprint_label.setStyleSheet(
                 "color: #9fd6ff; font-weight: bold; font-size: 12px;")
 
-        # 获取开仓阈值（从配置读取）
-        entry_threshold = VECTOR_SPACE_CONFIG.get("ENTRY_SIM_THRESHOLD", 70.0) / 100.0
+        # 开仓阈值优先使用引擎运行时值，避免UI与执行逻辑不一致
+        if entry_threshold is None or entry_threshold <= 0:
+            entry_threshold = VECTOR_SPACE_CONFIG.get("ENTRY_SIM_THRESHOLD", 70.0) / 100.0
+        else:
+            entry_threshold = float(entry_threshold)
         
         if matched_similarity is None or matched_similarity <= 0:
             self.matched_similarity_label.setText("-")

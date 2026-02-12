@@ -71,6 +71,7 @@ class BinanceTestnetTrader:
         self._qty_step = 0.001
         self._qty_min = 0.001
         self._price_tick = 0.1
+        self._min_notional = 5.0
         self._last_sync_ts = 0.0
         self._sync_interval_sec = 2.0
         self._pending_close = None  # (price, bar_idx, reason) 若离场失败则记录待重试
@@ -106,7 +107,25 @@ class BinanceTestnetTrader:
             r = self.session.delete(url, params=params, timeout=8)
         else:
             raise ValueError(f"unsupported method: {method}")
-        r.raise_for_status()
+        
+        # 【关键】解析 Binance API 错误信息
+        if r.status_code >= 400:
+            try:
+                error_body = r.json()
+                error_code = error_body.get("code", "?")
+                error_msg = error_body.get("msg", r.text[:200])
+                # 显示发送的参数（隐藏签名）
+                safe_params = {k: v for k, v in params.items() if k != "signature"}
+                print(f"[BinanceAPI] ❌ {method} {path} 失败")
+                print(f"[BinanceAPI] 错误码: {error_code} | 消息: {error_msg}")
+                print(f"[BinanceAPI] 请求参数: {safe_params}")
+                raise Exception(f"Binance API {error_code}: {error_msg}")
+            except Exception as e:
+                if "Binance API" in str(e):
+                    raise
+                # JSON 解析失败，回退到原始错误
+                r.raise_for_status()
+        
         return r.json()
 
     def _public_get(self, path: str, params: Optional[dict] = None) -> dict:
@@ -130,6 +149,8 @@ class BinanceTestnetTrader:
                 self._qty_min = float(f.get("minQty", "0.001"))
             elif f.get("filterType") == "PRICE_FILTER":
                 self._price_tick = float(f.get("tickSize", "0.1"))
+            elif f.get("filterType") in ("MIN_NOTIONAL", "NOTIONAL"):
+                self._min_notional = float(f.get("notional", f.get("minNotional", "5.0")))
 
     def _round_step(self, value: float, step: float) -> float:
         if step <= 0:
@@ -206,6 +227,14 @@ class BinanceTestnetTrader:
                 return bal
         return 0.0
 
+    def _get_usdt_available_balance(self) -> float:
+        rows = self._signed_request("GET", "/fapi/v2/balance")
+        for row in rows:
+            if row.get("asset") == "USDT":
+                # Binance 下单应使用可用余额，而不是总余额
+                return float(row.get("availableBalance", row.get("balance", 0.0)))
+        return 0.0
+
     def _get_mark_price(self) -> float:
         data = self._public_get("/fapi/v1/premiumIndex", {"symbol": self.symbol})
         return float(data.get("markPrice", 0.0))
@@ -268,13 +297,22 @@ class BinanceTestnetTrader:
         return self._signed_request("POST", "/fapi/v1/order", params)
 
     def _calc_entry_quantity(self, price: float) -> float:
-        bal = self._get_usdt_balance()
-        margin = bal * self.position_size_pct
-        notional = margin * self.leverage
+        # 关键：按可用余额计算，避免 balance 包含被占用资金导致 -2019
+        avail = self._get_usdt_available_balance()
+        margin = avail * self.position_size_pct
+        # 给手续费/滑点/撮合波动留缓冲，避免“刚好全仓”被拒
+        safety_factor = max(0.90, 1.0 - self.fee_rate * 3 - 0.01)  # 默认约 98.88%
+        effective_margin = margin * safety_factor
+        notional = effective_margin * self.leverage
         raw_qty = notional / max(price, 1e-9)
         qty = self._round_step(raw_qty, self._qty_step)
         if qty < self._qty_min:
             qty = self._qty_min
+        # 确保满足最小名义价值要求（通常 5 USDT）
+        if qty * price < self._min_notional:
+            qty = self._round_step((self._min_notional / max(price, 1e-9)) * 1.02, self._qty_step)
+            if qty < self._qty_min:
+                qty = self._qty_min
         return qty
 
     def open_position(self,
@@ -292,6 +330,10 @@ class BinanceTestnetTrader:
             return None
 
         self._set_leverage(self.leverage)
+        
+        # 获取余额和计算数量
+        balance = self._get_usdt_balance()
+        available = self._get_usdt_available_balance()
         qty = self._calc_entry_quantity(price)
         side_str = "BUY" if side == OrderSide.LONG else "SELL"
         
@@ -303,6 +345,13 @@ class BinanceTestnetTrader:
             qty_str = f"{qty:.{precision}f}"
         else:
             qty_str = str(int(qty))
+        
+        # 【调试】显示开仓参数
+        print(f"[BinanceTrader] 开仓请求: {side_str} {qty_str} {self.symbol} @ ~${price:.2f}")
+        print(
+            f"[BinanceTrader] 账户余额: ${balance:.2f} | 可用: ${available:.2f} | "
+            f"杠杆: {self.leverage}x | 数量精度: {self._qty_step} | 最小名义: ${self._min_notional:.2f}"
+        )
 
         resp = self._place_order({
             "symbol": self.symbol,
@@ -540,7 +589,9 @@ class BinanceTestnetTrader:
 
     def _update_stats_from_exchange(self):
         bal = self._get_usdt_balance()
+        available = self._get_usdt_available_balance()
         self.stats.current_balance = bal
+        self.stats.available_margin = available
         self.stats.total_pnl = bal - self.stats.initial_balance
         if self.stats.initial_balance > 0:
             self.stats.total_pnl_pct = (bal / self.stats.initial_balance - 1.0) * 100.0

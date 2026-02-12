@@ -188,6 +188,7 @@ class AccountStats:
     """账户统计"""
     initial_balance: float = 5000.0
     current_balance: float = 5000.0
+    available_margin: float = 0.0
     total_pnl: float = 0.0
     total_pnl_pct: float = 0.0
     
