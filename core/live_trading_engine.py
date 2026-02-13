@@ -59,6 +59,7 @@ class EngineState:
     entry_threshold: float = 0.7      # 运行时真实开仓阈值
     macd_ready: bool = False          # MACD 指标对齐
     kdj_ready: bool = False           # KDJ 指标对齐
+    
 
 
 class LiveTradingEngine:
@@ -107,6 +108,8 @@ class LiveTradingEngine:
                  # 代理配置
                  http_proxy: Optional[str] = None,
                  socks_proxy: Optional[str] = None,
+                 # 风控
+                 max_drawdown_pct: Optional[float] = None,
                  # 回调
                  on_state_update: Optional[Callable[[EngineState], None]] = None,
                  on_kline: Optional[Callable[[KlineData], None]] = None,
@@ -149,6 +152,15 @@ class LiveTradingEngine:
         self.use_prototypes = prototype_library is not None
         self.symbol = symbol
         self.interval = interval
+        
+        # 风控
+        if max_drawdown_pct is None:
+            try:
+                from config import LIVE_RISK_CONFIG
+                max_drawdown_pct = LIVE_RISK_CONFIG.get("MAX_DRAWDOWN_PCT")
+            except Exception:
+                max_drawdown_pct = None
+        self.max_drawdown_pct = max_drawdown_pct
         
         # 匹配参数
         self.cosine_threshold = cosine_threshold
@@ -240,6 +252,8 @@ class LiveTradingEngine:
         
         # 实时挂单信号 (待价格确认)
         self.pending_signal = None  # Dict with {side, trigger_price, expire_idx, fingerprint, similarity, reason}
+        # 上一根K线是否有持仓（用于检测新开仓）
+        self._last_had_position = False
     
     @property
     def paper_trader(self) -> BinanceTestnetTrader:
@@ -296,10 +310,21 @@ class LiveTradingEngine:
         self._running = False
         self.state.is_running = False
         
+        # 先强制同步一次，避免本地状态滞后
+        try:
+            self._paper_trader.sync_from_exchange(force=True)
+        except Exception:
+            pass
         # 如果有持仓，按当前价格平仓
         if self._paper_trader.has_position():
+            close_price = self.state.current_price
+            if close_price <= 0:
+                try:
+                    close_price = self._paper_trader._get_mark_price()
+                except Exception:
+                    close_price = self._paper_trader.current_position.entry_price
             self._paper_trader.close_position(
-                self.state.current_price,
+                close_price,
                 self._current_bar_idx,
                 CloseReason.MANUAL,
             )
@@ -543,7 +568,24 @@ class LiveTradingEngine:
         self.state.total_bars += 1
         self._current_bar_idx += 1
         
-        print(f"[LiveEngine] K线收线: {kline.open_time} | 价格={kline.close:.2f} | 持仓={self._paper_trader.has_position()}")
+        # 同步交易所状态（检测止损单成交等）
+        if hasattr(self._paper_trader, "sync_from_exchange"):
+            self._paper_trader.sync_from_exchange(force=False)
+        if hasattr(self._paper_trader, "cancel_expired_entry_stop_orders"):
+            self._paper_trader.cancel_expired_entry_stop_orders(self._current_bar_idx)
+        
+        has_pos = self._paper_trader.has_position()
+        # 检测新开仓：上一根无持仓，本根有持仓 → 触发开仓回调（含止损单成交、手动开仓等）
+        if has_pos and not self._last_had_position and self.on_trade_opened:
+            order = self._paper_trader.current_position
+            if order:
+                try:
+                    self.on_trade_opened(order)
+                except Exception as e:
+                    print(f"[LiveEngine] 开仓回调异常: {e}")
+        self._last_had_position = has_pos
+        
+        print(f"[LiveEngine] K线收线: {kline.open_time} | 价格={kline.close:.2f} | 持仓={has_pos}")
         self.state.last_event = f"K线收线 {kline.open_time.strftime('%H:%M')} | ${kline.close:,.2f}"
         
         # 更新DataFrame和特征
@@ -600,12 +642,25 @@ class LiveTradingEngine:
     def _get_current_atr(self) -> float:
         """获取当前ATR"""
         if self._df_buffer is None or 'atr' not in self._df_buffer.columns:
-            return 100.0  # 默认值
+            return 0.0
         
-        return float(self._df_buffer['atr'].iloc[-1])
+        atr = float(self._df_buffer['atr'].iloc[-1])
+        if np.isnan(atr) or atr <= 0:
+            high = float(self._df_buffer['high'].iloc[-1])
+            low = float(self._df_buffer['low'].iloc[-1])
+            atr = max(high - low, high * 0.001)
+        return atr
     
     def _process_entry(self, kline: KlineData, atr: float):
         """处理入场逻辑：实现 Ready-Aim-Fire 三重过滤 (已优化：支持信号动态替换)"""
+        if self._risk_limit_reached():
+            if self._paper_trader.has_pending_stop_orders():
+                self._paper_trader.cancel_entry_stop_orders()
+            self.state.matching_phase = "等待"
+            self.state.fingerprint_status = "风控暂停"
+            self.state.decision_reason = "风控触发：最大回撤已达阈值，暂停开仓。"
+            self.state.last_event = "⚠ 风控暂停开仓"
+            return
         try:
             # 准备阶段
             self.state.matching_phase = "匹配入场"
@@ -672,10 +727,16 @@ class LiveTradingEngine:
                 elif short_result.get("matched"):
                     direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
 
-                # 提取投票信息
+                # 提取投票信息和DTW相似度
                 long_votes = long_result.get("vote_long", 0)
                 short_votes = short_result.get("vote_short", 0)
-                print(f"[LiveEngine] 原型匹配结果: LONG={long_sim:.2%}(投票{long_votes}) | SHORT={short_sim:.2%}(投票{short_votes})")
+                long_cosine = long_result.get("cosine_similarity", long_sim)
+                long_dtw = long_result.get("dtw_similarity", 0.0)
+                short_cosine = short_result.get("cosine_similarity", short_sim)
+                short_dtw = short_result.get("dtw_similarity", 0.0)
+                print(f"[LiveEngine] 原型匹配结果: "
+                      f"LONG=综合{long_sim:.1%}(余弦{long_cosine:.1%}+DTW{long_dtw:.1%},投票{long_votes}) | "
+                      f"SHORT=综合{short_sim:.1%}(余弦{short_cosine:.1%}+DTW{short_dtw:.1%},投票{short_votes})")
                 
                 if direction is not None and chosen_proto is not None:
                     # 显示包含市场状态的原型名称
@@ -685,6 +746,7 @@ class LiveTradingEngine:
                     self._current_template = None
                     print(f"[LiveEngine] 匹配成功! 方向={direction} | 原型={chosen_fp} | 相似度={similarity:.2%}")
                     self.state.last_event = f"匹配成功 {direction} | {chosen_fp} | {similarity:.1%}"
+                    
             else:
                 long_candidates = self.trajectory_memory.get_templates_by_direction("LONG")
                 short_candidates = self.trajectory_memory.get_templates_by_direction("SHORT")
@@ -1070,13 +1132,24 @@ class LiveTradingEngine:
             self.state.decision_reason = self._build_exit_reason(close_reason.value, order)
             return
         
-        # 【删除】最大持仓时间限制 - 完全依赖轨迹相似度追踪
-        
-        # 【新增】保本减仓逻辑：一旦浮盈覆盖交易手续费，减仓一半
-        self._check_partial_take_profit(kline)
-        
-        # 【新增】ATR 移动止损逻辑
+        # 三阶段追踪止损 + 追踪止盈
         self._update_trailing_stop(order, kline, atr)
+        
+        # 分段减仓：阶梯式落袋为安
+        self._check_staged_partial_tp(kline)
+        
+        # 最大持仓安全网（防止相似度一直在0.5~0.7之间缓慢失血）
+        max_hold = getattr(self, 'max_hold_bars', 240)
+        if max_hold > 0 and order.hold_bars >= max_hold:
+            print(f"[LiveEngine] 超过最大持仓时间 {max_hold} 根K线，强制平仓")
+            self._paper_trader.close_position(
+                kline.close, self._current_bar_idx, CloseReason.MAX_HOLD
+            )
+            self.state.decision_reason = f"[平仓] 超时平仓: 持仓{order.hold_bars}根K线"
+            self.state.matching_phase = "等待"
+            self._current_template = None
+            self._current_prototype = None
+            return
         
         # 动态追踪检查
         if order.hold_bars > 0 and order.hold_bars % self.hold_check_interval == 0:
@@ -1194,12 +1267,14 @@ class LiveTradingEngine:
                               f"(信号强度: {exit_check['exit_signal_strength']:.0%})")
                         
                         # 执行信号离场
-                        self._paper_trader.close_position(
-                            exit_price=kline.close,
-                            exit_time=datetime.now(),
-                            reason=CloseReason.SIGNAL,
-                            bar_idx=self._current_bar_idx,
+                        closed = self._paper_trader.close_position(
+                            kline.close,
+                            self._current_bar_idx,
+                            CloseReason.SIGNAL,
                         )
+                        if not closed:
+                            self.state.exit_reason = "离场信号触发，但下单失败，等待重试。"
+                            return
                         
                         self.state.matching_phase = "等待"
                         self.state.tracking_status = "-"
@@ -1279,7 +1354,15 @@ class LiveTradingEngine:
     def _calculate_dynamic_tp_sl(self, entry_price: float, direction: str,
                                   prototype, atr: float):
         """
-        基于原型历史表现计算动态止盈止损
+        【三因子融合】基于原型历史表现 + ATR波动率 + 固定下限 计算止盈止损
+        
+        三因子设计：
+        1. 原型历史表现因子：基于avg_profit_pct和win_rate
+        2. ATR波动率因子：至少2.0倍ATR，适应市场波动
+        3. 固定百分比下限：至少0.15%（BTC约$100），避免噪声止损
+        
+        止损 = max(三因子)，永远不会太紧
+        止盈 >= 止损 * 风险收益比，保证盈亏比合理
         
         Args:
             entry_price: 入场价格
@@ -1290,28 +1373,35 @@ class LiveTradingEngine:
         Returns:
             (take_profit_price, stop_loss_price)
         """
-        # 安全检查：如果原型数据不足，回退到固定ATR倍数
-        if not prototype or getattr(prototype, 'member_count', 0) < 10:
-            if direction == "LONG":
-                tp = entry_price + atr * self.take_profit_atr
-                sl = entry_price - atr * self.stop_loss_atr
-            else:
-                tp = entry_price - atr * self.take_profit_atr
-                sl = entry_price + atr * self.stop_loss_atr
-            return tp, sl
-        
-        # 1. 计算止盈目标（基于平均收益率）
         import numpy as np
-        profit_pct = np.clip(prototype.avg_profit_pct, 0.5, 10.0) / 100.0
+        leverage = float(self._paper_trader.leverage)
         
-        # 根据胜率调整（高胜率更激进，低胜率更保守）
-        win_rate = prototype.win_rate
-        if win_rate >= 0.75:
-            profit_pct *= 1.2  # 高胜率：提高20%
-        elif win_rate < 0.60:
-            profit_pct *= 0.8  # 低胜率：降低20%
+        # ========== 因子1: 基于原型历史表现 ==========
+        if prototype and getattr(prototype, 'member_count', 0) >= 10:
+            raw_profit_pct = np.clip(prototype.avg_profit_pct, 0.5, 10.0)
+            price_move_pct = raw_profit_pct / leverage / 100.0  # 还原为价格百分比
+            win_rate = prototype.win_rate
+            
+            # 根据胜率调整止盈目标（高胜率更激进）
+            if win_rate >= 0.75:
+                price_move_pct *= 1.2
+            elif win_rate < 0.60:
+                price_move_pct *= 0.8
+        else:
+            # 回退：使用ATR倍数
+            price_move_pct = (atr * self.take_profit_atr) / entry_price
+            win_rate = 0.5
         
-        # 2. 计算止损幅度（基于风险收益比）
+        # ========== 因子2: ATR波动率止损（市场适应性）==========
+        # 至少 2.0 倍 ATR，保证在正常波动范围外
+        atr_based_sl_pct = (atr / entry_price) * 2.0
+        
+        # ========== 因子3: 固定百分比下限（避免噪声止损）==========
+        # BTC 1分钟线，至少 0.15% 距离（约 $100）
+        # 其他币种可根据价格自动调整
+        min_fixed_pct = 0.0015  # 0.15%
+        
+        # ========== 风险收益比（基于胜率）==========
         if win_rate >= 0.70:
             risk_reward_ratio = 2.0  # 高胜率：1:2
         elif win_rate >= 0.50:
@@ -1319,19 +1409,30 @@ class LiveTradingEngine:
         else:
             risk_reward_ratio = 1.0  # 低胜率：1:1
         
-        stop_loss_pct = profit_pct / risk_reward_ratio
+        # 原型建议的止损（按风险收益比）
+        prototype_sl_pct = price_move_pct / risk_reward_ratio
         
-        # ATR保护：止损至少为1.5倍ATR
-        min_stop_loss_pct = (atr / entry_price) * 1.5
-        stop_loss_pct = max(stop_loss_pct, min_stop_loss_pct)
+        # ========== 综合：止损取三因子最大值 ==========
+        stop_loss_pct = max(prototype_sl_pct, atr_based_sl_pct, min_fixed_pct)
         
-        # 3. 计算最终价格
+        # ========== 止盈：至少要比止损大，保证盈亏比 ==========
+        take_profit_pct = max(price_move_pct, stop_loss_pct * risk_reward_ratio)
+        
+        # ========== 计算最终价格 ==========
         if direction == "LONG":
-            take_profit = entry_price * (1 + profit_pct)
+            take_profit = entry_price * (1 + take_profit_pct)
             stop_loss = entry_price * (1 - stop_loss_pct)
         else:  # SHORT
-            take_profit = entry_price * (1 - profit_pct)
+            take_profit = entry_price * (1 - take_profit_pct)
             stop_loss = entry_price * (1 + stop_loss_pct)
+        
+        # 详细日志
+        print(f"[LiveEngine] 三因子TP/SL:")
+        print(f"  - 原型因子: {prototype_sl_pct*100:.3f}% (收益{price_move_pct*100:.3f}% / RR={risk_reward_ratio})")
+        print(f"  - ATR因子:  {atr_based_sl_pct*100:.3f}% ({atr:.2f}*2.0)")
+        print(f"  - 固定下限: {min_fixed_pct*100:.3f}%")
+        print(f"  → 最终SL={stop_loss_pct*100:.3f}% (${abs(stop_loss-entry_price):.2f}) | "
+              f"TP={take_profit_pct*100:.3f}% (${abs(take_profit-entry_price):.2f})")
         
         return take_profit, stop_loss
     
@@ -1540,8 +1641,22 @@ class LiveTradingEngine:
         )
     
     def get_history_df(self) -> pd.DataFrame:
-        """获取历史K线DataFrame"""
-        return self._data_feed.get_history_df()
+        """获取历史K线DataFrame（含 MACD/KDJ 等指标，供图表显示）"""
+        # 优先返回带指标的 _df_buffer，确保图表能显示 MACD、KDJ
+        if self._df_buffer is not None and not self._df_buffer.empty:
+            return self._df_buffer.copy()
+        # 冷启动：_init_features 尚未完成时，临时计算指标
+        df = self._data_feed.get_history_df()
+        if df.empty:
+            return df
+        try:
+            from utils.indicators import calculate_all_indicators
+            if 'open_time' not in df.columns and 'timestamp' in df.columns:
+                df = df.rename(columns={'timestamp': 'open_time'})
+            df = calculate_all_indicators(df)
+            return df
+        except Exception:
+            return df
     
     def get_stats(self) -> dict:
         """获取统计信息"""
@@ -1577,59 +1692,161 @@ class LiveTradingEngine:
         self._paper_trader.save_history(filepath)
 
 
-    def _check_partial_take_profit(self, kline: KlineData):
-        """检查并执行保本减仓"""
+    def _check_staged_partial_tp(self, kline: KlineData):
+        """
+        分段减仓：根据利润阶梯逐步落袋为安
+        
+        阶梯:
+          - 第1次: 峰值利润 >= 2.0% → 减仓 30%
+          - 第2次: 峰值利润 >= 4.0% → 再减仓 30%
+          - 剩余 40% 由追踪止损保护，让利润奔跑
+        """
         if self._paper_trader is None or not self._paper_trader.has_position():
             return
         
         order = self._paper_trader.current_position
-        if order is None or order.is_partial_tp_done:
+        if order is None:
             return
 
-        # 计算浮盈是否足以覆盖预估手续费
-        # 预估总手续费 = (入场名义价值 + 现价名义价值) * 手续费率
-        # 为了更保险，我们要求利润是手续费的 1.5 倍以上再执行减仓
-        entry_notional = order.entry_price * order.quantity
-        current_notional = kline.close * order.quantity
-        estimated_fees = (entry_notional + current_notional) * getattr(self._paper_trader, 'fee_rate', 0.0004)
+        # 根据已减仓次数判断下一阈值
+        if order.partial_tp_count == 0 and order.peak_profit_pct >= 2.0:
+            pct = 0.30  # 第1次：减30%
+            label = "1/2"
+            threshold = 2.0
+        elif order.partial_tp_count == 1 and order.peak_profit_pct >= 4.0:
+            pct = 0.30  # 第2次：再减30%（此时总减60%）
+            label = "2/2"
+            threshold = 4.0
+        else:
+            return
         
-        if order.unrealized_pnl > estimated_fees * 1.5:
-            print(f"[LiveEngine] 触发保本减仓! 浮盈({order.unrealized_pnl:.2f}) > 预估手续费x1.5({estimated_fees*1.5:.2f})")
-            
-            # 减仓一半
-            partial_qty = self._round_to_step(order.quantity * 0.5)
-            
-            # 执行减仓
-            self._paper_trader.close_position(
-                price=kline.close,
-                bar_idx=self._current_bar_idx,
-                reason=CloseReason.SIGNAL, # 使用 SIGNAL 子类型
-                quantity=partial_qty
-            )
-            
-            # 标记已执行
-            order.is_partial_tp_done = True
-            self.state.last_event = "✅保本减仓已执行"
+        partial_qty = self._round_to_step(order.quantity * pct)
+        if partial_qty <= 0:
+            return
+        
+        closed = self._paper_trader.close_position(
+            price=kline.close,
+            bar_idx=self._current_bar_idx,
+            reason=CloseReason.TAKE_PROFIT,
+            quantity=partial_qty
+        )
+        if closed:
+            # 更新 current_position（partial close后对象可能变化）
+            remaining = self._paper_trader.current_position
+            if remaining is not None:
+                remaining.partial_tp_count = order.partial_tp_count + 1
+                # 继承追踪状态
+                remaining.peak_price = order.peak_price
+                remaining.peak_profit_pct = order.peak_profit_pct
+                remaining.trailing_stage = order.trailing_stage
+            msg = f"阶梯止盈 {label}: 减仓{pct:.0%} @ 峰值利润{order.peak_profit_pct:.1f}%"
+            print(f"[LiveEngine] {msg}")
+            self.state.last_event = f"✅{msg}"
 
     def _update_trailing_stop(self, order: PaperOrder, kline: KlineData, atr: float):
         """
-        ATR 移动止损逻辑
-        当浮盈 > 1.5% 时启动，止损位跟随价格上移（多）或下移（空）
-        """
-        if order.profit_pct < 1.5:
-            return
-            
-        # 移动止损距离：1.5 倍 ATR
-        trailing_dist = atr * 1.5
+        三阶段渐进式追踪止损 + 追踪止盈
         
+        █ 阶段0（未激活）: profit < 0.8% → 保持原始止损
+        █ 阶段1（保本）:   profit >= 0.8% → SL移至入场价+微利（保本）
+        █ 阶段2（锁利）:   profit >= 2.0% → SL锁住峰值利润的40%
+        █ 阶段3（紧追）:   profit >= 4.0% → SL紧跟峰值利润的60%，追踪TP上移
+        
+        核心原则：
+        - 止损只能往有利方向移动，永不回退
+        - 止盈跟随价格上移（多）/下移（空），永不降低
+        """
+        if atr <= 0:
+            return
+        
+        entry = order.entry_price
+        current_sl = order.stop_loss or entry
+        current_tp = order.take_profit
+        profit_pct = order.profit_pct
+        peak_pct = order.peak_profit_pct
+        
+        new_sl = current_sl
+        new_tp = current_tp
+        new_stage = order.trailing_stage
+        
+        # ── 阶段判定 ──
+        if peak_pct >= 4.0:
+            new_stage = max(order.trailing_stage, 3)
+        elif peak_pct >= 2.0:
+            new_stage = max(order.trailing_stage, 2)
+        elif peak_pct >= 0.8:
+            new_stage = max(order.trailing_stage, 1)
+        
+        # ── 阶段1：保本 ──
+        if new_stage >= 1:
+            # SL = 入场价 + 0.2% 微利缓冲（覆盖手续费）
+            if order.side == OrderSide.LONG:
+                breakeven_sl = entry * 1.002
+            else:
+                breakeven_sl = entry * 0.998
+            
+            if order.side == OrderSide.LONG:
+                new_sl = max(new_sl, breakeven_sl)
+            else:
+                new_sl = min(new_sl, breakeven_sl)
+        
+        # ── 阶段2：锁利（锁住峰值利润的40%）──
+        if new_stage >= 2:
+            lock_pct = peak_pct * 0.40 / 100.0  # 锁住40%的峰值收益
+            if order.side == OrderSide.LONG:
+                lock_sl = entry * (1 + lock_pct / self._paper_trader.leverage)
+                new_sl = max(new_sl, lock_sl)
+            else:
+                lock_sl = entry * (1 - lock_pct / self._paper_trader.leverage)
+                new_sl = min(new_sl, lock_sl)
+        
+        # ── 阶段3：紧追（锁住峰值利润的60% + 追踪TP上移）──
+        if new_stage >= 3:
+            lock_pct = peak_pct * 0.60 / 100.0  # 锁住60%的峰值收益
+            if order.side == OrderSide.LONG:
+                tight_sl = entry * (1 + lock_pct / self._paper_trader.leverage)
+                # 额外：ATR紧追（取两者更有利的）
+                atr_sl = order.peak_price - atr * 1.2
+                tight_sl = max(tight_sl, atr_sl)
+                new_sl = max(new_sl, tight_sl)
+            else:
+                tight_sl = entry * (1 - lock_pct / self._paper_trader.leverage)
+                atr_sl = order.peak_price + atr * 1.2
+                tight_sl = min(tight_sl, atr_sl)
+                new_sl = min(new_sl, tight_sl)
+            
+            # 追踪止盈：TP跟随价格上移，永不降低
+            if current_tp is not None:
+                tp_distance = abs(current_tp - entry)
+                if order.side == OrderSide.LONG:
+                    # 价格每突破旧TP的50%距离，TP上移
+                    new_tp_candidate = order.peak_price + tp_distance * 0.3
+                    if new_tp_candidate > current_tp:
+                        new_tp = new_tp_candidate
+                else:
+                    new_tp_candidate = order.peak_price - tp_distance * 0.3
+                    if new_tp_candidate < current_tp:
+                        new_tp = new_tp_candidate
+        
+        # ── 应用（SL只能往有利方向移动）──
         if order.side == OrderSide.LONG:
-            new_sl = kline.high - trailing_dist
             if new_sl > (order.stop_loss or 0):
                 order.stop_loss = new_sl
+            if new_tp is not None and current_tp is not None and new_tp > current_tp:
+                order.take_profit = new_tp
         else:
-            new_sl = kline.low + trailing_dist
             if new_sl < (order.stop_loss or float('inf')):
                 order.stop_loss = new_sl
+            if new_tp is not None and current_tp is not None and new_tp < current_tp:
+                order.take_profit = new_tp
+        
+        # 记录阶段变化
+        if new_stage > order.trailing_stage:
+            stage_names = {1: "保本", 2: "锁利", 3: "紧追"}
+            print(f"[LiveEngine] 追踪止损升级: 阶段{new_stage}({stage_names[new_stage]}) | "
+                  f"SL={order.stop_loss:.2f} | TP={order.take_profit:.2f} | "
+                  f"峰值利润={peak_pct:.1f}%")
+            order.trailing_stage = new_stage
 
     def _check_exit_indicator_gate(self, df: pd.DataFrame, direction: str) -> bool:
         """
@@ -1659,6 +1876,15 @@ class LiveTradingEngine:
         """按交易所最小步进对齐数量"""
         step = getattr(self._paper_trader, '_qty_step', 0.001)
         return max(step, (qty // step) * step)
+
+    def _risk_limit_reached(self) -> bool:
+        """检查风控阈值是否触发"""
+        if self.max_drawdown_pct is None:
+            return False
+        stats = getattr(self._paper_trader, "stats", None)
+        if not stats:
+            return False
+        return stats.max_drawdown_pct >= self.max_drawdown_pct
 
 # 简单测试
 if __name__ == "__main__":

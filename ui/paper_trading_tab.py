@@ -16,6 +16,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import UI_CONFIG, VECTOR_SPACE_CONFIG, MARKET_REGIME_CONFIG
+from core.paper_trader import OrderStatus
 
 
 class PaperTradingControlPanel(QtWidgets.QWidget):
@@ -834,15 +835,27 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._init_ui()
+        self._rows_by_key = {}
     
     def _init_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
+        self.stacked = QtWidgets.QStackedWidget()
+        # 空状态页
+        empty_page = QtWidgets.QWidget()
+        empty_layout = QtWidgets.QVBoxLayout(empty_page)
+        self.empty_label = QtWidgets.QLabel("暂无交易记录\n\n启动模拟交易后，此处将显示交易明细")
+        self.empty_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setStyleSheet(f"color: #666; font-size: 12px; padding: 30px; background-color: {UI_CONFIG['THEME_SURFACE']};")
+        empty_layout.addWidget(self.empty_label)
+        self.stacked.addWidget(empty_page)
+        
+        # 表格页
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(10)
+        self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
-            "时间", "方向", "入场价", "出场价", "盈亏%", "盈亏(USDT)", "原因", "模板", "相似度", "持仓"
+            "时间", "方向", "入场价", "出场价", "止盈", "止损", "盈亏%", "盈亏(USDT)", "手续费", "原因", "模板", "相似度", "持仓"
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
@@ -867,19 +880,50 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
                 background-color: #2a2a2a;
             }}
         """)
-        
-        layout.addWidget(self.table)
+        self.table.setMinimumHeight(80)
+        table_page = QtWidgets.QWidget()
+        table_layout = QtWidgets.QVBoxLayout(table_page)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(self.table)
+        self.stacked.addWidget(table_page)
+        layout.addWidget(self.stacked)
+    
+    def _update_empty_state(self):
+        """根据是否有数据显示空状态或表格"""
+        has_data = self.table.rowCount() > 0
+        self.stacked.setCurrentIndex(1 if has_data else 0)
     
     def add_trade(self, order):
         """添加单个交易记录"""
-        self._insert_trade_row(order)
+        key = self._trade_key(order)
+        if key in self._rows_by_key:
+            # 已存在则更新（例如平仓、或同步更新）
+            self._update_trade_row(self._rows_by_key[key], order)
+        else:
+            row = self._insert_trade_row(order)
+            self._rows_by_key[key] = row
+        self._update_empty_state()
     
     def set_history(self, trades: List):
         """批量设置历史记录"""
         self.table.setRowCount(0)
+        self._rows_by_key.clear()
         for order in trades:
-            self._insert_trade_row(order)
+            row = self._insert_trade_row(order)
+            self._rows_by_key[self._trade_key(order)] = row
+        self._update_empty_state()
             
+    def _trade_key(self, order) -> str:
+        """生成稳定的交易标识"""
+        order_id = str(getattr(order, "order_id", "") or "")
+        if order_id and not order_id.startswith("EXCHANGE_SYNC"):
+            return order_id
+        side = getattr(order, "side", None)
+        side_val = side.value if side else "-"
+        entry_price = getattr(order, "entry_price", 0.0)
+        quantity = getattr(order, "quantity", 0.0)
+        return f"SYNC-{side_val}-{entry_price:.2f}-{quantity:.6f}"
+    
     def _insert_trade_row(self, order):
         """内部通用插入行逻辑"""
         row = self.table.rowCount()
@@ -888,18 +932,25 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         # 为了美观，新纪录放前面？或者按时间排序。这里维持原有顺序，但在 TableWidget 中 insertRow(0) 可以置顶
         # 目前按时间顺序追加
         
+        self._update_trade_row(row, order)
+        # 滚动到最新
+        self.table.scrollToBottom()
+        return row
+    
+    def _update_trade_row(self, row: int, order):
+        """更新表格行数据"""
         # 时间
         time_str = "-"
         if order.exit_time:
             time_str = order.exit_time.strftime("%m-%d %H:%M")
         elif order.entry_time:
             time_str = order.entry_time.strftime("%m-%d %H:%M") + "(持)"
-            
         self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(time_str))
         
         # 方向
-        side_item = QtWidgets.QTableWidgetItem(order.side.value)
-        side_color = QtGui.QColor("#089981") if order.side.value == "LONG" else QtGui.QColor("#f23645")
+        side_val = order.side.value
+        side_item = QtWidgets.QTableWidgetItem(side_val)
+        side_color = QtGui.QColor("#089981") if side_val == "LONG" else QtGui.QColor("#f23645")
         side_item.setForeground(side_color)
         self.table.setItem(row, 1, side_item)
         
@@ -909,39 +960,55 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         # 出场价
         exit_price = order.exit_price if order.exit_price else "-"
         self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{exit_price:.2f}" if isinstance(exit_price, float) else exit_price))
-        
+
+        # 止盈 / 止损
+        tp_val = getattr(order, "take_profit", None)
+        sl_val = getattr(order, "stop_loss", None)
+        tp_text = f"{tp_val:.2f}" if isinstance(tp_val, float) else "-"
+        sl_text = f"{sl_val:.2f}" if isinstance(sl_val, float) else "-"
+        self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(tp_text))
+        self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(sl_text))
+
         # 盈亏%
         pnl_pct_item = QtWidgets.QTableWidgetItem(f"{order.profit_pct:+.2f}%")
         pnl_color = QtGui.QColor("#089981") if order.profit_pct >= 0 else QtGui.QColor("#f23645")
         pnl_pct_item.setForeground(pnl_color)
-        self.table.setItem(row, 4, pnl_pct_item)
+        self.table.setItem(row, 6, pnl_pct_item)
         
-        # 盈亏(USDT)
-        pnl_val = getattr(order, "realized_pnl", 0.0)
+        # 盈亏(USDT) - 开仓显示未实现，平仓显示已实现
+        is_closed = getattr(order, "status", None) == OrderStatus.CLOSED or order.exit_time is not None
+        if is_closed:
+            pnl_val = getattr(order, "realized_pnl", 0.0)
+        else:
+            pnl_val = getattr(order, "unrealized_pnl", 0.0)
         pnl_usdt_item = QtWidgets.QTableWidgetItem(f"{pnl_val:+,.2f}")
         pnl_usdt_item.setForeground(pnl_color)
-        self.table.setItem(row, 5, pnl_usdt_item)
+        self.table.setItem(row, 7, pnl_usdt_item)
+        
+        # 手续费
+        fee_val = getattr(order, "total_fee", 0.0)
+        fee_item = QtWidgets.QTableWidgetItem(f"{fee_val:.4f}")
+        fee_item.setForeground(QtGui.QColor("#f9a825"))  # 黄色
+        self.table.setItem(row, 8, fee_item)
         
         # 原因
         reason = order.close_reason.value if order.close_reason else "-"
-        self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(reason))
+        self.table.setItem(row, 9, QtWidgets.QTableWidgetItem(reason))
         
         # 模板
         template = order.template_fingerprint[:8] if order.template_fingerprint else "-"
-        self.table.setItem(row, 7, QtWidgets.QTableWidgetItem(template))
+        self.table.setItem(row, 10, QtWidgets.QTableWidgetItem(template))
         
         # 相似度
-        self.table.setItem(row, 8, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
+        self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
         
         # 持仓时长
-        self.table.setItem(row, 9, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
-        
-        # 滚动到最新
-        self.table.scrollToBottom()
+        self.table.setItem(row, 12, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
     
     def clear(self):
         """清空表格"""
         self.table.setRowCount(0)
+        self._update_empty_state()
 
 
 class PaperTradingTab(QtWidgets.QWidget):
@@ -993,6 +1060,7 @@ class PaperTradingTab(QtWidgets.QWidget):
         trade_layout = QtWidgets.QVBoxLayout(trade_group)
         self.trade_log = PaperTradingTradeLog()
         trade_layout.addWidget(self.trade_log)
+        trade_group.setMinimumHeight(120)
         
         center_layout.addWidget(trade_group, stretch=1)
         
@@ -1007,8 +1075,7 @@ class PaperTradingTab(QtWidgets.QWidget):
         self.trade_log.set_history(trades)
         
     def reset(self):
-        """重置界面"""
-        self.trade_log.clear()
+        """重置界面（不清空交易记录，历史数据应保留）"""
         self.status_panel.update_position(None)
         self.status_panel.update_matching_context("未知", "待匹配", "-")
         self.control_panel.update_match_preview("", None, "待匹配")
@@ -1040,6 +1107,8 @@ class PaperTradingTab(QtWidgets.QWidget):
             side: 方向（LONG/SHORT）
             is_entry: True=入场，False=离场
         """
+        if bar_idx is None or price is None:
+            return
         if side == "LONG":
             signal_type = 1 if is_entry else 2
         else:  # SHORT
@@ -1049,16 +1118,11 @@ class PaperTradingTab(QtWidgets.QWidget):
     
     def update_tp_sl_lines(self, tp_price: float = None, sl_price: float = None):
         """
-        更新图表上的止盈止损线
+        更新图表上的止盈止损虚线（InfiniteLine）
         
         Args:
-            tp_price: 止盈价
-            sl_price: 止损价
+            tp_price: 止盈价格，None则隐藏TP线
+            sl_price: 止损价格，None则隐藏SL线
         """
-        if tp_price is not None and sl_price is not None:
-            self.chart_widget._set_tp_sp(tp_price, sl_price)
-        else:
-            # 清除TP/SL线
-            self.chart_widget._last_tp = None
-            self.chart_widget._last_sp = None
-            self.chart_widget._update_tp_sp_segment()
+        # 直接调用新的 InfiniteLine 接口
+        self.chart_widget.set_tp_sl_lines(tp_price, sl_price)

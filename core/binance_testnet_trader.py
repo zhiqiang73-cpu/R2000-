@@ -11,6 +11,7 @@ import time
 import os
 import json
 from datetime import datetime
+from dataclasses import replace
 from typing import Optional, Dict, List, Callable
 from urllib.parse import urlencode
 
@@ -20,6 +21,7 @@ from core.paper_trader import (
     AccountStats,
     CloseReason,
     OrderSide,
+    OrderStatus,
     PaperOrder,
     TemplateSimPerformance,
 )
@@ -75,6 +77,7 @@ class BinanceTestnetTrader:
         self._last_sync_ts = 0.0
         self._sync_interval_sec = 2.0
         self._pending_close = None  # (price, bar_idx, reason) 若离场失败则记录待重试
+        self._entry_stop_orders: List[dict] = []  # [{order_id, client_id, expire_bar}]
 
         self._validate_credentials()
         self._load_symbol_filters()
@@ -254,6 +257,61 @@ class BinanceTestnetTrader:
             return rows[0]
         return {}
 
+    def _infer_close_reason(self, order: PaperOrder, exit_price: float) -> CloseReason:
+        """
+        根据平仓价格和订单的TP/SL设置，推断真正的平仓原因
+        
+        逻辑：
+        1. 如果平仓价在止盈价附近（±0.1%），认为是止盈
+        2. 如果平仓价在止损价附近（±0.1%），认为是止损
+        3. 如果盈亏符合止盈方向，认为是止盈
+        4. 如果盈亏符合止损方向，认为是止损
+        5. 否则标记为"未知"（但用SIGNAL代替，因为可能是追踪止损等情况）
+        """
+        tolerance = 0.001  # 0.1% 容差
+        
+        # 检查是否触及止盈
+        if order.take_profit is not None:
+            tp = order.take_profit
+            if abs(exit_price - tp) / tp < tolerance:
+                return CloseReason.TAKE_PROFIT
+            # LONG: 平仓价 >= TP 表示止盈触发
+            # SHORT: 平仓价 <= TP 表示止盈触发
+            if order.side == OrderSide.LONG and exit_price >= tp:
+                return CloseReason.TAKE_PROFIT
+            if order.side == OrderSide.SHORT and exit_price <= tp:
+                return CloseReason.TAKE_PROFIT
+        
+        # 检查是否触及止损
+        if order.stop_loss is not None:
+            sl = order.stop_loss
+            if abs(exit_price - sl) / sl < tolerance:
+                return CloseReason.STOP_LOSS
+            # LONG: 平仓价 <= SL 表示止损触发
+            # SHORT: 平仓价 >= SL 表示止损触发
+            if order.side == OrderSide.LONG and exit_price <= sl:
+                return CloseReason.STOP_LOSS
+            if order.side == OrderSide.SHORT and exit_price >= sl:
+                return CloseReason.STOP_LOSS
+        
+        # 根据盈亏方向推断
+        entry = order.entry_price
+        if order.side == OrderSide.LONG:
+            pnl_direction = exit_price - entry
+        else:
+            pnl_direction = entry - exit_price
+        
+        # 如果是盈利且有TP设置，可能是止盈
+        if pnl_direction > 0 and order.take_profit is not None:
+            return CloseReason.TAKE_PROFIT
+        
+        # 如果是亏损且有SL设置，可能是止损
+        if pnl_direction < 0 and order.stop_loss is not None:
+            return CloseReason.STOP_LOSS
+        
+        # 无法确定，使用 SIGNAL（表示系统自动平仓，而非手动）
+        return CloseReason.SIGNAL
+
     def _sync_from_exchange(self, force: bool = False):
         """从交易所同步余额/持仓，确保UI与币安账户一致"""
         now = time.time()
@@ -270,7 +328,37 @@ class BinanceTestnetTrader:
         pos = self._get_position()
         amt = float(pos.get("positionAmt", 0.0)) if pos else 0.0
         if abs(amt) < 1e-12:
+            # 检测"之前有仓 -> 交易所已无仓"的转变，兜底触发平仓回调
+            prev_pos = self.current_position
             self.current_position = None
+            if prev_pos is not None and prev_pos.status != OrderStatus.CLOSED:
+                mark = 0.0
+                if pos:
+                    mark = float(pos.get("markPrice", 0.0))
+                if mark <= 0:
+                    try:
+                        mark = float(self._get_mark_price())
+                    except Exception:
+                        mark = 0.0
+                exit_price = mark if mark > 0 else prev_pos.entry_price
+                
+                # 【修复】根据平仓价格推断真正的平仓原因，而不是硬编码为"手动"
+                close_reason = self._infer_close_reason(prev_pos, exit_price)
+                
+                prev_pos.close(
+                    exit_price=exit_price,
+                    exit_time=datetime.now(),
+                    exit_bar_idx=self.current_bar_idx,
+                    reason=close_reason,
+                    leverage=self.leverage,
+                )
+                self.order_history.append(prev_pos)
+                # 持久化：防止停止程序时丢记录
+                self.save_history(self.history_file)
+                print(f"[BinanceTrader] 交易所仓位已消失，平仓原因={close_reason.value}: "
+                      f"{prev_pos.side.value} PnL={prev_pos.realized_pnl:+.2f} USDT")
+                if self.on_trade_closed:
+                    self.on_trade_closed(prev_pos)
             return
 
         side = OrderSide.LONG if amt > 0 else OrderSide.SHORT
@@ -282,18 +370,43 @@ class BinanceTestnetTrader:
         pnl = (mark - entry) * qty if side == OrderSide.LONG else (entry - mark) * qty
         pnl_pct = (pnl / margin * 100.0) if margin > 1e-9 else 0.0
 
-        self.current_position = PaperOrder(
-            order_id="EXCHANGE_SYNC",
-            symbol=self.symbol,
-            side=side,
-            quantity=qty,
-            margin_used=margin,
-            entry_price=entry,
-            entry_time=datetime.now(),
-            entry_bar_idx=self.current_bar_idx,
-            unrealized_pnl=pnl,
-            profit_pct=pnl_pct,
-        )
+        # 如果已有本地持仓且方向/入场价一致，只更新行情数据，保留追踪状态
+        existing = self.current_position
+        if (existing is not None
+                and existing.side == side
+                and abs(existing.entry_price - entry) < 0.01):
+            # 更新行情相关字段，保留所有追踪状态（trailing_stage, peak_price等）
+            existing.quantity = qty
+            existing.margin_used = margin
+            existing.unrealized_pnl = pnl
+            existing.profit_pct = pnl_pct
+            # 更新峰值追踪
+            if side == OrderSide.LONG:
+                if mark > existing.peak_price:
+                    existing.peak_price = mark
+            else:
+                if existing.peak_price == 0 or mark < existing.peak_price:
+                    existing.peak_price = mark
+            if pnl_pct > existing.peak_profit_pct:
+                existing.peak_profit_pct = pnl_pct
+        else:
+            # 新仓位（首次发现或方向变了），创建新对象
+            self.current_position = PaperOrder(
+                order_id="EXCHANGE_SYNC",
+                symbol=self.symbol,
+                side=side,
+                quantity=qty,
+                margin_used=margin,
+                entry_price=entry,
+                entry_time=datetime.now(),
+                entry_bar_idx=self.current_bar_idx,
+                unrealized_pnl=pnl,
+                profit_pct=pnl_pct,
+                peak_price=mark,
+            )
+        # 若交易所已有持仓，说明入场单已成交或不再有效
+        if self._entry_stop_orders:
+            self._entry_stop_orders.clear()
 
     def has_position(self) -> bool:
         return self.current_position is not None
@@ -325,8 +438,36 @@ class BinanceTestnetTrader:
                         "symbol": self.symbol,
                         "orderId": o["orderId"]
                     })
+            self._entry_stop_orders.clear()
         except Exception as e:
             print(f"[BinanceTrader] 撤销入场单失败: {e}")
+    
+    def cancel_expired_entry_stop_orders(self, current_bar_idx: int):
+        """超时撤销入场止损单"""
+        if not self._entry_stop_orders:
+            return
+        remaining = []
+        for o in self._entry_stop_orders:
+            expire_bar = o.get("expire_bar", -1)
+            if current_bar_idx <= expire_bar:
+                remaining.append(o)
+                continue
+            order_id = o.get("order_id")
+            client_id = o.get("client_id")
+            try:
+                print(f"[BinanceTrader] 入场单超时撤销: {client_id or order_id}")
+                params = {"symbol": self.symbol}
+                if order_id:
+                    params["orderId"] = order_id
+                elif client_id:
+                    params["origClientOrderId"] = client_id
+                else:
+                    remaining.append(o)
+                    continue
+                self._signed_request("DELETE", "/fapi/v1/order", params)
+            except Exception as e:
+                print(f"[BinanceTrader] 撤销超时入场单失败: {e}")
+        self._entry_stop_orders = remaining
 
     def _new_client_order_id(self, prefix: str) -> str:
         self._order_counter += 1
@@ -380,16 +521,23 @@ class BinanceTestnetTrader:
 
         print(f"[BinanceTrader] 放置开仓止损单: {side_str} {qty_str} @ 触发价 {trigger_str}")
 
+        client_id = self._new_client_order_id("ENTRY_STOP")
         resp = self._place_order({
             "symbol": self.symbol,
             "side": side_str,
             "type": "STOP_MARKET",
             "quantity": qty_str,
             "stopPrice": trigger_str,
-            "newClientOrderId": self._new_client_order_id("ENTRY_STOP"),
+            "newClientOrderId": client_id,
         })
-        
-        return resp.get("orderId")
+        order_id = resp.get("orderId")
+        if order_id:
+            self._entry_stop_orders.append({
+                "order_id": order_id,
+                "client_id": client_id,
+                "expire_bar": bar_idx + timeout_bars,
+            })
+        return order_id
 
     def open_position(self,
                       side: OrderSide,
@@ -457,6 +605,7 @@ class BinanceTestnetTrader:
             template_fingerprint=template_fingerprint,
             entry_similarity=entry_similarity,
             entry_reason=entry_reason,
+            peak_price=avg_price,  # 初始峰值 = 入场价
         )
         self.current_position = order
         if self.on_order_update:
@@ -475,12 +624,12 @@ class BinanceTestnetTrader:
         px = self._round_step(px, self._price_tick)
         return max(self._price_tick, px)
 
-    def _force_market_close(self, order: 'PaperOrder', exit_side: str) -> dict:
+    def _force_market_close(self, order: 'PaperOrder', exit_side: str, close_qty: float) -> dict:
         """限价单失败后，降级为市价单强制平仓"""
         print(f"[BinanceTrader] ⚠ 限价IOC未成交，降级为市价单强制平仓!")
         # 格式化数量
         precision = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
-        qty_str = f"{self._round_step(order.quantity, self._qty_step):.{precision}f}"
+        qty_str = f"{self._round_step(close_qty, self._qty_step):.{precision}f}"
 
         resp = self._place_order({
             "symbol": self.symbol,
@@ -506,7 +655,9 @@ class BinanceTestnetTrader:
             return None
 
         order = self.current_position
-        close_qty = quantity if quantity is not None else order.quantity
+        original_qty = order.quantity
+        close_qty = quantity if quantity is not None else original_qty
+        close_qty = min(close_qty, original_qty)
         exit_side = "SELL" if order.side == OrderSide.LONG else "BUY"
 
         # 第一步：尝试限价 IOC（低滑点）
@@ -536,7 +687,7 @@ class BinanceTestnetTrader:
         # 第二步：限价失败 → 立即降级为市价单（绝不让仓位悬空！）
         if status not in ("FILLED", "PARTIALLY_FILLED") or filled_qty <= 0:
             print(f"[BinanceTrader] 限价离场未成交(status={status})，启动市价降级...")
-            resp = self._force_market_close(order, exit_side)
+            resp = self._force_market_close(order, exit_side, close_qty)
             status = str(resp.get("status", ""))
             filled_qty = float(resp.get("executedQty", 0.0))
             if status not in ("FILLED", "PARTIALLY_FILLED") or filled_qty <= 0:
@@ -546,35 +697,63 @@ class BinanceTestnetTrader:
                 return None
 
         exit_price = float(resp.get("avgPrice", 0.0)) or limit_price
-        pnl = (exit_price - order.entry_price) * filled_qty if order.side == OrderSide.LONG else (order.entry_price - exit_price) * filled_qty
-        fee = (order.entry_price * order.quantity + exit_price * filled_qty) * self.fee_rate
+        closed_qty = min(filled_qty, close_qty)
+        if closed_qty <= 0:
+            self._pending_close = (price, bar_idx, reason)
+            return None
+
+        pnl = (exit_price - order.entry_price) * closed_qty if order.side == OrderSide.LONG else (order.entry_price - exit_price) * closed_qty
+        fee = (order.entry_price * closed_qty + exit_price * closed_qty) * self.fee_rate
         net_pnl = pnl - fee
-        pnl_pct = (net_pnl / max(order.margin_used, 1e-9)) * 100.0
+        margin_portion = order.margin_used * (closed_qty / max(original_qty, 1e-12))
+        pnl_pct = (net_pnl / max(margin_portion, 1e-9)) * 100.0
 
-        order.exit_price = exit_price
-        order.exit_time = datetime.now()
-        order.exit_bar_idx = bar_idx
-        order.close_reason = reason
-        order.realized_pnl = net_pnl
-        order.unrealized_pnl = 0.0
-        order.profit_pct = pnl_pct
-        order.status = order.status.__class__.CLOSED
-        order.hold_bars = bar_idx - order.entry_bar_idx
+        closed_order = replace(
+            order,
+            quantity=closed_qty,
+            margin_used=margin_portion,
+            status=OrderStatus.CLOSED,
+            exit_price=exit_price,
+            exit_time=datetime.now(),
+            exit_bar_idx=bar_idx,
+            close_reason=reason,
+            realized_pnl=net_pnl,
+            unrealized_pnl=0.0,
+            profit_pct=pnl_pct,
+            hold_bars=bar_idx - order.entry_bar_idx,
+            total_fee=fee,
+        )
 
-        self.order_history.append(order)
-        self.current_position = None
+        self.order_history.append(closed_order)
         self._pending_close = None  # 清除重试标记
 
+        full_close = closed_qty >= (original_qty - 1e-12)
+        if full_close:
+            self.current_position = None
+        else:
+            remaining_qty = original_qty - closed_qty
+            order.quantity = remaining_qty
+            order.margin_used = order.margin_used - margin_portion
+            # 更新未实现盈亏（使用当前价格近似）
+            mark_price = price
+            pnl_unreal = (mark_price - order.entry_price) * remaining_qty if order.side == OrderSide.LONG else (order.entry_price - mark_price) * remaining_qty
+            order.unrealized_pnl = pnl_unreal
+            order.profit_pct = (pnl_unreal / max(order.margin_used, 1e-9)) * 100.0
+
         self._update_stats_from_exchange()
-        if order.template_fingerprint:
-            self._record_template_performance(order)
+        if closed_order.template_fingerprint:
+            self._record_template_performance(closed_order)
         
         # 【持久化】平仓后自动保存
         self.save_history(self.history_file)
         
-        if self.on_trade_closed:
-            self.on_trade_closed(order)
-        return order
+        if full_close:
+            if self.on_trade_closed:
+                self.on_trade_closed(closed_order)
+        else:
+            if self.on_order_update:
+                self.on_order_update(order)
+        return closed_order
 
     def update_price(self, price: float, high: float = None, low: float = None,
                      bar_idx: int = None) -> Optional[CloseReason]:
@@ -602,6 +781,16 @@ class BinanceTestnetTrader:
         pnl = (price - order.entry_price) * order.quantity if order.side == OrderSide.LONG else (order.entry_price - price) * order.quantity
         order.unrealized_pnl = pnl
         order.profit_pct = (pnl / max(order.margin_used, 1e-9)) * 100.0
+
+        # 追踪峰值利润（用于锁利逻辑）
+        if order.side == OrderSide.LONG:
+            if high > order.peak_price:
+                order.peak_price = high
+        else:
+            if order.peak_price == 0 or low < order.peak_price:
+                order.peak_price = low
+        if order.profit_pct > order.peak_profit_pct:
+            order.peak_profit_pct = order.profit_pct
 
         if order.take_profit is not None:
             if order.side == OrderSide.LONG and high >= order.take_profit:
@@ -642,23 +831,29 @@ class BinanceTestnetTrader:
         order.current_similarity = similarity
 
         if similarity >= safe_threshold:
+            # 安全区：不回退止损，追踪止损可能已经更好
             order.tracking_status = "安全"
-            if order.alert_mode:
-                order.alert_mode = False
-                order.stop_loss = order.original_stop_loss
+            order.alert_mode = False
         elif similarity >= alert_threshold:
+            # 警戒区：收紧到成本价（但不回退已上移的SL）
             order.tracking_status = "警戒"
-            if not order.alert_mode:
-                order.alert_mode = True
-                order.stop_loss = order.entry_price
+            order.alert_mode = True
+            if order.side == OrderSide.LONG:
+                order.stop_loss = max(order.stop_loss or 0, order.entry_price)
+            else:
+                order.stop_loss = min(order.stop_loss or float('inf'), order.entry_price)
         elif similarity >= derail_threshold:
-            # 危险区间：收紧止损到成本价，但还不立刻强平
+            # 危险区：收紧到成本价+微利
             order.tracking_status = "危险"
-            if not order.alert_mode:
-                order.alert_mode = True
-                order.stop_loss = order.entry_price
+            order.alert_mode = True
+            if order.side == OrderSide.LONG:
+                danger_sl = order.entry_price * 1.001
+                order.stop_loss = max(order.stop_loss or 0, danger_sl)
+            else:
+                danger_sl = order.entry_price * 0.999
+                order.stop_loss = min(order.stop_loss or float('inf'), danger_sl)
         else:
-            # 真正脱轨：similarity < derail_threshold → 强制平仓
+            # 脱轨：立即强制平仓
             order.tracking_status = "脱轨"
             if current_price is not None:
                 closed = self.close_position(current_price, bar_idx or self.current_bar_idx, CloseReason.DERAIL)

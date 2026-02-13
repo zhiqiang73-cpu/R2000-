@@ -118,6 +118,11 @@ BACKTEST_CONFIG = {
     "TP_SP_LOOKBACK": 20,       # TP/SP 近端高低点窗口
 }
 
+# ==================== 实盘风控配置 ====================
+LIVE_RISK_CONFIG = {
+    "MAX_DRAWDOWN_PCT": 30.0,   # 触发阈值(%), 达到后暂停开仓
+}
+
 # ==================== 标注回测配置（基于标记点） ====================
 LABEL_BACKTEST_CONFIG = {
     "INITIAL_CAPITAL": 5000,    # 本金 (USDT)

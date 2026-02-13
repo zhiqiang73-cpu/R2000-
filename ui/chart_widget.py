@@ -459,22 +459,58 @@ class ChartWidget(QtWidgets.QWidget):
         # 零轴线
         self.macd_plot.addItem(pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen('#555', width=0.5)))
         
-        # TP / SP 短线段 + 文字（清晰但不遮挡K线）
-        tp_color = QtGui.QColor(UI_CONFIG["CHART_TAKE_PROFIT_COLOR"])
-        sp_color = QtGui.QColor(UI_CONFIG["CHART_STOP_LOSS_COLOR"])
-        self.tp_segment = pg.PlotDataItem([], [], pen=pg.mkPen(tp_color, width=1.6))
-        self.sp_segment = pg.PlotDataItem([], [], pen=pg.mkPen(sp_color, width=1.6))
-        self.candle_plot.addItem(self.tp_segment)
-        self.candle_plot.addItem(self.sp_segment)
-        self.tp_segment.setZValue(5)
-        self.sp_segment.setZValue(5)
-
-        self.tp_label = pg.TextItem(text="TP", color=tp_color, anchor=(1, 0.5))
-        self.sp_label = pg.TextItem(text="SP", color=sp_color, anchor=(1, 0.5))
-        self.candle_plot.addItem(self.tp_label)
-        self.candle_plot.addItem(self.sp_label)
-        self.tp_label.setVisible(False)
-        self.sp_label.setVisible(False)
+        # === 指纹轨迹叠加（虚线）===
+        self.fingerprint_traj_curve = pg.PlotDataItem(
+            pen=pg.mkPen('#FFD700', width=0.9, style=QtCore.Qt.PenStyle.DashLine)
+        )
+        self.fingerprint_traj_curve.setZValue(6)
+        self.candle_plot.addItem(self.fingerprint_traj_curve)
+        # 置信区间（上下界 + 填充）
+        self.fingerprint_upper_curve = pg.PlotDataItem(pen=pg.mkPen('#FFD700', width=0.6))
+        self.fingerprint_lower_curve = pg.PlotDataItem(pen=pg.mkPen('#FFD700', width=0.6))
+        self.fingerprint_band = pg.FillBetweenItem(
+            self.fingerprint_upper_curve,
+            self.fingerprint_lower_curve,
+            brush=pg.mkBrush(255, 215, 0, 40),
+        )
+        self.fingerprint_upper_curve.setZValue(5)
+        self.fingerprint_lower_curve.setZValue(5)
+        self.fingerprint_band.setZValue(4)
+        self.candle_plot.addItem(self.fingerprint_upper_curve)
+        self.candle_plot.addItem(self.fingerprint_lower_curve)
+        self.candle_plot.addItem(self.fingerprint_band)
+        
+        self.fingerprint_label = pg.TextItem(anchor=(0, 0), color="#FFD700")
+        self.fingerprint_label.setFont(QtGui.QFont('Arial', 10, QtGui.QFont.Weight.Bold))
+        self.candle_plot.addItem(self.fingerprint_label, ignoreBounds=True)
+        
+        self._overlay_future_padding = 0
+        
+        # 【重要改动】TP / SL 水平虚线（InfiniteLine）- 延伸整个可视区域
+        # 使用虚线样式 + 标签，清晰显示止盈止损位置
+        tp_color = UI_CONFIG["CHART_TAKE_PROFIT_COLOR"]
+        sl_color = UI_CONFIG["CHART_STOP_LOSS_COLOR"]
+        
+        self.tp_line = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen(tp_color, width=1.2, style=QtCore.Qt.PenStyle.DashLine),
+            label='TP: {value:.2f}',
+            labelOpts={'position': 0.95, 'color': tp_color, 'fill': (30, 30, 30, 200), 'movable': False}
+        )
+        self.sl_line = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen(sl_color, width=1.2, style=QtCore.Qt.PenStyle.DashLine),
+            label='SL: {value:.2f}',
+            labelOpts={'position': 0.95, 'color': sl_color, 'fill': (30, 30, 30, 200), 'movable': False}
+        )
+        
+        self.tp_line.setVisible(False)
+        self.sl_line.setVisible(False)
+        self.tp_line.setZValue(10)  # 高于K线但低于十字线
+        self.sl_line.setZValue(10)
+        
+        self.candle_plot.addItem(self.tp_line, ignoreBounds=True)
+        self.candle_plot.addItem(self.sl_line, ignoreBounds=True)
         
         # 十字线
         self.vline = pg.InfiniteLine(angle=90, movable=False, 
@@ -526,7 +562,8 @@ class ChartWidget(QtWidgets.QWidget):
             self.signal_marker.clear_signals()
             self._last_tp = None
             self._last_sp = None
-            self._update_tp_sp_segment()
+            # 清空 TP/SL 虚线
+            self.set_tp_sl_lines(None, None)
         
         if df is None or len(df) == 0:
             return
@@ -561,9 +598,11 @@ class ChartWidget(QtWidgets.QWidget):
         old_len = len(self.df) if self.df is not None else 0
         self.df = df
         
-        # 更新时间轴
+        # 更新时间轴（支持 timestamp 或 open_time）
         if 'timestamp' in df.columns:
             self.date_axis.set_timestamps(df['timestamp'].tolist())
+        elif 'open_time' in df.columns:
+            self.date_axis.set_timestamps(df['open_time'].tolist())
         
         # 仅渲染末尾变化的区域
         self._display_range(0, len(df))
@@ -782,11 +821,29 @@ class ChartWidget(QtWidgets.QWidget):
             if tp_price is not None and sp_price is not None:
                 self._set_tp_sp(tp_price, sp_price)
 
+    def set_tp_sl_lines(self, tp_price: float = None, sl_price: float = None):
+        """
+        设置/更新止盈止损虚线位置
+        
+        Args:
+            tp_price: 止盈价格，None则隐藏
+            sl_price: 止损价格，None则隐藏
+        """
+        if tp_price is not None:
+            self.tp_line.setValue(tp_price)
+            self.tp_line.setVisible(True)
+        else:
+            self.tp_line.setVisible(False)
+        
+        if sl_price is not None:
+            self.sl_line.setValue(sl_price)
+            self.sl_line.setVisible(True)
+        else:
+            self.sl_line.setVisible(False)
+    
     def _set_tp_sp(self, tp_price: float, sp_price: float):
-        """设置 TP/SP 数值并刷新短线段"""
-        self._last_tp = tp_price
-        self._last_sp = sp_price
-        self._update_tp_sp_segment()
+        """兼容旧接口，内部转发到新方法"""
+        self.set_tp_sl_lines(tp_price, sp_price)
 
     def _calc_tp_sp(self, idx: int, label_type: int, df: pd.DataFrame):
         """基于近端高低点计算 TP/SP（短线逻辑）"""
@@ -814,25 +871,12 @@ class ChartWidget(QtWidgets.QWidget):
         return tp_price, sp_price
 
     def _update_tp_sp_segment(self):
-        """用短线段显示 TP/SP，避免遮挡K线"""
-        if self.df is None or self._last_tp is None or self._last_sp is None:
-            self.tp_segment.setData([], [])
-            self.sp_segment.setData([], [])
-            self.tp_label.setVisible(False)
-            self.sp_label.setVisible(False)
-            return
-
-        view_range = self.candle_plot.viewRange()[0]
-        x_end = view_range[1]
-        x_start = max(view_range[0], x_end - 12)
-
-        self.tp_segment.setData([x_start, x_end], [self._last_tp, self._last_tp])
-        self.sp_segment.setData([x_start, x_end], [self._last_sp, self._last_sp])
-
-        self.tp_label.setPos(x_end - 0.5, self._last_tp)
-        self.sp_label.setPos(x_end - 0.5, self._last_sp)
-        self.tp_label.setVisible(True)
-        self.sp_label.setVisible(True)
+        """
+        【已废弃】旧的短线段更新方法，现在改用 InfiniteLine 虚线
+        保留此方法以兼容旧代码调用，实际上不做任何操作
+        新代码请使用 set_tp_sl_lines() 方法
+        """
+        pass  # InfiniteLine 不需要每次viewRange变化时更新
     
     def _update_signal_markers_range(self, start_idx: int, end_idx: int):
         """更新指定范围内的信号标记 - LONG/SHORT/EXIT 系统"""
@@ -1033,6 +1077,49 @@ class ChartWidget(QtWidgets.QWidget):
         """自动范围"""
         self.candle_plot.autoRange()
         self.volume_plot.autoRange()
+    
+    def set_fingerprint_trajectory(self, prices: np.ndarray, start_idx: int,
+                                   similarity: float, label: str,
+                                   lower: np.ndarray = None, upper: np.ndarray = None):
+        """在K线图上叠加指纹轨迹虚线"""
+        if prices is None or len(prices) == 0:
+            self.clear_fingerprint_trajectory()
+            return
+        
+        x = np.arange(start_idx, start_idx + len(prices))
+        self.fingerprint_traj_curve.setData(x=x, y=prices)
+        if lower is not None and upper is not None and len(lower) == len(prices) and len(upper) == len(prices):
+            self.fingerprint_lower_curve.setData(x=x, y=lower)
+            self.fingerprint_upper_curve.setData(x=x, y=upper)
+        else:
+            self.fingerprint_lower_curve.setData([], [])
+            self.fingerprint_upper_curve.setData([], [])
+        
+        if self.df is not None and len(self.df) > 0:
+            max_x = int(x[-1])
+            self._overlay_future_padding = max(0, max_x - (len(self.df) - 1))
+        else:
+            self._overlay_future_padding = 0
+        
+        sim_pct = similarity * 100
+        color = "#00FF00" if sim_pct >= 70 else ("#FFD700" if sim_pct >= 50 else "#FF6347")
+        self.fingerprint_label.setText(f"{label} {sim_pct:.1f}%")
+        self.fingerprint_label.setColor(color)
+        
+        rect = self.candle_plot.viewRect()
+        self.fingerprint_label.setPos(rect.left() + 2, rect.top() + 20)
+    
+    def clear_fingerprint_trajectory(self):
+        """清除指纹轨迹叠加"""
+        self.fingerprint_traj_curve.setData([], [])
+        self.fingerprint_upper_curve.setData([], [])
+        self.fingerprint_lower_curve.setData([], [])
+        self.fingerprint_label.setText("")
+        self._overlay_future_padding = 0
+    
+    def get_overlay_padding(self) -> int:
+        """获取轨迹对未来的X轴扩展长度"""
+        return int(self._overlay_future_padding or 0)
 
 
 # 测试代码

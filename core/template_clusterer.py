@@ -71,6 +71,10 @@ class Prototype:
     # 用于快速余弦匹配的展平向量
     pre_entry_flat: np.ndarray = field(default_factory=lambda: np.array([]))
     
+    # 【DTW二次过滤】代表序列 - 存储最接近质心的模板的原始 pre_entry 序列
+    # 形状: (window_size, 32)，用于DTW距离计算
+    representative_pre_entry: np.ndarray = field(default_factory=lambda: np.array([]))
+    
     def __post_init__(self):
         """初始化时预计算展平向量"""
         if self.pre_entry_centroid.size > 0 and self.pre_entry_flat.size == 0:
@@ -107,6 +111,8 @@ class Prototype:
             "wf_grade": self.wf_grade,
             "wf_match_count": self.wf_match_count,
             "wf_win_rate": self.wf_win_rate,
+            # DTW 代表序列
+            "representative_pre_entry": self.representative_pre_entry.tolist() if self.representative_pre_entry.size > 0 else [],
         }
     
     @classmethod
@@ -131,6 +137,8 @@ class Prototype:
             wf_grade=d.get("wf_grade", ""),
             wf_match_count=d.get("wf_match_count", 0),
             wf_win_rate=d.get("wf_win_rate", 0.0),
+            # DTW 代表序列（兼容旧版本）
+            representative_pre_entry=np.array(d.get("representative_pre_entry", [])),
         )
         return proto
 
@@ -485,6 +493,17 @@ class TemplateClusterer:
             else:
                 short_prototypes = direction_prototypes
         
+        # 【原型去重】删除过于相似的原型，提高区分度
+        if verbose:
+            print(f"[TemplateClusterer] 原型去重中...")
+        
+        long_prototypes = self._deduplicate_prototypes(
+            long_prototypes, similarity_threshold=0.98, verbose=verbose
+        )
+        short_prototypes = self._deduplicate_prototypes(
+            short_prototypes, similarity_threshold=0.98, verbose=verbose
+        )
+        
         library.long_prototypes = long_prototypes
         library.short_prototypes = short_prototypes
         
@@ -616,6 +635,16 @@ class TemplateClusterer:
             holding_centroid = centroid[32:96]  # mean(32) + std(32)
             pre_exit_centroid = centroid[96:128]
             
+            # 【DTW代表序列】找到最接近质心的模板，用其 pre_entry 作为代表序列
+            representative_pre_entry = np.array([])
+            if len(cluster_vectors) > 0:
+                # 计算每个模板到质心的距离
+                distances = np.linalg.norm(cluster_vectors - centroid, axis=1)
+                closest_idx = np.argmin(distances)
+                closest_template = cluster_templates[closest_idx]
+                if closest_template.pre_entry.size > 0:
+                    representative_pre_entry = closest_template.pre_entry.copy()
+            
             # 统计成员信息
             member_count = len(cluster_templates)
             profits = [t.profit_pct for t in cluster_templates]
@@ -646,6 +675,7 @@ class TemplateClusterer:
                 win_rate=win_rate,
                 avg_hold_bars=avg_hold,
                 member_fingerprints=member_fps,
+                representative_pre_entry=representative_pre_entry,  # DTW 代表序列
             )
             
             prototypes.append(prototype)
@@ -676,6 +706,106 @@ class TemplateClusterer:
                   f"平均收益{avg_profit:.2f}%")
             print(f"        市场状态分布: {regime_str}")
 
+    def _deduplicate_prototypes(self, prototypes: List[Prototype], 
+                                 similarity_threshold: float = 0.98,
+                                 verbose: bool = True) -> List[Prototype]:
+        """
+        去重：删除过于相似的原型，保留更有统计意义的那个
+        
+        算法：
+        1. 计算所有原型对之间的余弦相似度
+        2. 如果两个原型相似度 > threshold，合并为一个
+        3. 合并规则：保留成员数更多的原型，合并统计信息
+        
+        Args:
+            prototypes: 原型列表
+            similarity_threshold: 相似度阈值，超过则认为太像需要合并
+            verbose: 是否打印去重信息
+        
+        Returns:
+            去重后的原型列表
+        """
+        if len(prototypes) <= 1:
+            return prototypes
+        
+        # 标记哪些原型被合并掉了
+        merged_into = {}  # {被合并的idx: 合并目标idx}
+        
+        # 计算相似度矩阵
+        n = len(prototypes)
+        for i in range(n):
+            if i in merged_into:
+                continue
+            
+            for j in range(i + 1, n):
+                if j in merged_into:
+                    continue
+                
+                # 计算余弦相似度（使用 pre_entry_centroid）
+                p1, p2 = prototypes[i], prototypes[j]
+                
+                # 只在同方向、同 regime 内去重
+                if p1.direction != p2.direction or p1.regime != p2.regime:
+                    continue
+                
+                if p1.pre_entry_centroid.size == 0 or p2.pre_entry_centroid.size == 0:
+                    continue
+                
+                sim = self._cosine_similarity(p1.pre_entry_centroid, p2.pre_entry_centroid)
+                
+                if sim >= similarity_threshold:
+                    # 选择保留成员数更多的；相同则保留期望收益更高的
+                    if p1.member_count > p2.member_count:
+                        keep_idx, drop_idx = i, j
+                    elif p2.member_count > p1.member_count:
+                        keep_idx, drop_idx = j, i
+                    else:
+                        # 成员数相同，比较平均收益
+                        if p1.avg_profit_pct >= p2.avg_profit_pct:
+                            keep_idx, drop_idx = i, j
+                        else:
+                            keep_idx, drop_idx = j, i
+                    
+                    merged_into[drop_idx] = keep_idx
+                    
+                    # 合并统计信息到保留的原型
+                    keep_proto = prototypes[keep_idx]
+                    drop_proto = prototypes[drop_idx]
+                    
+                    # 合并成员数和统计
+                    keep_proto.member_count += drop_proto.member_count
+                    keep_proto.win_count += drop_proto.win_count
+                    keep_proto.total_profit_pct += drop_proto.total_profit_pct
+                    keep_proto.member_fingerprints.extend(drop_proto.member_fingerprints)
+                    
+                    # 重新计算平均值
+                    if keep_proto.member_count > 0:
+                        keep_proto.avg_profit_pct = keep_proto.total_profit_pct / keep_proto.member_count
+                        keep_proto.win_rate = keep_proto.win_count / keep_proto.member_count
+        
+        # 过滤掉被合并的原型
+        result = [p for i, p in enumerate(prototypes) if i not in merged_into]
+        
+        if verbose and len(merged_into) > 0:
+            print(f"        [去重] 合并了 {len(merged_into)} 个相似原型 "
+                  f"(阈值={similarity_threshold:.0%}), 剩余 {len(result)} 个")
+        
+        return result
+    
+    @staticmethod
+    def _cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+        """计算余弦相似度"""
+        if v1.size == 0 or v2.size == 0:
+            return 0.0
+        
+        norm1 = np.linalg.norm(v1)
+        norm2 = np.linalg.norm(v2)
+        
+        if norm1 < 1e-9 or norm2 < 1e-9:
+            return 0.0
+        
+        return float(np.dot(v1, v2) / (norm1 * norm2))
+
 
 class PrototypeMatcher:
     """
@@ -688,16 +818,28 @@ class PrototypeMatcher:
     
     def __init__(self, library: PrototypeLibrary, 
                  cosine_threshold: float = 0.5,
-                 min_prototypes_agree: int = 1):
+                 min_prototypes_agree: int = 1,
+                 dtw_top_k: int = 5,
+                 dtw_threshold: float = 0.5,
+                 dtw_weight: float = 0.3):
         """
         Args:
             library: 原型库
             cosine_threshold: 余弦相似度阈值
             min_prototypes_agree: 最少需要多少个原型同意才开仓
+            dtw_top_k: DTW二次验证的候选数量（取余弦Top-K）
+            dtw_threshold: DTW距离阈值（0~1，越小越严格）
+            dtw_weight: DTW分数权重（综合分 = (1-w)*cosine + w*dtw_sim）
         """
         self.library = library
         self.cosine_threshold = cosine_threshold
         self.min_prototypes_agree = min_prototypes_agree
+        
+        # 【DTW二次过滤参数】
+        self.dtw_top_k = dtw_top_k
+        self.dtw_threshold = dtw_threshold
+        self.dtw_weight = dtw_weight
+        self.dtw_radius = 10  # Sakoe-Chiba band radius
         
         # 【性能优化】预先堆叠原型中心向量，实现向量化匹配
         self._long_centroids = None
@@ -733,6 +875,102 @@ class PrototypeMatcher:
                 norms[norms < 1e-9] = 1.0
                 self._short_centroids /= norms
                 self._short_protos = short_list
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # DTW 二次过滤方法
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    def _compute_dtw_distance(self, seq1: np.ndarray, seq2: np.ndarray) -> float:
+        """
+        计算两个多变量序列的DTW距离（归一化到0~1）
+        
+        Args:
+            seq1, seq2: (time, features) 形状的序列
+        
+        Returns:
+            归一化的DTW距离，越小越相似
+        """
+        if seq1.size == 0 or seq2.size == 0:
+            return 1.0
+        
+        # 确保是2D
+        if seq1.ndim == 1:
+            seq1 = seq1.reshape(-1, 1)
+        if seq2.ndim == 1:
+            seq2 = seq2.reshape(-1, 1)
+        
+        n, m = len(seq1), len(seq2)
+        if n == 0 or m == 0:
+            return 1.0
+        
+        # 初始化代价矩阵
+        dtw_matrix = np.full((n + 1, m + 1), np.inf)
+        dtw_matrix[0, 0] = 0
+        
+        # Sakoe-Chiba 带约束
+        window = max(self.dtw_radius, abs(n - m))
+        
+        for i in range(1, n + 1):
+            j_start = max(1, i - window)
+            j_end = min(m, i + window) + 1
+            for j in range(j_start, j_end):
+                cost = np.linalg.norm(seq1[i - 1] - seq2[j - 1])
+                dtw_matrix[i, j] = cost + min(
+                    dtw_matrix[i - 1, j],      # 插入
+                    dtw_matrix[i, j - 1],      # 删除
+                    dtw_matrix[i - 1, j - 1]   # 匹配
+                )
+        
+        distance = dtw_matrix[n, m]
+        
+        # 归一化：按最大可能距离估算
+        max_len = max(n, m)
+        n_features = seq1.shape[1] if seq1.ndim > 1 else 1
+        max_dist = max_len * np.sqrt(n_features) * 2
+        
+        return min(1.0, distance / max_dist) if max_dist > 0 else 1.0
+    
+    def _dtw_filter_candidates(self, current_window: np.ndarray,
+                                candidates: List[Tuple[Prototype, float]]) -> List[Tuple[Prototype, float, float, float]]:
+        """
+        对余弦候选进行DTW二次过滤
+        
+        Args:
+            current_window: (time, 32) 当前K线窗口
+            candidates: [(prototype, cosine_sim), ...] 余弦排序后的候选
+        
+        Returns:
+            [(prototype, cosine_sim, dtw_sim, combined_score), ...] 按综合分排序
+        """
+        if not candidates:
+            return []
+        
+        # 只对 Top-K 进行DTW验证（节省计算）
+        top_k_candidates = candidates[:self.dtw_top_k]
+        
+        results = []
+        for proto, cosine_sim in top_k_candidates:
+            # 检查原型是否有代表序列
+            if proto.representative_pre_entry.size == 0:
+                # 没有代表序列，只用余弦
+                dtw_dist = 0.5  # 中性值
+                dtw_sim = 0.5
+            else:
+                # 计算DTW距离
+                dtw_dist = self._compute_dtw_distance(
+                    current_window, proto.representative_pre_entry
+                )
+                dtw_sim = max(0.0, 1.0 - dtw_dist)
+            
+            # 综合分数 = (1 - dtw_weight) * cosine + dtw_weight * dtw_sim
+            combined = (1 - self.dtw_weight) * cosine_sim + self.dtw_weight * dtw_sim
+            
+            results.append((proto, cosine_sim, dtw_sim, combined))
+        
+        # 按综合分排序（高到低）
+        results.sort(key=lambda x: x[3], reverse=True)
+        
+        return results
 
     def match_entry(self, current_window: np.ndarray, 
                     direction: str = None,
@@ -850,11 +1088,34 @@ class PrototypeMatcher:
         if not matches:
             return self._empty_result()
         
-        best_proto, best_sim = matches[0]
+        # ══════════════════════════════════════════════════════════
+        # 【DTW 二次过滤】对余弦 Top-K 候选进行路径相似度验证
+        # ══════════════════════════════════════════════════════════
+        dtw_filtered = self._dtw_filter_candidates(current_window, matches)
         
-        # 检查是否满足匹配条件
-        matched = (best_sim >= self.cosine_threshold and 
-                   votes >= self.min_prototypes_agree)
+        if dtw_filtered:
+            # 使用DTW过滤后的结果
+            best_proto, best_cosine, best_dtw_sim, best_combined = dtw_filtered[0]
+            
+            # 检查是否满足匹配条件（综合考虑余弦和DTW）
+            # 条件：余弦达标 AND 投票数达标 AND DTW距离在阈值内
+            dtw_passed = (1.0 - best_dtw_sim) <= self.dtw_threshold
+            matched = (best_cosine >= self.cosine_threshold and 
+                       votes >= self.min_prototypes_agree and
+                       dtw_passed)
+            
+            # 构建带DTW信息的top_matches
+            top_matches_with_dtw = [
+                (p, cosine, dtw_s, comb) for p, cosine, dtw_s, comb in dtw_filtered[:5]
+            ]
+        else:
+            # 回退到纯余弦结果
+            best_proto, best_cosine = matches[0]
+            best_dtw_sim = 0.0
+            best_combined = best_cosine
+            matched = (best_cosine >= self.cosine_threshold and 
+                       votes >= self.min_prototypes_agree)
+            top_matches_with_dtw = [(p, sim, 0.0, sim) for p, sim in matches[:5]]
         
         vote_ratio = vote_long / total_votes if total_votes > 0 else 0.5
         
@@ -862,11 +1123,14 @@ class PrototypeMatcher:
             "matched": matched,
             "direction": direction,
             "best_prototype": best_proto,
-            "similarity": best_sim,
+            "similarity": best_combined,  # 综合分作为主相似度
+            "cosine_similarity": best_cosine,  # 余弦相似度（用于显示）
+            "dtw_similarity": best_dtw_sim,    # DTW相似度（用于显示）
             "vote_long": vote_long,
             "vote_short": vote_short,
             "vote_ratio": vote_ratio,
-            "top_matches": matches[:5],
+            "top_matches": [(p, comb) for p, _, _, comb in top_matches_with_dtw],  # 兼容旧格式
+            "top_matches_detail": top_matches_with_dtw,  # 详细信息
         }
 
     def _match_direction_vectorized(self, current_unit: np.ndarray, 
@@ -1215,10 +1479,13 @@ class PrototypeMatcher:
             "direction": None,
             "best_prototype": None,
             "similarity": 0.0,
+            "cosine_similarity": 0.0,
+            "dtw_similarity": 0.0,
             "vote_long": 0,
             "vote_short": 0,
             "vote_ratio": 0.5,
             "top_matches": [],
+            "top_matches_detail": [],
         }
 
 

@@ -15,6 +15,7 @@ import traceback
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.paper_trader import load_trade_history_from_file
 from config import (UI_CONFIG, DATA_CONFIG, LABEL_BACKTEST_CONFIG,
                     MARKET_REGIME_CONFIG, VECTOR_SPACE_CONFIG,
                     TRAJECTORY_CONFIG, WALK_FORWARD_CONFIG, MEMORY_CONFIG,
@@ -467,6 +468,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # 自动加载已有原型库（如果配置了）
         self._auto_load_prototypes()
+        
+        # 自动加载历史交易记录（程序启动即显示）
+        self._load_paper_trade_history_on_start()
     
     def _init_ui(self):
         """初始化 UI - 深色主题"""
@@ -2462,6 +2466,18 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             print(f"[MainWindow] 加载API配置失败: {e}")
     
+    def _load_paper_trade_history_on_start(self):
+        """程序启动时从本地文件加载历史交易记录并显示"""
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            history_file = os.path.join(project_root, "data", "live_trade_history.json")
+            history = load_trade_history_from_file(history_file)
+            if history:
+                self.paper_trading_tab.load_historical_trades(history)
+                self.statusBar().showMessage(f"已加载 {len(history)} 条历史交易记录", 3000)
+        except Exception as e:
+            print(f"[MainWindow] 加载历史交易记录失败: {e}")
+    
     def _on_paper_api_save_requested(self, cfg: dict):
         """保存模拟交易API配置"""
         try:
@@ -2646,8 +2662,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 socks_proxy=socks_proxy,
                 on_state_update=self._on_live_state_update,
                 on_kline=self._on_live_kline,
-                on_trade_opened=self._handle_live_trade_opened,
-                on_trade_closed=self._handle_live_trade_closed,
+                on_trade_opened=self._on_live_trade_opened,
+                on_trade_closed=self._on_live_trade_closed,
                 on_error=self._handle_live_error,
             )
             
@@ -2655,10 +2671,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if success:
                 self._live_running = True
                 self.paper_trading_tab.control_panel.set_running(True)
-                self.paper_trading_tab.reset()
-                
-                # 【持久化】加载历史记录到 UI
+                # 先获取历史记录（避免 reset 清空后无数据恢复）
                 history = self._live_engine.paper_trader.order_history
+                if not history:
+                    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    history_file = os.path.join(project_root, "data", "live_trade_history.json")
+                    history = load_trade_history_from_file(history_file)
+                self.paper_trading_tab.reset()
                 if history:
                     self.paper_trading_tab.load_historical_trades(history)
                     self.paper_trading_tab.status_panel.append_event(f"成功恢复 {len(history)} 条历史交易记录")
@@ -2754,12 +2773,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 matched_sim,
                 state.fingerprint_status,
             )
+
+            # 若开仓回调未触发，兜底补记开仓记录
+            if order is not None:
+                entry_key = (
+                    getattr(order, "order_id", ""),
+                    getattr(order, "entry_time", None),
+                    getattr(order, "entry_bar_idx", None),
+                    getattr(order, "entry_price", None),
+                )
+                if getattr(self, "_last_logged_open_key", None) != entry_key:
+                    self.paper_trading_tab.trade_log.add_trade(order)
+                    self._last_logged_open_key = entry_key
             
             # 检查并显示最新事件到日志
             last_event = getattr(state, "last_event", "")
             if last_event and last_event != getattr(self, "_last_logged_event", ""):
                 self._last_logged_event = last_event
                 self.paper_trading_tab.status_panel.append_event(last_event)
+            
+            # 更新指纹轨迹叠加显示
+            self._update_fingerprint_trajectory_overlay(state)
     
     def _on_live_kline(self, kline):
         """实时K线更新"""
@@ -2801,11 +2835,237 @@ class MainWindow(QtWidgets.QMainWindow):
             if not hasattr(self, "_last_live_n") or n > self._last_live_n:
                 self._last_live_n = n
                 visible = 50
+                future_pad = 0
+                if hasattr(self.paper_trading_tab.chart_widget, "get_overlay_padding"):
+                    future_pad = self.paper_trading_tab.chart_widget.get_overlay_padding()
                 self.paper_trading_tab.chart_widget.candle_plot.setXRange(
-                    n - visible, n + 5, padding=0
+                    n - visible, n + max(5, max(0, future_pad)), padding=0
                 )
+            
+            # 【关键】实时更新 TP/SL 虚线位置（追踪止损更新后自动跟随）
+            order = self._live_engine._paper_trader.current_position
+            if order is not None:
+                tp = getattr(order, "take_profit", None)
+                sl = getattr(order, "stop_loss", None)
+                self.paper_trading_tab.chart_widget.set_tp_sl_lines(tp, sl)
+            else:
+                # 无持仓时清除虚线
+                self.paper_trading_tab.chart_widget.set_tp_sl_lines(None, None)
+                
         except Exception as e:
             print(f"[MainWindow] 更新实时图表失败: {e}")
+
+    def _reconstruct_future_prices_from_features(self, feature_rows: np.ndarray, df, steps: int = 5) -> np.ndarray:
+        """
+        用32维特征（重点使用C层空间特征）逆向还原未来价格轨迹。
+        返回长度=steps 的未来价格（不含当前点）。
+        """
+        if feature_rows is None or feature_rows.size == 0:
+            return np.array([])
+        if feature_rows.ndim != 2 or feature_rows.shape[1] < 32:
+            return np.array([])
+
+        steps = max(1, min(int(steps), len(feature_rows)))
+        f = feature_rows[:steps]
+
+        close_hist = list(df['close'].iloc[-20:].astype(float).values)
+        high_hist = list(df['high'].iloc[-20:].astype(float).values)
+        low_hist = list(df['low'].iloc[-20:].astype(float).values)
+        atr_series = df['atr'] if 'atr' in df.columns else None
+        if atr_series is not None and len(atr_series) > 0:
+            atr_vals = atr_series.iloc[-20:].astype(float).replace([np.inf, -np.inf], np.nan).dropna().values
+            atr_ref = float(np.median(atr_vals)) if len(atr_vals) > 0 else 0.0
+        else:
+            atr_ref = 0.0
+        if atr_ref <= 0:
+            atr_ref = max((max(high_hist) - min(low_hist)) / max(len(close_hist), 1), close_hist[-1] * 0.001)
+
+        out = []
+        prev = float(close_hist[-1])
+        for i in range(steps):
+            row = f[i]
+            c0 = float(np.clip(row[26], 0.0, 1.0))   # price_in_range
+            c1 = max(0.0, float(row[27]))            # dist_to_high_atr
+            c2 = max(0.0, float(row[28]))            # dist_to_low_atr
+            c4 = float(np.clip(row[30], 0.0, 1.0))   # price_vs_20high
+            c5 = float(np.clip(row[31], 0.0, 1.0))   # price_vs_20low
+
+            high_ref = max(high_hist)
+            low_ref = min(low_hist)
+            range_ref = max(high_ref - low_ref, max(prev * 0.0005, 1e-6))
+
+            # 多方程逆推候选（来源于Layer-C定义）
+            cand = []
+            cand.append(low_ref + c0 * range_ref)                       # from price_in_range
+            cand.append(high_ref - c1 * atr_ref)                        # from dist_to_high_atr
+            cand.append(low_ref + c2 * atr_ref)                         # from dist_to_low_atr
+            cand.append(high_ref - (1.0 - c4) * range_ref)              # from price_vs_20high
+            cand.append(low_ref + (1.0 - c5) * range_ref)               # from price_vs_20low
+
+            w = np.array([0.42, 0.22, 0.22, 0.07, 0.07], dtype=float)
+            price = float(np.dot(w, np.array(cand, dtype=float)))
+
+            # 平滑与限幅，防止跳点
+            max_step = max(prev * 0.01, 2.5 * atr_ref)
+            delta = np.clip(price - prev, -max_step, max_step)
+            price = prev + 0.65 * delta
+
+            out.append(price)
+            prev = price
+            close_hist.append(price)
+            high_hist.append(price)
+            low_hist.append(price)
+            if len(close_hist) > 20:
+                close_hist.pop(0)
+                high_hist.pop(0)
+                low_hist.pop(0)
+
+        return np.array(out, dtype=float)
+
+    def _update_fingerprint_trajectory_overlay(self, state):
+        """将匹配指纹的轨迹叠加到K线图上"""
+        if not self._live_engine:
+            return
+        chart = getattr(self.paper_trading_tab, "chart_widget", None)
+        if chart is None or not hasattr(chart, "set_fingerprint_trajectory"):
+            return
+        
+        df = chart.df
+        if df is None or df.empty:
+            return
+        
+        # 计算当前匹配信息
+        matched_sim = None
+        if self._live_engine.paper_trader and self._live_engine.paper_trader.current_position:
+            matched_sim = getattr(self._live_engine.paper_trader.current_position, "entry_similarity", None)
+        if matched_sim is None:
+            matched_sim = getattr(state, "best_match_similarity", 0.0)
+        
+        matched_fp = getattr(state, "best_match_template", "") or ""
+        
+        # 节流：同一bar+同一指纹不重复重算
+        current_bar_idx = int(getattr(self._live_engine, "_current_bar_idx", len(df) - 1))
+        overlay_sig = (matched_fp, current_bar_idx)
+        if getattr(self, "_last_overlay_signature", None) == overlay_sig:
+            return
+        self._last_overlay_signature = overlay_sig
+
+        template = None
+        label = ""
+        cache = getattr(self, "_overlay_template_cache", None)
+        if cache is None:
+            cache = {}
+            self._overlay_template_cache = cache
+        lookup_key = (matched_fp, getattr(state, "market_regime", ""), current_bar_idx)
+        
+        # 模板模式：直接使用当前模板
+        if not getattr(self._live_engine, "use_prototypes", False):
+            template = getattr(self._live_engine, "_current_template", None)
+            if template:
+                label = f"{template.direction} {template.fingerprint()[:8]}"
+        else:
+            # 原型模式：从原型成员指纹中选择一个模板
+            proto = getattr(self._live_engine, "_current_prototype", None)
+            if proto and getattr(proto, "member_fingerprints", None) and self.trajectory_memory:
+                for fp in proto.member_fingerprints:
+                    t = self.trajectory_memory.get_template_by_fingerprint(fp)
+                    if t is not None:
+                        template = t
+                        label = f"{proto.direction} {fp[:8]}"
+                        break
+        
+        # 回退：用匹配到的指纹去找模板
+        if template is None and matched_fp and not matched_fp.startswith("proto_") and self.trajectory_memory:
+            template = cache.get(matched_fp)
+            if template is None:
+                template = self.trajectory_memory.get_template_by_fingerprint(matched_fp)
+                if template is not None:
+                    cache[matched_fp] = template
+            if template:
+                label = f"{template.direction} {matched_fp[:8]}"
+        
+        # 回退：当前窗口轨迹匹配一次模板（用于原型指纹无法定位时）
+        # 性能保护：同一匹配键只尝试一次，避免每个tick重跑DTW
+        if template is None and self.trajectory_memory:
+            last_attempt_key = getattr(self, "_overlay_last_match_attempt_key", None)
+            if last_attempt_key == lookup_key:
+                chart.clear_fingerprint_trajectory()
+                return
+            self._overlay_last_match_attempt_key = lookup_key
+            try:
+                from config import TRAJECTORY_CONFIG
+                from core.trajectory_matcher import TrajectoryMatcher
+                
+                pre_window = TRAJECTORY_CONFIG.get("PRE_ENTRY_WINDOW", 60)
+                direction = ""
+                proto = getattr(self._live_engine, "_current_prototype", None)
+                if proto and getattr(proto, "direction", ""):
+                    direction = proto.direction
+                elif matched_fp:
+                    direction = "LONG" if "LONG" in matched_fp else ("SHORT" if "SHORT" in matched_fp else "")
+                
+                if direction:
+                    candidates = self.trajectory_memory.get_candidates(
+                        getattr(state, "market_regime", ""),
+                        direction
+                    )
+                    if not candidates:
+                        candidates = self.trajectory_memory.get_templates_by_direction(direction)
+                    
+                    fv = getattr(self._live_engine, "_fv_engine", None)
+                    current_idx = getattr(self._live_engine, "_current_bar_idx", len(df) - 1)
+                    start_idx = max(0, current_idx - pre_window + 1)
+                    if fv is not None:
+                        current_traj = fv.get_raw_matrix(start_idx, current_idx + 1)
+                        matcher = TrajectoryMatcher()
+                        result = matcher.match_entry(
+                            current_traj,
+                            candidates,
+                            cosine_threshold=self._live_engine.cosine_threshold,
+                            dtw_threshold=self._live_engine.dtw_threshold,
+                        )
+                        if result and result.best_template:
+                            template = result.best_template
+                            label = f"{direction} {template.fingerprint()[:8]}"
+                            if matched_fp:
+                                cache[matched_fp] = template
+            except Exception:
+                template = None
+        
+        if template is None:
+            chart.clear_fingerprint_trajectory()
+            return
+
+        # 仅显示“当前之后5根K线”的未来预测轨迹（由32维特征逆向还原）
+        # 关键：只用 holding 前几根（获利阶段），不用 pre_exit（离场段方向会反转）
+        if template.holding.size == 0:
+            chart.clear_fingerprint_trajectory()
+            return
+        
+        traj_future = template.holding  # 只取持仓获利阶段
+        if traj_future.ndim != 2 or traj_future.shape[1] < 32:
+            chart.clear_fingerprint_trajectory()
+            return
+
+        projected_future = self._reconstruct_future_prices_from_features(traj_future, df, steps=5)
+        if projected_future.size == 0:
+            chart.clear_fingerprint_trajectory()
+            return
+        current_price = float(df['close'].iloc[-1])
+        recent_n = min(80, len(df))
+        recent_range = float(df['high'].iloc[-recent_n:].max() - df['low'].iloc[-recent_n:].min())
+        band_base = max(current_price * 0.0008, recent_range * 0.02)
+        band_steps = np.linspace(0.35, 1.0, len(projected_future))
+        band_future = band_base * band_steps
+        # 加上当前点，总共显示 1 + 5
+        prices = np.concatenate([[current_price], projected_future], axis=0)
+        lower = np.concatenate([[current_price], projected_future - band_future], axis=0)
+        upper = np.concatenate([[current_price], projected_future + band_future], axis=0)
+        start_idx = len(df) - 1
+        chart.set_fingerprint_trajectory(
+            prices, start_idx, matched_sim or 0.0, label,
+            lower=lower, upper=upper
+        )
     
     def _on_live_trade_opened(self, order):
         """实时交易开仓回调"""
@@ -2823,17 +3083,17 @@ class MainWindow(QtWidgets.QMainWindow):
             # 添加图表标记
             side = order.side.value
             self.paper_trading_tab.add_trade_marker(
-                bar_idx=order.entry_bar_idx,
+                bar_idx=getattr(order, "entry_bar_idx", None),
                 price=order.entry_price,
                 side=side,
                 is_entry=True
             )
             
-            # 绘制止盈止损线
-            self.paper_trading_tab.update_tp_sl_lines(
-                tp_price=order.take_profit,
-                sl_price=order.stop_loss
-            )
+            # 绘制止盈止损线（sync 来的仓位可能无 TP/SL）
+            tp = getattr(order, "take_profit", None)
+            sl = getattr(order, "stop_loss", None)
+            if tp is not None or sl is not None:
+                self.paper_trading_tab.update_tp_sl_lines(tp_price=tp, sl_price=sl)
             
             # 记录事件
             fp_short = order.template_fingerprint[:12] if order.template_fingerprint else "-"
@@ -2846,6 +3106,12 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # 添加到交易记录表格（开仓时即显示，状态为持仓中）
             self.paper_trading_tab.trade_log.add_trade(order)
+            self._last_logged_open_key = (
+                getattr(order, "order_id", ""),
+                getattr(order, "entry_time", None),
+                getattr(order, "entry_bar_idx", None),
+                getattr(order, "entry_price", None),
+            )
             
             print(f"[MainWindow] 实时交易开仓: {event_msg}")
         except Exception as e:
@@ -2868,9 +3134,11 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             # 添加平仓标记
             side = order.side.value
+            exit_bar = getattr(order, "exit_bar_idx", None)
+            exit_px = getattr(order, "exit_price", None)
             self.paper_trading_tab.add_trade_marker(
-                bar_idx=order.exit_bar_idx,
-                price=order.exit_price,
+                bar_idx=exit_bar,
+                price=exit_px,
                 side=side,
                 is_entry=False
             )
@@ -2884,9 +3152,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # 记录事件
             reason = order.close_reason.value if order.close_reason else "未知"
             profit_color = "盈利" if order.profit_pct >= 0 else "亏损"
+            pnl_usdt = getattr(order, "realized_pnl", 0.0)
             event_msg = (
                 f"[平仓] {side} @ {order.exit_price:.2f} | "
-                f"{profit_color} {order.profit_pct:+.2f}% ({order.profit_usdt:+.2f} USDT) | "
+                f"{profit_color} {order.profit_pct:+.2f}% ({pnl_usdt:+.2f} USDT) | "
                 f"原因={reason} | 持仓={order.hold_bars}根K线"
             )
             self.paper_trading_tab.status_panel.append_event(event_msg)
@@ -2896,12 +3165,6 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"[MainWindow] 处理平仓失败: {e}")
             import traceback
             traceback.print_exc()
-    
-    def _on_live_error(self, msg: str):
-        """实时交易错误回调"""
-        print(f"[MainWindow] 实时交易错误: {msg}")
-        self.statusBar().showMessage(f"模拟交易错误: {msg}", 5000)
-        self.paper_trading_tab.status_panel.append_event(f"[错误] {msg}")
     
     def _get_proxy_settings(self):
         """获取代理设置"""
@@ -2917,49 +3180,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     http_proxy = proxy_text
         
         return http_proxy, socks_proxy
-    
-    def _on_live_trade_opened(self, order):
-        """开仓回调"""
-        QtCore.QMetaObject.invokeMethod(
-            self, "_handle_trade_opened",
-            QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(object, order)
-        )
-    
-    @QtCore.pyqtSlot(object)
-    def _handle_trade_opened(self, order):
-        """处理开仓（主线程）"""
-        self.statusBar().showMessage(
-            f"开仓: {order.side.value} @ {order.entry_price:.2f} | 保证金 {order.margin_used:.2f} USDT"
-        )
-        self.paper_trading_tab.status_panel.append_event(
-            f"开仓 {order.side.value} @ {order.entry_price:.2f} | 保证金 {order.margin_used:.2f} | {order.entry_reason}"
-        )
-    
-    def _on_live_trade_closed(self, order):
-        """平仓回调"""
-        QtCore.QMetaObject.invokeMethod(
-            self, "_handle_trade_closed",
-            QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(object, order)
-        )
-    
-    @QtCore.pyqtSlot(object)
-    def _handle_trade_closed(self, order):
-        """处理平仓（主线程）"""
-        # 添加到交易记录
-        self.paper_trading_tab.trade_log.add_trade(order)
-        self.paper_trading_tab.status_panel.append_event(
-            f"平仓 {order.side.value} | {order.close_reason.value if order.close_reason else '-'} | 收益 {order.profit_pct:+.2f}%"
-        )
-        
-        # 更新统计
-        if self._live_engine:
-            stats = self._live_engine.get_stats()
-            self.paper_trading_tab.status_panel.update_stats(stats)
-        
-        pnl_text = f"{order.profit_pct:+.2f}%"
-        self.statusBar().showMessage(f"平仓: {order.close_reason.value} | 收益: {pnl_text}")
     
     def _on_live_error(self, error_msg: str):
         """实时交易错误"""
@@ -3022,6 +3242,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """删除亏损模板"""
         if not self._live_engine:
             self.paper_trading_tab.status_panel.set_action_status("模拟交易未运行")
+            return
+        
+        if getattr(self._live_engine, "use_prototypes", False):
+            self.paper_trading_tab.status_panel.set_action_status("原型模式下不支持删除亏损模板")
             return
         
         losing_fps = self._live_engine.get_losing_templates()

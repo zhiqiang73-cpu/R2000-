@@ -239,6 +239,15 @@ class TrajectoryMemory:
             if direction in regime_dict:
                 templates.extend(regime_dict[direction])
         return templates
+    
+    def get_template_by_fingerprint(self, fingerprint: str) -> Optional[TrajectoryTemplate]:
+        """按指纹查找模板"""
+        if not fingerprint:
+            return None
+        for t in self.get_all_templates():
+            if t.fingerprint() == fingerprint:
+                return t
+        return None
 
     def get_regime_list(self) -> List[str]:
         """获取所有市场状态"""
