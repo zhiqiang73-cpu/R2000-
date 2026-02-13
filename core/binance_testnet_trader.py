@@ -89,6 +89,9 @@ class BinanceTestnetTrader:
         self._last_entry_side: Optional[OrderSide] = None
         self._last_entry_price: Optional[float] = None
         self._last_entry_ts: float = 0.0
+        # 交易所成交同步游标
+        self._last_user_trade_id: int = 0
+        self._last_user_trade_time_ms: int = 0
 
         self._validate_credentials()
         self._load_symbol_filters()
@@ -141,6 +144,95 @@ class BinanceTestnetTrader:
                 r.raise_for_status()
         
         return r.json()
+
+    @staticmethod
+    def _trade_side(trade: dict) -> Optional[str]:
+        """兼容返回结构，提取成交方向 BUY/SELL"""
+        if "side" in trade:
+            return str(trade.get("side", "")).upper()
+        if "buyer" in trade:
+            return "BUY" if trade.get("buyer") else "SELL"
+        return None
+
+    @staticmethod
+    def _to_float(val, default: float = 0.0) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return default
+
+    def _get_user_trades(self, start_time_ms: Optional[int] = None,
+                         limit: int = 200, order_id: Optional[int] = None) -> List[dict]:
+        """拉取成交明细（真实撮合）"""
+        params = {"symbol": self.symbol, "limit": limit}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if order_id is not None:
+            params["orderId"] = int(order_id)
+        try:
+            return self._signed_request("GET", "/fapi/v1/userTrades", params)
+        except Exception:
+            # 兼容部分测试网不支持 orderId 的情况
+            if order_id is not None:
+                params.pop("orderId", None)
+                return self._signed_request("GET", "/fapi/v1/userTrades", params)
+            return []
+
+    def _aggregate_trades(self, trades: List[dict], entry_side: str) -> Dict[str, float]:
+        """聚合成交（真实成交均价 / 手续费 / 已实现盈亏）"""
+        if not trades:
+            return {"exit_price": 0.0, "exit_fee": 0.0, "entry_fee": 0.0,
+                    "realized_pnl": 0.0, "last_time_ms": 0}
+
+        entry_side = entry_side.upper()
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+
+        entry_trades = []
+        exit_trades = []
+        realized_pnl = 0.0
+        entry_fee = 0.0
+        exit_fee = 0.0
+        last_time_ms = 0
+
+        for t in trades:
+            side = self._trade_side(t) or ""
+            qty = self._to_float(t.get("qty", t.get("executedQty", 0.0)))
+            price = self._to_float(t.get("price", 0.0))
+            commission = self._to_float(t.get("commission", 0.0))
+            pnl = self._to_float(t.get("realizedPnl", 0.0))
+            trade_time = int(t.get("time", 0) or 0)
+            if trade_time > last_time_ms:
+                last_time_ms = trade_time
+
+            if side == entry_side:
+                entry_trades.append((price, qty))
+                entry_fee += commission
+            elif side == exit_side:
+                exit_trades.append((price, qty))
+                exit_fee += commission
+            # realizedPnl 通常只在减仓/平仓产生
+            realized_pnl += pnl
+
+        def _weighted_avg(rows: List[tuple]) -> float:
+            total_qty = sum(q for _, q in rows)
+            if total_qty <= 1e-12:
+                return 0.0
+            return sum(p * q for p, q in rows) / total_qty
+
+        exit_price = _weighted_avg(exit_trades)
+        if exit_price <= 0.0:
+            # 若无法区分方向，退化为所有成交均价
+            exit_price = _weighted_avg([(self._to_float(t.get("price", 0.0)),
+                                         self._to_float(t.get("qty", t.get("executedQty", 0.0))))
+                                        for t in trades])
+
+        return {
+            "exit_price": exit_price,
+            "exit_fee": exit_fee,
+            "entry_fee": entry_fee,
+            "realized_pnl": realized_pnl,
+            "last_time_ms": last_time_ms,
+        }
 
     def _public_get(self, path: str, params: Optional[dict] = None) -> dict:
         url = f"{self.base_url}{path}"
@@ -329,26 +421,33 @@ class BinanceTestnetTrader:
             prev_pos = self.current_position
             self.current_position = None
             if prev_pos is not None and prev_pos.status != OrderStatus.CLOSED:
-                mark = 0.0
-                if pos:
-                    mark = float(pos.get("markPrice", 0.0))
-                if mark <= 0:
-                    try:
-                        mark = float(self._get_mark_price())
-                    except Exception:
-                        mark = 0.0
-                exit_price = mark if mark > 0 else prev_pos.entry_price
-                
-                # 【修复】根据平仓价格推断真正的平仓原因，而不是硬编码为"手动"
+                # 使用真实成交记录计算盈亏与费用
+                entry_time_ms = int(prev_pos.entry_time.timestamp() * 1000) - 1000
+                entry_side = "BUY" if prev_pos.side == OrderSide.LONG else "SELL"
+                trades = self._get_user_trades(start_time_ms=entry_time_ms)
+                agg = self._aggregate_trades(trades, entry_side=entry_side)
+
+                exit_price = agg["exit_price"] or prev_pos.entry_price
+                exit_fee = agg["exit_fee"]
+                entry_fee = prev_pos.total_fee or agg["entry_fee"]
+                realized_pnl = agg["realized_pnl"]
+                net_pnl = realized_pnl - exit_fee - entry_fee
+                exit_time = datetime.fromtimestamp(agg["last_time_ms"] / 1000) if agg["last_time_ms"] > 0 else datetime.now()
+
+                # 根据平仓价格推断真正的平仓原因
                 close_reason = self._infer_close_reason(prev_pos, exit_price)
-                
-                prev_pos.close(
-                    exit_price=exit_price,
-                    exit_time=datetime.now(),
-                    exit_bar_idx=self.current_bar_idx,
-                    reason=close_reason,
-                    leverage=self.leverage,
-                )
+
+                prev_pos.status = OrderStatus.CLOSED
+                prev_pos.exit_price = exit_price
+                prev_pos.exit_time = exit_time
+                prev_pos.exit_bar_idx = self.current_bar_idx
+                prev_pos.close_reason = close_reason
+                prev_pos.realized_pnl = net_pnl
+                prev_pos.unrealized_pnl = 0.0
+                margin_used = prev_pos.margin_used if prev_pos.margin_used > 0 else 1.0
+                prev_pos.profit_pct = (net_pnl / margin_used) * 100.0
+                prev_pos.total_fee = entry_fee + exit_fee
+
                 self.order_history.append(prev_pos)
                 # 持久化：防止停止程序时丢记录
                 self.save_history(self.history_file)
@@ -450,8 +549,8 @@ class BinanceTestnetTrader:
     def has_position(self) -> bool:
         return self.current_position is not None
 
-    def has_pending_stop_orders(self) -> bool:
-        """检查是否有活跃的入场挂单"""
+    def has_pending_stop_orders(self, current_bar_idx: int = None) -> bool:
+        """检查是否有活跃的入场挂单（current_bar_idx仅用于兼容接口）"""
         try:
             # 获取所有挂单
             open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
@@ -646,6 +745,15 @@ class BinanceTestnetTrader:
         avg_price = float(resp.get("avgPrice", 0.0)) or float(resp.get("price", 0.0)) or price
         margin_used = (executed_qty * avg_price) / max(float(self.leverage), 1.0)
         self.current_bar_idx = bar_idx
+        # 真实成交手续费（入场）
+        entry_fee = 0.0
+        try:
+            order_id = int(resp.get("orderId", 0) or 0)
+            if order_id > 0:
+                entry_trades = self._get_user_trades(order_id=order_id)
+                entry_fee = sum(self._to_float(t.get("commission", 0.0)) for t in entry_trades)
+        except Exception:
+            entry_fee = 0.0
 
         order = PaperOrder(
             order_id=str(resp.get("orderId", self._new_client_order_id("ENTRY_LOCAL"))),
@@ -663,6 +771,7 @@ class BinanceTestnetTrader:
             entry_similarity=entry_similarity,
             entry_reason=entry_reason,
             peak_price=avg_price,  # 初始峰值 = 入场价
+            total_fee=entry_fee,
         )
         # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
         self._last_entry_tp = take_profit
@@ -765,11 +874,26 @@ class BinanceTestnetTrader:
             self._pending_close = (price, bar_idx, reason)
             return None
 
-        pnl = (exit_price - order.entry_price) * closed_qty if order.side == OrderSide.LONG else (order.entry_price - exit_price) * closed_qty
-        fee = (order.entry_price * closed_qty + exit_price * closed_qty) * self.fee_rate
-        net_pnl = pnl - fee
+        # ===== 使用真实撮合成交计算盈亏/手续费 =====
+        order_id = int(resp.get("orderId", 0) or 0)
+        entry_time_ms = int(order.entry_time.timestamp() * 1000) - 1000
+        entry_side = "BUY" if order.side == OrderSide.LONG else "SELL"
+        trades = []
+        if order_id > 0:
+            trades = self._get_user_trades(order_id=order_id, start_time_ms=entry_time_ms)
+        if not trades:
+            trades = self._get_user_trades(start_time_ms=entry_time_ms)
+        agg = self._aggregate_trades(trades, entry_side=entry_side)
+        exit_price = agg["exit_price"] or exit_price
+        exit_fee = agg["exit_fee"]
+        entry_fee = order.total_fee or agg["entry_fee"]
+        realized_pnl = agg["realized_pnl"]
+        # 交易所 realizedPnl 通常不含手续费，按净值计算
+        net_pnl = realized_pnl - exit_fee - entry_fee
         margin_portion = order.margin_used * (closed_qty / max(original_qty, 1e-12))
         pnl_pct = (net_pnl / max(margin_portion, 1e-9)) * 100.0
+        exit_time = datetime.fromtimestamp(agg["last_time_ms"] / 1000) if agg["last_time_ms"] > 0 else datetime.now()
+        total_fee = entry_fee + exit_fee
 
         closed_order = replace(
             order,
@@ -777,14 +901,14 @@ class BinanceTestnetTrader:
             margin_used=margin_portion,
             status=OrderStatus.CLOSED,
             exit_price=exit_price,
-            exit_time=datetime.now(),
+            exit_time=exit_time,
             exit_bar_idx=bar_idx,
             close_reason=reason,
             realized_pnl=net_pnl,
             unrealized_pnl=0.0,
             profit_pct=pnl_pct,
             hold_bars=max(0, bar_idx - order.entry_bar_idx),
-            total_fee=fee,
+            total_fee=total_fee,
         )
 
         self.order_history.append(closed_order)
