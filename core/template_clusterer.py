@@ -75,6 +75,10 @@ class Prototype:
     # 形状: (window_size, 32)，用于DTW距离计算
     representative_pre_entry: np.ndarray = field(default_factory=lambda: np.array([]))
     
+    # 【概率扇形图】成员交易的收益率和持仓时长分布
+    # 列表 of (profit_pct, hold_bars)，用于构建真实价格路径的概率分布
+    member_trade_stats: List[tuple] = field(default_factory=list)
+    
     def __post_init__(self):
         """初始化时预计算展平向量"""
         if self.pre_entry_centroid.size > 0 and self.pre_entry_flat.size == 0:
@@ -113,6 +117,8 @@ class Prototype:
             "wf_win_rate": self.wf_win_rate,
             # DTW 代表序列
             "representative_pre_entry": self.representative_pre_entry.tolist() if self.representative_pre_entry.size > 0 else [],
+            # 概率扇形图数据
+            "member_trade_stats": self.member_trade_stats,
         }
     
     @classmethod
@@ -139,6 +145,8 @@ class Prototype:
             wf_win_rate=d.get("wf_win_rate", 0.0),
             # DTW 代表序列（兼容旧版本）
             representative_pre_entry=np.array(d.get("representative_pre_entry", [])),
+            # 概率扇形图数据（兼容旧版本）
+            member_trade_stats=d.get("member_trade_stats", []),
         )
         return proto
 
@@ -160,12 +168,30 @@ class PrototypeLibrary:
     def total_count(self) -> int:
         return len(self.long_prototypes) + len(self.short_prototypes)
     
+    @staticmethod
+    def _regime_direction_matches(proto: Prototype) -> bool:
+        """
+        严格剔除“方向-状态”反向的原型：
+        - LONG 只能出现在偏多状态
+        - SHORT 只能出现在偏空状态
+        - 空/未知状态不做限制（交由上层处理）
+        """
+        if not proto.regime:
+            return True
+        bull_regimes = {"强多头", "弱多头", "震荡偏多", "Strong Bull", "Weak Bull", "Range Bull"}
+        bear_regimes = {"强空头", "弱空头", "震荡偏空", "Strong Bear", "Weak Bear", "Range Bear"}
+        if proto.direction == "LONG":
+            return proto.regime in bull_regimes
+        if proto.direction == "SHORT":
+            return proto.regime in bear_regimes
+        return True
+
     def get_prototypes_by_direction(self, direction: str) -> List[Prototype]:
         """获取指定方向的原型"""
         if direction == "LONG":
-            return self.long_prototypes
+            return [p for p in self.long_prototypes if self._regime_direction_matches(p)]
         elif direction == "SHORT":
-            return self.short_prototypes
+            return [p for p in self.short_prototypes if self._regime_direction_matches(p)]
         else:
             return []
     
@@ -181,7 +207,7 @@ class PrototypeLibrary:
             匹配的原型列表
         """
         prototypes = self.get_prototypes_by_direction(direction)
-        return [p for p in prototypes if p.regime == regime]
+        return [p for p in prototypes if p.regime == regime and self._regime_direction_matches(p)]
     
     def get_available_regimes(self) -> List[str]:
         """获取原型库中存在的所有市场状态"""
@@ -657,6 +683,12 @@ class TemplateClusterer:
             win_rate = win_count / member_count if member_count > 0 else 0.0
             avg_hold = np.mean(hold_bars) if hold_bars else 0.0
             
+            # 【概率扇形图】收集每个成员的 (收益率, 持仓K线数)
+            member_trade_stats = [
+                (float(t.profit_pct), int(t.holding.shape[0]) if t.holding.size > 0 else 0)
+                for t in cluster_templates
+            ]
+            
             # 收集成员指纹
             member_fps = [t.fingerprint() for t in cluster_templates]
             
@@ -676,6 +708,7 @@ class TemplateClusterer:
                 avg_hold_bars=avg_hold,
                 member_fingerprints=member_fps,
                 representative_pre_entry=representative_pre_entry,  # DTW 代表序列
+                member_trade_stats=member_trade_stats,  # 概率扇形图数据
             )
             
             prototypes.append(prototype)
@@ -1012,9 +1045,8 @@ class PrototypeMatcher:
             return self._empty_result()
         current_unit = current_vec / c_norm
         
-        # 【关键修复】Regime-Direction 强制约束
-        # 多头市场（强多头/弱多头/震荡偏多）→ 只允许做 LONG
-        # 空头市场（强空头/弱空头/震荡偏空）→ 只允许做 SHORT
+        # Regime-Direction 严格约束：任何偏多/偏空状态只允许对应方向
+        # 这样避免“震荡偏空却匹配上涨原型”的混乱情况
         BULL_REGIMES = {"强多头", "弱多头", "震荡偏多", "Strong Bull", "Weak Bull", "Range Bull"}
         BEAR_REGIMES = {"强空头", "弱空头", "震荡偏空", "Strong Bear", "Weak Bear", "Range Bear"}
         
@@ -1031,12 +1063,12 @@ class PrototypeMatcher:
             long_matches = self._match_direction_vectorized(current_unit, "LONG")
             short_matches = self._match_direction_vectorized(current_unit, "SHORT")
         else:
-            # 根据 regime 强制限定方向
+            # 严格按 regime 方向过滤：不允许反向原型
             if allowed_direction == "LONG":
                 long_matches = self._match_direction(current_vec, "LONG", regime)
-                short_matches = []  # 多头市场不匹配 SHORT
+                short_matches = []
             elif allowed_direction == "SHORT":
-                long_matches = []   # 空头市场不匹配 LONG
+                long_matches = []
                 short_matches = self._match_direction(current_vec, "SHORT", regime)
             else:
                 # 未知 regime 类型，保持双向匹配
@@ -1050,72 +1082,63 @@ class PrototypeMatcher:
         
         # 确定方向
         if direction is not None:
+            # 如果 regime 已明确方向，则禁止反向匹配
+            if allowed_direction and direction != allowed_direction:
+                return self._empty_result()
             # 指定方向
             matches = long_matches if direction == "LONG" else short_matches
             votes = vote_long if direction == "LONG" else vote_short
         else:
-            # 双向选择投票多的
-            if vote_long > vote_short:
+            # regime 已限定方向时，强制选择对应方向
+            if allowed_direction == "LONG":
                 direction = "LONG"
                 matches = long_matches
                 votes = vote_long
-            elif vote_short > vote_long:
+            elif allowed_direction == "SHORT":
                 direction = "SHORT"
                 matches = short_matches
                 votes = vote_short
             else:
-                # 平局，看最高相似度
-                if long_matches and short_matches:
-                    if long_matches[0][1] >= short_matches[0][1]:
-                        direction = "LONG"
-                        matches = long_matches
-                        votes = vote_long
-                    else:
-                        direction = "SHORT"
-                        matches = short_matches
-                        votes = vote_short
-                elif long_matches:
+                # 双向选择投票多的
+                if vote_long > vote_short:
                     direction = "LONG"
                     matches = long_matches
                     votes = vote_long
-                elif short_matches:
+                elif vote_short > vote_long:
                     direction = "SHORT"
                     matches = short_matches
                     votes = vote_short
                 else:
-                    return self._empty_result()
+                    # 平局，看最高相似度
+                    if long_matches and short_matches:
+                        if long_matches[0][1] >= short_matches[0][1]:
+                            direction = "LONG"
+                            matches = long_matches
+                            votes = vote_long
+                        else:
+                            direction = "SHORT"
+                            matches = short_matches
+                            votes = vote_short
+                    elif long_matches:
+                        direction = "LONG"
+                        matches = long_matches
+                        votes = vote_long
+                    elif short_matches:
+                        direction = "SHORT"
+                        matches = short_matches
+                        votes = vote_short
+                    else:
+                        return self._empty_result()
         
         if not matches:
             return self._empty_result()
         
-        # ══════════════════════════════════════════════════════════
-        # 【DTW 二次过滤】对余弦 Top-K 候选进行路径相似度验证
-        # ══════════════════════════════════════════════════════════
-        dtw_filtered = self._dtw_filter_candidates(current_window, matches)
-        
-        if dtw_filtered:
-            # 使用DTW过滤后的结果
-            best_proto, best_cosine, best_dtw_sim, best_combined = dtw_filtered[0]
-            
-            # 检查是否满足匹配条件（综合考虑余弦和DTW）
-            # 条件：余弦达标 AND 投票数达标 AND DTW距离在阈值内
-            dtw_passed = (1.0 - best_dtw_sim) <= self.dtw_threshold
-            matched = (best_cosine >= self.cosine_threshold and 
-                       votes >= self.min_prototypes_agree and
-                       dtw_passed)
-            
-            # 构建带DTW信息的top_matches
-            top_matches_with_dtw = [
-                (p, cosine, dtw_s, comb) for p, cosine, dtw_s, comb in dtw_filtered[:5]
-            ]
-        else:
-            # 回退到纯余弦结果
-            best_proto, best_cosine = matches[0]
-            best_dtw_sim = 0.0
-            best_combined = best_cosine
-            matched = (best_cosine >= self.cosine_threshold and 
-                       votes >= self.min_prototypes_agree)
-            top_matches_with_dtw = [(p, sim, 0.0, sim) for p, sim in matches[:5]]
+        # 仅使用余弦相似度进行入场匹配（已移除DTW门槛）
+        best_proto, best_cosine = matches[0]
+        best_dtw_sim = 0.0
+        best_combined = best_cosine
+        matched = (best_cosine >= self.cosine_threshold)
+        top_matches_with_dtw = [(p, sim, 0.0, sim) for p, sim in matches[:5]]
         
         vote_ratio = vote_long / total_votes if total_votes > 0 else 0.5
         
@@ -1123,7 +1146,7 @@ class PrototypeMatcher:
             "matched": matched,
             "direction": direction,
             "best_prototype": best_proto,
-            "similarity": best_combined,  # 综合分作为主相似度
+            "similarity": best_combined,  # 当前等于余弦相似度
             "cosine_similarity": best_cosine,  # 余弦相似度（用于显示）
             "dtw_similarity": best_dtw_sim,    # DTW相似度（用于显示）
             "vote_long": vote_long,

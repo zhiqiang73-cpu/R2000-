@@ -141,7 +141,7 @@ VECTOR_SPACE_CONFIG = {
     "LOST_THRESHOLD": 20.0,      # 迷失信号阈值 (%) - entry和exit都低于此值
     "EXIT_CONFIRM_BARS": 3,      # 出场信号需连续确认的K线数
     "PRECISION": 3,              # 坐标精度（小数位）
-    "ENTRY_CONFIRM_PCT": 0.0001, # 入场价格确认比例 (0.01%)
+    "ENTRY_CONFIRM_PCT": 0.0002, # 入场价格确认比例 (0.02%)，优化Maker成交概率
     "TRIGGER_TIMEOUT_BARS": 5,   # 信号触发超时（K线数）
     # GA权重搜索范围
     "WEIGHT_MIN": -10.0,
@@ -284,6 +284,15 @@ PAPER_TRADING_CONFIG = {
     "HOLD_ALERT_THRESHOLD": 0.5,
     "HOLD_DERAIL_THRESHOLD": 0.3,
     "HOLD_CHECK_INTERVAL": 3,
+
+    # 实时决策频率（秒）
+    "REALTIME_DECISION_SEC": 0.05,
+    # 是否允许在未收线K线中进行入场决策
+    "REALTIME_ENTRY_ENABLED": True,
+    # REST轮询频率（秒，过高可能被限流）
+    "REALTIME_REST_POLL_SEC": 0.05,
+    # UI刷新频率（毫秒）
+    "REALTIME_UI_REFRESH_MS": 50,
     
     # 数据目录
     "HISTORY_DIR": "data/paper_trading",

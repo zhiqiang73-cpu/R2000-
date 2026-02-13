@@ -832,6 +832,9 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
 class PaperTradingTradeLog(QtWidgets.QWidget):
     """模拟交易记录表格"""
     
+    # 定义信号
+    delete_trade_signal = QtCore.pyqtSignal(object)  # 删除交易记录信号
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self._init_ui()
@@ -855,7 +858,7 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         self.table = QtWidgets.QTableWidget()
         self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
-            "时间", "方向", "入场价", "出场价", "止盈", "止损", "盈亏%", "盈亏(USDT)", "手续费", "原因", "模板", "相似度", "持仓"
+            "时间", "方向", "入场价", "出场价", "止盈", "止损", "盈亏%", "盈亏(USDT)", "手续费", "原因", "相似度", "持仓", "操作"
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
@@ -995,15 +998,65 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         reason = order.close_reason.value if order.close_reason else "-"
         self.table.setItem(row, 9, QtWidgets.QTableWidgetItem(reason))
         
-        # 模板
-        template = order.template_fingerprint[:8] if order.template_fingerprint else "-"
-        self.table.setItem(row, 10, QtWidgets.QTableWidgetItem(template))
+        # 相似度（从第11列移到第10列）
+        self.table.setItem(row, 10, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
         
-        # 相似度
-        self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
+        # 持仓时长（从第12列移到第11列）
+        self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
         
-        # 持仓时长
-        self.table.setItem(row, 12, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
+        # 操作按钮（第12列）
+        delete_btn = QtWidgets.QPushButton("删除")
+        delete_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                border: none;
+                border-radius: 3px;
+                padding: 3px 8px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #b71c1c;
+            }
+            QPushButton:pressed {
+                background-color: #8b0000;
+            }
+        """)
+        delete_btn.clicked.connect(lambda checked=False, o=order: self._on_delete_clicked(o))
+        self.table.setCellWidget(row, 12, delete_btn)
+    
+    def _on_delete_clicked(self, order):
+        """删除按钮点击事件"""
+        # 确认对话框
+        reply = QtWidgets.QMessageBox.question(
+            self.table,
+            "确认删除",
+            f"确定要删除此交易记录吗？\n\n"
+            f"时间: {order.entry_time.strftime('%m-%d %H:%M') if order.entry_time else '-'}\n"
+            f"方向: {order.side.value}\n"
+            f"入场价: {order.entry_price:.2f}",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        
+        # 从表格中删除
+        key = self._trade_key(order)
+        if key in self._rows_by_key:
+            row = self._rows_by_key[key]
+            self.table.removeRow(row)
+            del self._rows_by_key[key]
+            
+            # 更新后续行的索引映射
+            for k, v in list(self._rows_by_key.items()):
+                if v > row:
+                    self._rows_by_key[k] = v - 1
+        
+        self._update_empty_state()
+        
+        # 触发删除信号，让主窗口处理数据持久化
+        self.delete_trade_signal.emit(order)
     
     def clear(self):
         """清空表格"""
@@ -1097,7 +1150,8 @@ class PaperTradingTab(QtWidgets.QWidget):
         })
         self.control_panel.update_position_direction("-")
     
-    def add_trade_marker(self, bar_idx: int, price: float, side: str, is_entry: bool = True):
+    def add_trade_marker(self, bar_idx: int, price: float, side: str,
+                         is_entry: bool = True, close_reason: str = None):
         """
         在图表上添加交易标记
         
@@ -1106,13 +1160,25 @@ class PaperTradingTab(QtWidgets.QWidget):
             price: 价格
             side: 方向（LONG/SHORT）
             is_entry: True=入场，False=离场
+            close_reason: 平仓原因字符串（止盈/止损/脱轨/超时/信号/手动）
         """
         if bar_idx is None or price is None:
             return
-        if side == "LONG":
-            signal_type = 1 if is_entry else 2
-        else:  # SHORT
-            signal_type = -1 if is_entry else -2
+        
+        if is_entry:
+            signal_type = 1 if side == "LONG" else -1
+        else:
+            # 根据 close_reason 映射到不同标记类型
+            # 5=保本, 6=部分止盈, 7=脱轨, 8=信号离场, 9=超时, 2/-2=普通EXIT
+            reason_map = {
+                "保本": 5,      # 追踪止损保本触发
+                "止盈": 6,      # 止盈
+                "脱轨": 7,      # 相似度脱轨
+                "信号": 8,      # 信号离场
+                "超时": 9,      # 超过最大持仓
+                "止损": 10,     # 止损
+            }
+            signal_type = reason_map.get(close_reason, 2 if side == "LONG" else -2)
         
         self.chart_widget.signal_marker.add_signal(bar_idx, price, signal_type)
     
@@ -1126,3 +1192,13 @@ class PaperTradingTab(QtWidgets.QWidget):
         """
         # 直接调用新的 InfiniteLine 接口
         self.chart_widget.set_tp_sl_lines(tp_price, sl_price)
+
+    def update_position_marker(self, order, bar_idx: int = None, price: float = None):
+        """
+        更新当前持仓标记（单点，随K线移动）
+        """
+        if order is None:
+            self.chart_widget.set_current_position_marker()
+            return
+        side = order.side.value
+        self.chart_widget.set_current_position_marker(bar_idx, price, side)

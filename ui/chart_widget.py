@@ -220,12 +220,21 @@ class SignalMarker(pg.ScatterPlotItem):
     def _build_items(self, points, signal_type):
         return [self._build_item(x, y, signal_type) for x, y in points]
 
+    # 信号类型常量
+    #  1 = LONG入场,   -1 = SHORT入场
+    #  2 = LONG离场,   -2 = SHORT离场   (翻转/普通EXIT)
+    #  3 = TP,          4 = SL
+    #  5 = 保本平仓,    6 = 止盈,   7 = 脱轨,  8 = 信号离场,  9 = 超时,  10 = 止损
+
     def _build_item(self, x, y, signal_type):
+        # 默认形状：▲/▼
         symbol = 't1' if signal_type in (1, 2) else 't'
-        if signal_type == 3:
-            symbol = 'o'
-        if signal_type == 4:
-            symbol = 's'
+        if signal_type in (3, 5, 6):
+            symbol = 'o'   # 圆形
+        if signal_type in (4, 7, 10):
+            symbol = 's'   # 方形
+        if signal_type in (8, 9):
+            symbol = 'd'   # 菱形
 
         color = ""
         label = ""
@@ -233,14 +242,11 @@ class SignalMarker(pg.ScatterPlotItem):
         if signal_type == 1:
             color = self.long_entry_color
             label = "LONG"
-        elif signal_type == 2:
-            color = self.long_exit_color
-            label = "EXIT"
         elif signal_type == -1:
             color = self.short_entry_color
             label = "SHORT"
-        elif signal_type == -2:
-            color = self.short_exit_color
+        elif signal_type in (2, -2):
+            color = self.long_exit_color if signal_type == 2 else self.short_exit_color
             label = "EXIT"
         elif signal_type == 3:
             color = UI_CONFIG["CHART_TAKE_PROFIT_COLOR"]
@@ -248,6 +254,24 @@ class SignalMarker(pg.ScatterPlotItem):
         elif signal_type == 4:
             color = UI_CONFIG["CHART_STOP_LOSS_COLOR"]
             label = "SL"
+        elif signal_type == 5:
+            color = "#FFD700"  # 金色 — 保本
+            label = "保本"
+        elif signal_type == 6:
+            color = "#00E676"  # 亮绿 — 止盈
+            label = "止盈"
+        elif signal_type == 7:
+            color = "#FF5252"  # 红色 — 脱轨
+            label = "脱轨"
+        elif signal_type == 8:
+            color = "#FF9800"  # 橙色 — 信号离场
+            label = "信号离场"
+        elif signal_type == 9:
+            color = "#9E9E9E"  # 灰色 — 超时
+            label = "超时"
+        elif signal_type == 10:
+            color = "#F44336"  # 深红 — 止损
+            label = "止损"
 
         return {
             'pos': (x, y),
@@ -291,14 +315,19 @@ class SignalMarker(pg.ScatterPlotItem):
 
             # 根据信号类型决定标签是在上方还是下方
             # 标记点 (x, y) 已经是精确的 High (SHORT) 或 Low (LONG)
-            is_above = "SHORT" in label or (label == "EXIT" and item['symbol'] == 't')
+            is_above = "SHORT" in label or item['symbol'] == 't'
             offset_y = 10 if is_above else -24
             
             painter.save()
             painter.resetTransform()
             
+            # 动态计算标签宽度
+            fm = QtGui.QFontMetrics(painter.font())
+            text_w = fm.horizontalAdvance(label) + 8
+            half_w = text_w / 2
+            
             # 绘制圆角标签背景
-            rect = QtCore.QRectF(float(wp.x() - 18), float(wp.y() + offset_y), 36, 14)
+            rect = QtCore.QRectF(float(wp.x() - half_w), float(wp.y() + offset_y), text_w, 14)
             painter.drawRoundedRect(rect, 2, 2)
             
             # 绘制文字
@@ -384,6 +413,11 @@ class ChartWidget(QtWidgets.QWidget):
         self.signal_marker = SignalMarker()
         self.candle_plot.addItem(self.signal_marker)
         self.signal_marker.setZValue(20)
+
+        # 当前持仓标记（单点，实时更新）
+        self.position_marker = pg.ScatterPlotItem(pxMode=True)
+        self.candle_plot.addItem(self.position_marker)
+        self.position_marker.setZValue(21)
         
         # 成交量图区域
         self.volume_plot = self.graphics_layout.addPlot(row=1, col=0)
@@ -486,22 +520,29 @@ class ChartWidget(QtWidgets.QWidget):
         
         self._overlay_future_padding = 0
         
+        # 概率扇形图数据（供偏离检测使用）
+        self._fan_median = None
+        self._fan_p25 = None
+        self._fan_p75 = None
+        self._fan_start_idx = 0
+        
         # 【重要改动】TP / SL 水平虚线（InfiniteLine）- 延伸整个可视区域
         # 使用虚线样式 + 标签，清晰显示止盈止损位置
-        tp_color = UI_CONFIG["CHART_TAKE_PROFIT_COLOR"]
-        sl_color = UI_CONFIG["CHART_STOP_LOSS_COLOR"]
+        # 使用高对比固定色，避免与黄色概率扇形混淆
+        tp_color = "#00E676"  # TP: 亮绿
+        sl_color = "#FF1744"  # SL: 亮红
         
         self.tp_line = pg.InfiniteLine(
             angle=0, movable=False,
-            pen=pg.mkPen(tp_color, width=1.2, style=QtCore.Qt.PenStyle.DashLine),
-            label='TP: {value:.2f}',
-            labelOpts={'position': 0.95, 'color': tp_color, 'fill': (30, 30, 30, 200), 'movable': False}
+            pen=pg.mkPen(tp_color, width=2.0, style=QtCore.Qt.PenStyle.DashLine),
+            label='TP ↑ {value:.2f}',
+            labelOpts={'position': 0.92, 'color': tp_color, 'fill': (18, 28, 18, 220), 'movable': False}
         )
         self.sl_line = pg.InfiniteLine(
             angle=0, movable=False,
-            pen=pg.mkPen(sl_color, width=1.2, style=QtCore.Qt.PenStyle.DashLine),
-            label='SL: {value:.2f}',
-            labelOpts={'position': 0.95, 'color': sl_color, 'fill': (30, 30, 30, 200), 'movable': False}
+            pen=pg.mkPen(sl_color, width=2.0, style=QtCore.Qt.PenStyle.DashLine),
+            label='SL ↓ {value:.2f}',
+            labelOpts={'position': 0.78, 'color': sl_color, 'fill': (36, 12, 12, 220), 'movable': False}
         )
         
         self.tp_line.setVisible(False)
@@ -631,6 +672,20 @@ class ChartWidget(QtWidgets.QWidget):
         df_visible = self.df.iloc[display_start:display_end]
         actual_min = df_visible['low'].min()
         actual_max = df_visible['high'].max()
+
+        # 将TP/SL虚线纳入缩放范围，确保可见
+        try:
+            if hasattr(self, "tp_line") and self.tp_line.isVisible():
+                tp_val = float(self.tp_line.value())
+                actual_min = min(actual_min, tp_val)
+                actual_max = max(actual_max, tp_val)
+            if hasattr(self, "sl_line") and self.sl_line.isVisible():
+                sl_val = float(self.sl_line.value())
+                actual_min = min(actual_min, sl_val)
+                actual_max = max(actual_max, sl_val)
+        except Exception:
+            # 安全兜底，避免缩放异常影响主渲染
+            pass
         
         # 基础边距 (2%)
         padding = (actual_max - actual_min) * 0.1
@@ -821,6 +876,25 @@ class ChartWidget(QtWidgets.QWidget):
             if tp_price is not None and sp_price is not None:
                 self._set_tp_sp(tp_price, sp_price)
 
+    def set_current_position_marker(self, idx: int = None, price: float = None, side: str = None):
+        """
+        设置当前持仓标记（单点），用于显示“正在持仓”的位置。
+        """
+        if idx is None or price is None or side is None:
+            self.position_marker.setData([])
+            return
+
+        color = UI_CONFIG["CHART_LONG_ENTRY_COLOR"] if side == "LONG" else UI_CONFIG["CHART_SHORT_ENTRY_COLOR"]
+        spot = {
+            "pos": (idx, price),
+            "size": 12,
+            "symbol": "o",
+            "brush": pg.mkBrush(color),
+            "pen": pg.mkPen(color, width=1.2),
+            "data": "HOLD",
+        }
+        self.position_marker.setData([spot])
+
     def set_tp_sl_lines(self, tp_price: float = None, sl_price: float = None):
         """
         设置/更新止盈止损虚线位置
@@ -829,17 +903,66 @@ class ChartWidget(QtWidgets.QWidget):
             tp_price: 止盈价格，None则隐藏
             sl_price: 止损价格，None则隐藏
         """
+        changed = False
         if tp_price is not None:
             self.tp_line.setValue(tp_price)
-            self.tp_line.setVisible(True)
+            # 强制刷新标签文本，避免部分环境下显示为 1.00/0.00
+            try:
+                self.tp_line.label.setFormat(f"TP ↑ {float(tp_price):.2f}")
+            except Exception:
+                pass
+            if not self.tp_line.isVisible():
+                self.tp_line.setVisible(True)
+                changed = True
         else:
-            self.tp_line.setVisible(False)
+            if self.tp_line.isVisible():
+                self.tp_line.setVisible(False)
         
         if sl_price is not None:
             self.sl_line.setValue(sl_price)
-            self.sl_line.setVisible(True)
+            # 强制刷新标签文本，避免部分环境下显示为 1.00/0.00
+            try:
+                self.sl_line.label.setFormat(f"SL ↓ {float(sl_price):.2f}")
+            except Exception:
+                pass
+            if not self.sl_line.isVisible():
+                self.sl_line.setVisible(True)
+                changed = True
         else:
-            self.sl_line.setVisible(False)
+            if self.sl_line.isVisible():
+                self.sl_line.setVisible(False)
+        
+        # TP/SL变化后强制重新缩放Y轴，确保虚线在可见范围内
+        if changed and (tp_price is not None or sl_price is not None):
+            self._force_rescale_for_tp_sl()
+    
+    def _force_rescale_for_tp_sl(self):
+        """TP/SL线出现时，强制调整Y轴确保其可见"""
+        if self.df is None or self.df.empty:
+            return
+        try:
+            view_box = self.candle_plot.getViewBox()
+            x_range = view_box.viewRange()[0]
+            display_start = max(0, int(x_range[0]))
+            display_end = min(len(self.df), int(x_range[1]) + 1)
+            if display_end <= display_start:
+                return
+            df_visible = self.df.iloc[display_start:display_end]
+            y_min = float(df_visible['low'].min())
+            y_max = float(df_visible['high'].max())
+            # 将 TP/SL 纳入范围
+            if self.tp_line.isVisible():
+                tp_val = float(self.tp_line.value())
+                y_min = min(y_min, tp_val)
+                y_max = max(y_max, tp_val)
+            if self.sl_line.isVisible():
+                sl_val = float(self.sl_line.value())
+                y_min = min(y_min, sl_val)
+                y_max = max(y_max, sl_val)
+            padding = (y_max - y_min) * 0.1
+            self.candle_plot.setYRange(y_min - padding, y_max + padding, padding=0)
+        except Exception:
+            pass
     
     def _set_tp_sp(self, tp_price: float, sp_price: float):
         """兼容旧接口，内部转发到新方法"""
@@ -1081,7 +1204,7 @@ class ChartWidget(QtWidgets.QWidget):
     def set_fingerprint_trajectory(self, prices: np.ndarray, start_idx: int,
                                    similarity: float, label: str,
                                    lower: np.ndarray = None, upper: np.ndarray = None):
-        """在K线图上叠加指纹轨迹虚线"""
+        """在K线图上叠加指纹轨迹虚线（兼容旧调用）"""
         if prices is None or len(prices) == 0:
             self.clear_fingerprint_trajectory()
             return
@@ -1109,6 +1232,177 @@ class ChartWidget(QtWidgets.QWidget):
         rect = self.candle_plot.viewRect()
         self.fingerprint_label.setPos(rect.left() + 2, rect.top() + 20)
     
+    def set_probability_fan(self, entry_price: float, start_idx: int,
+                            member_trade_stats: list, direction: str,
+                            similarity: float, label: str,
+                            leverage: float = 10.0, max_bars: int = 30):
+        """
+        基于原型成员的真实历史数据，绘制概率扇形置信带
+        
+        Args:
+            entry_price: 当前/入场价格（扇形的起点）
+            start_idx: 扇形起始的K线索引
+            member_trade_stats: [(profit_pct, hold_bars), ...] 成员交易统计
+            direction: "LONG" / "SHORT"
+            similarity: 匹配相似度
+            label: 标签文字
+            leverage: 杠杆倍数
+            max_bars: 扇形最大展示K线数
+        """
+        if not member_trade_stats or entry_price <= 0:
+            self.clear_fingerprint_trajectory()
+            return
+        
+        # 1. 确定展示的K线数量（取成员中位数持仓时长，上限max_bars）
+        hold_bars_list = [int(h) for _, h in member_trade_stats if h > 0]
+        if not hold_bars_list:
+            self.clear_fingerprint_trajectory()
+            return
+        
+        median_hold = int(np.median(hold_bars_list))
+        fan_length = min(max(median_hold, 5), max_bars)
+        
+        # 2. 为每个成员构建归一化的价格路径
+        # 假设线性到达最终收益（简化但合理的近似）
+        paths = []
+        for profit_pct, hold_bars in member_trade_stats:
+            if hold_bars <= 0:
+                continue
+            # profit_pct 是杠杆后的百分比，需要转回价格变化
+            price_change_pct = profit_pct / leverage / 100.0
+            
+            # 方向修正
+            if direction == "SHORT":
+                price_change_pct = -price_change_pct  # SHORT盈利时价格下跌
+            
+            # 构建路径：线性插值从0到最终价格变化
+            path_len = min(int(hold_bars), fan_length)
+            if path_len < 2:
+                path_len = 2
+            
+            # 用 sqrt 形状模拟真实交易（前期变化大，后期平缓）
+            t = np.linspace(0, 1, path_len)
+            price_path = entry_price * (1 + price_change_pct * np.sqrt(t))
+            
+            # 补齐到 fan_length（持仓结束后保持最终价格）
+            if len(price_path) < fan_length:
+                padding = np.full(fan_length - len(price_path), price_path[-1])
+                price_path = np.concatenate([price_path, padding])
+            else:
+                price_path = price_path[:fan_length]
+            
+            paths.append(price_path)
+        
+        if len(paths) < 3:
+            self.clear_fingerprint_trajectory()
+            return
+        
+        # 3. 计算百分位数
+        paths_array = np.array(paths)
+        median_path = np.median(paths_array, axis=0)
+        p25 = np.percentile(paths_array, 25, axis=0)
+        p75 = np.percentile(paths_array, 75, axis=0)
+        
+        # 4. 统一黄色样式（更清晰、复古）
+        fan_color = "#FFD700"
+        r, g, b = (255, 215, 0)
+        
+        # 5. 绘制
+        x = np.arange(start_idx, start_idx + fan_length)
+        
+        # 中位线（主线）- 动态颜色
+        self.fingerprint_traj_curve.setPen(pg.mkPen(fan_color, width=1.2, style=QtCore.Qt.PenStyle.DashLine))
+        self.fingerprint_traj_curve.setData(x=x, y=median_path)
+        # 置信区间（25%-75%）- 动态颜色
+        self.fingerprint_upper_curve.setPen(pg.mkPen(fan_color, width=0.6))
+        self.fingerprint_lower_curve.setPen(pg.mkPen(fan_color, width=0.6))
+        self.fingerprint_lower_curve.setData(x=x, y=p25)
+        self.fingerprint_upper_curve.setData(x=x, y=p75)
+        # 半透明填充
+        self.fingerprint_band.setBrush(pg.mkBrush(r, g, b, 40))
+        
+        # 更新padding，并确保视图包含未来扇形区域
+        if self.df is not None and len(self.df) > 0:
+            max_x = int(x[-1])
+            self._overlay_future_padding = max(0, max_x - (len(self.df) - 1))
+            try:
+                view_box = self.candle_plot.getViewBox()
+                x_range = view_box.viewRange()[0]
+                width = max(10, x_range[1] - x_range[0])
+                target_right = len(self.df) + max(5, self._overlay_future_padding)
+                target_left = target_right - width
+                self.candle_plot.setXRange(target_left, target_right, padding=0)
+            except Exception:
+                pass
+        else:
+            self._overlay_future_padding = 0
+        
+        # 6. 标签
+        sim_pct = similarity * 100
+        color = fan_color
+        
+        n_members = len(member_trade_stats)
+        self.fingerprint_label.setText(f"{label} {sim_pct:.1f}% ({n_members}笔)")
+        self.fingerprint_label.setColor(color)
+        
+        rect = self.candle_plot.viewRect()
+        self.fingerprint_label.setPos(rect.left() + 2, rect.top() + 20)
+        
+        # 保存扇形数据（供偏离检测使用）
+        self._fan_median = median_path
+        self._fan_p25 = p25
+        self._fan_p75 = p75
+        self._fan_start_idx = start_idx
+    
+    def check_price_deviation(self, current_price: float, current_idx: int) -> str:
+        """
+        检查当前价格是否偏离扇形置信带
+        
+        Returns:
+            "inside" / "edge" / "outside"
+        """
+        if not hasattr(self, '_fan_median') or self._fan_median is None:
+            return "unknown"
+        
+        bar_offset = current_idx - self._fan_start_idx
+        if bar_offset < 0 or bar_offset >= len(self._fan_median):
+            return "unknown"
+        
+        p25 = float(self._fan_p25[bar_offset])
+        p75 = float(self._fan_p75[bar_offset])
+        median = float(self._fan_median[bar_offset])
+        if not np.isfinite(p25) or not np.isfinite(p75) or not np.isfinite(median):
+            return "unknown"
+        
+        # 扩展一个额外边缘区域，并加入“最小波动带”防误报
+        # 5根扇形在某些原型上会非常窄，若不加波动下限会频繁误报 outside。
+        range_size = max(0.0, p75 - p25)
+        vol_floor = abs(median) * 0.0012  # 至少约0.12%价格带
+        if self.df is not None and len(self.df) > 5:
+            start = max(0, current_idx - 20)
+            try:
+                recent_high = float(self.df['high'].iloc[start:current_idx + 1].max())
+                recent_low = float(self.df['low'].iloc[start:current_idx + 1].min())
+                recent_range = max(0.0, recent_high - recent_low)
+                vol_floor = max(vol_floor, recent_range * 0.08)  # 近期波动的8%
+            except Exception:
+                pass
+        eff_range = max(range_size, vol_floor)
+        edge_lower = p25 - eff_range * 1.0
+        edge_upper = p75 + eff_range * 1.0
+        outer_lower = p25 - eff_range * 2.0
+        outer_upper = p75 + eff_range * 2.0
+        
+        if p25 <= current_price <= p75:
+            return "inside"
+        elif edge_lower <= current_price <= edge_upper:
+            return "edge"
+        elif outer_lower <= current_price <= outer_upper:
+            # 介于边缘和极端之间时仍视为 edge，避免过早触发严重偏离
+            return "edge"
+        else:
+            return "outside"
+    
     def clear_fingerprint_trajectory(self):
         """清除指纹轨迹叠加"""
         self.fingerprint_traj_curve.setData([], [])
@@ -1116,6 +1410,10 @@ class ChartWidget(QtWidgets.QWidget):
         self.fingerprint_lower_curve.setData([], [])
         self.fingerprint_label.setText("")
         self._overlay_future_padding = 0
+        self._fan_median = None
+        self._fan_p25 = None
+        self._fan_p75 = None
+        self._fan_start_idx = 0
     
     def get_overlay_padding(self) -> int:
         """获取轨迹对未来的X轴扩展长度"""

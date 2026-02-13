@@ -1,0 +1,200 @@
+# R3000 系统修改归档
+
+> 本文档记录项目开发过程中对系统的各项修改，全部采用文字描述，不使用代码。  
+> 文档创建时间：2026-02-13
+
+---
+
+## 一、核心交易逻辑（core）
+
+### 1.1 持仓与平仓决策（live_trading_engine.py）
+
+**时间戳：2026-02-13**
+
+- **统一状态 reset 机制**  
+  原先存在六处分散的手动状态清理逻辑（止盈止损触发、超时平仓、信号离场、脱轨离场、内部回调等），容易遗漏字段导致“幽灵状态”。新增 `_reset_position_state` 和 `_close_and_reset` 两个集中方法，所有离场路径统一调用，保证状态重置一致。
+
+- **新开仓保护期逻辑**  
+  保护期条件从“持有时间小于 8 秒且 hold_bars 小于 1”改为 purely 时间判断“持有时间小于 8 秒”，避免因 hold_bars 提前到 1 而过早结束保护。
+
+- **相似度检查频率**  
+  在“首根 K 线必检”的基础上，增加对 `hold_bars == 1` 的检查，并沿用 `hold_bars % hold_check_interval == 0` 的定期检查，确保首根 K 线及后续定期巡检都能执行。
+
+- **三阶段追踪止损与分段减仓**  
+  系统中已有完整逻辑：`_update_trailing_stop` 实现保本（0.8%）、锁利（2%）、紧追（4%）三阶段；`_check_staged_partial_tp` 实现峰值 2% 减仓 30%、4% 再减 30%。二者在 `_process_holding` 中调用，保护期结束后执行。
+
+- **最大持仓安全网**  
+  超过 `max_hold_bars` 时强制平仓，防止相似度长期在 0.5–0.7 区间缓慢亏损。
+
+---
+
+### 1.2 原型与指纹匹配（template_clusterer.py）
+
+**时间戳：2026-02-13**
+
+- **严格方向与 regime 一致**  
+  在 `PrototypeMatcher.match_entry` 中，将多头 regime（含弱多头、震荡偏多）与做多方向绑定，空头 regime（含弱空、震荡偏空）与做空方向绑定；若当前允许方向与 regime 不符，直接返回空结果。
+
+- **彻底排除反向 regime**  
+  在 `PrototypeLibrary` 中新增 `_regime_direction_matches`，在 `get_prototypes_by_direction` 与 `get_prototypes_by_direction_and_regime` 的检索层过滤掉方向与 regime 不一致的原型，保证做多仅匹配做多原型，做空仅匹配做空原型。
+
+---
+
+### 1.3 模拟交易与平仓（paper_trader.py）
+
+**时间戳：2026-02-13（部分来自早期会话）**
+
+- **止损触发时的原因修正**  
+  当止损价在盈利区（做多时止损价高于入场价、做空时止损价低于入场价）触发时，将 `CloseReason` 从“止损”改为“止盈”，避免盈利单仍记录为止损。
+
+- **部分平仓支持**  
+  `close_position` 与 `_market_close` 支持 `quantity` 参数，部分平仓时只关闭指定数量，剩余仓位继续持有；全平与部分平分别更新 `current_position` 和 `order_history`。
+
+- **限价部分平仓**  
+  限价单部分成交时，按实际成交数量计算手续费与盈亏，不再按整单 quantity 放大。
+
+- **PaperOrder 新增字段**  
+  显式声明 `limit_order_quantity`、`trailing_stage`、`partial_tp_count` 等字段，便于追踪止损、分段减仓逻辑使用。
+
+---
+
+### 1.4 币安测试网交易（binance_testnet_trader.py）
+
+**时间戳：2026-02-13（部分来自早期会话）**
+
+- **OrderStatus 导入**  
+  修复 `_load_history` 中使用的 `OrderStatus` 未导入问题，避免历史记录加载时 NameError。
+
+- **部分平仓处理**  
+  部分平仓时不再清空 `current_position`，仅更新剩余数量与保证金；全平才清空并触发 `on_trade_closed`，部分平触发 `on_order_update`。
+
+- **止损触发原因修正**  
+  与 paper_trader 一致：止损在盈利区触发时，记录为“止盈”而非“止损”。
+
+- **强制市价平仓**  
+  `_force_market_close` 增加 `close_qty` 参数，支持部分强平。
+
+---
+
+### 1.5 其他核心修复（live_trading_engine.py）
+
+**时间戳：2026-02-13（部分来自早期会话）**
+
+- **stop() 平仓价格**  
+  当 `state.current_price` 为 0 或无效时，尝试通过 `_get_mark_price` 或入场价作为平仓价，避免用错误价格平仓。
+
+- **ATR 缺失处理**  
+  当 ATR 缺失或无效时，不再返回 100.0 的默认值；改为用最近一根 K 线 high-low 或价格 0.1% 估算，避免止盈止损过宽。
+
+- **sync_from_exchange 频率**  
+  每根 K 线闭合时由 `force=True` 改为 `force=False`，减少 API 限流风险。
+
+- **风控配置**  
+  新增 `LIVE_RISK_CONFIG`（config.py）中 `MAX_DRAWDOWN_PCT`，达到阈值时暂停开仓并取消挂单。
+
+---
+
+## 二、用户界面（ui）
+
+### 2.1 K 线图与标记（chart_widget.py）
+
+**时间戳：2026-02-13**
+
+- **平仓标记细分**  
+  原先所有离场统一显示“EXIT”。现按平仓原因区分：  
+  - 保本：追踪止损在保本区触发（利润小于 1%）；金色圆形  
+  - 止盈：实际止盈；亮绿圆形  
+  - 止损：原始止损；深红方形  
+  - 脱轨：相似度脱轨离场；红色方形  
+  - 信号离场：信号匹配触发；橙色菱形  
+  - 超时：超过最大持仓；灰色菱形  
+  - EXIT：翻转入场补的离场标记；沿用原三角样式  
+
+- **标签宽度**  
+  根据文字长度动态计算标签宽度，支持中文四字标签正确显示。
+
+- **轨迹对比面板**  
+  在 K 线图下方新增轨迹对比子图，展示当前走势与匹配原型的 price_in_range 特征曲线，并显示相似度百分比。
+
+- **当前持仓标记**  
+  新增 `position_marker`，实时显示当前持仓在 K 线上的位置，随价格和 bar 索引更新。
+
+---
+
+### 2.2 模拟交易页（paper_trading_tab.py）
+
+**时间戳：2026-02-13**
+
+- **add_trade_marker 扩展**  
+  新增 `close_reason` 参数，将平仓原因映射到 chart_widget 的对应信号类型；入场标记不变。
+
+- **update_position_marker**  
+  新增方法，将当前持仓信息传递给 chart_widget，用于更新 position_marker。
+
+---
+
+### 2.3 主窗口（main_window.py）
+
+**时间戳：2026-02-13**
+
+- **平仓回调中的标记逻辑**  
+  在 `_handle_live_trade_closed` 中，根据 `order.close_reason`、`trailing_stage`、`profit_pct` 计算细化后的平仓原因字符串（保本、止盈、止损、脱轨、信号、超时），并传给 `add_trade_marker`。
+
+- **事件日志显示**  
+  平仓事件中的“原因”字段改为使用细化后的显示文案，不再只显示原始 CloseReason。
+
+- **持仓标记更新**  
+  在 `_update_live_state` 中调用 `update_position_marker`，保证持仓时 K 线图上的 position_marker 持续更新。
+
+- **删除亏损模板**  
+  在原型模式下，禁用“删除亏损模板”功能，避免误删原型数据。
+
+- **重复错误回调**  
+  移除重复定义的 `_on_live_error`，保留单一实现。
+
+---
+
+## 三、配置文件（config）
+
+**时间戳：2026-02-13**
+
+- **LIVE_RISK_CONFIG**  
+  新增实盘风控配置段，包含 `MAX_DRAWDOWN_PCT`（默认 30%），达到后暂停开仓。
+
+---
+
+## 四、数据与数据源
+
+### 4.1 live_data_feed.py
+
+**时间戳：2026-02-13（如有修改）**
+
+- 若存在 K 线数据获取、重连、REST 回退等调整，均归类于数据源与连接逻辑优化。
+
+---
+
+## 五、修改涉及的源文件清单
+
+| 文件路径 | 修改概要 |
+|---------|---------|
+| core/live_trading_engine.py | 统一状态 reset、保护期、相似度检查、追踪止损、分段减仓、stop 价格、ATR、sync 频率、风控 |
+| core/paper_trader.py | 止损原因修正、部分平仓、限价部分平仓、新字段 |
+| core/binance_testnet_trader.py | OrderStatus 导入、部分平仓、止损原因、强制市价平仓 |
+| core/template_clusterer.py | 方向与 regime 严格一致、反向 regime 排除 |
+| core/live_data_feed.py | 数据源相关优化 |
+| ui/chart_widget.py | 平仓标记细分、标签宽度、轨迹对比、持仓标记 |
+| ui/paper_trading_tab.py | add_trade_marker 扩展、update_position_marker |
+| ui/main_window.py | 平仓标记逻辑、事件文案、持仓标记更新、删除模板、错误回调 |
+| config.py | LIVE_RISK_CONFIG |
+
+---
+
+## 六、版本与备份说明
+
+- 本归档对应本地工作区修改，尚未全部提交。  
+- 推送到 GitHub 时，建议使用 commit message 包含时间点，例如：  
+  `docs: 修改归档 CHANGELOG_修改归档.md @ 2026-02-13`
+
+---
+
+*文档结束*

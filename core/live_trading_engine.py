@@ -23,6 +23,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.live_data_feed import LiveDataFeed, KlineData
+from config import PAPER_TRADING_CONFIG
 from core.paper_trader import PaperOrder, OrderSide, CloseReason
 from core.binance_testnet_trader import BinanceTestnetTrader
 from core.market_regime import MarketRegimeClassifier, MarketRegime
@@ -190,6 +191,15 @@ class LiveTradingEngine:
         self.on_trade_opened = on_trade_opened
         self.on_trade_closed = on_trade_closed
         self.on_error = on_error
+
+        # 实时决策频率（秒）
+        self._realtime_decision_interval = float(
+            PAPER_TRADING_CONFIG.get("REALTIME_DECISION_SEC", 0.05)
+        )
+        self._realtime_entry_enabled = bool(
+            PAPER_TRADING_CONFIG.get("REALTIME_ENTRY_ENABLED", True)
+        )
+        self._last_realtime_decision_ts = 0.0
         
         # 数据接收器
         self._data_feed = LiveDataFeed(
@@ -205,6 +215,9 @@ class LiveTradingEngine:
             on_error=self._on_feed_error,
             http_proxy=http_proxy,
             socks_proxy=socks_proxy,
+            rest_poll_seconds=PAPER_TRADING_CONFIG.get("REALTIME_REST_POLL_SEC", 0.05),
+            emit_realtime=True,
+            realtime_emit_interval=PAPER_TRADING_CONFIG.get("REALTIME_DECISION_SEC", 0.05),
         )
         
         # 执行参数固定：每次开仓 50% 仓位，杠杆 10x
@@ -254,7 +267,21 @@ class LiveTradingEngine:
         self.pending_signal = None  # Dict with {side, trigger_price, expire_idx, fingerprint, similarity, reason}
         # 上一根K线是否有持仓（用于检测新开仓）
         self._last_had_position = False
+        
+        # 日志节流：避免高频决策刷屏
+        self._last_log_messages: dict = {}   # key -> last_message
+        self._last_log_times: dict = {}      # key -> last_time
     
+    def _throttled_print(self, key: str, msg: str, interval: float = 5.0):
+        """节流打印：同一 key 的相同内容在 interval 秒内只打印一次"""
+        now = time.time()
+        last_msg = self._last_log_messages.get(key)
+        last_t = self._last_log_times.get(key, 0)
+        if msg != last_msg or (now - last_t) >= interval:
+            print(msg)
+            self._last_log_messages[key] = msg
+            self._last_log_times[key] = now
+
     @property
     def paper_trader(self) -> BinanceTestnetTrader:
         return self._paper_trader
@@ -383,6 +410,7 @@ class LiveTradingEngine:
                     library=self._active_prototype_library,
                     cosine_threshold=self.cosine_threshold,
                     min_prototypes_agree=self.min_templates_agree,
+                    dtw_weight=0.1,  # 降低DTW权重（余弦90% + DTW10%）
                 )
             else:
                 self._matcher = TrajectoryMatcher()
@@ -441,6 +469,8 @@ class LiveTradingEngine:
             self._fv_engine.precompute(df)
             self._df_buffer = df
             self._current_bar_idx = len(df) - 1
+            # 与交易器对齐bar索引，避免同步仓位entry_bar_idx错乱
+            self._paper_trader.current_bar_idx = self._current_bar_idx
             
             print(f"[LiveEngine] 历史特征计算完成: {len(df)} 根K线")
             
@@ -523,6 +553,8 @@ class LiveTradingEngine:
             return
         
         with self._lock:
+            # 始终同步给交易器，避免交易所同步路径使用过时bar索引
+            self._paper_trader.current_bar_idx = self._current_bar_idx
             # 更新状态
             self.state.current_price = kline.close
             self.state.current_time = kline.open_time
@@ -544,21 +576,25 @@ class LiveTradingEngine:
             else:
                 # 实时更新持仓盈亏 + TP/SL检查（含挂起重试）
                 if self._paper_trader.has_position():
+                    # 手动/同步仓位可能缺失TP/SL，先补全风险保护
+                    self._ensure_position_tp_sl()
                     close_reason = self._paper_trader.update_price(
                         kline.close,
                         high=kline.high,
                         low=kline.low,
                     )
                     if close_reason:
-                        self.state.matching_phase = "等待"
-                        self.state.tracking_status = "-"
-                        self._current_template = None
-                        self._current_prototype = None
-                        self.state.position_side = "-"
-                        self.state.decision_reason = f"实时TP/SL触发: {close_reason.value}"
+                        self._reset_position_state(f"实时TP/SL触发: {close_reason.value}")
                 else:
-                    # 未持仓时，做预匹配展示（不下单，仅更新UI状态）
-                    self._preview_match(kline)
+                    # 未持仓时，按秒级决策频率做预匹配/入场判断
+                    now = time.time()
+                    if (self._realtime_entry_enabled
+                            and now - self._last_realtime_decision_ts >= self._realtime_decision_interval):
+                        self._last_realtime_decision_ts = now
+                        atr = self._get_current_atr()
+                        self._process_entry(kline, atr)
+                    else:
+                        self._preview_match(kline)
             
             if self.on_state_update:
                 self.on_state_update(self.state)
@@ -567,6 +603,7 @@ class LiveTradingEngine:
         """处理完整K线"""
         self.state.total_bars += 1
         self._current_bar_idx += 1
+        self._paper_trader.current_bar_idx = self._current_bar_idx
         
         # 同步交易所状态（检测止损单成交等）
         if hasattr(self._paper_trader, "sync_from_exchange"):
@@ -577,6 +614,7 @@ class LiveTradingEngine:
         has_pos = self._paper_trader.has_position()
         # 检测新开仓：上一根无持仓，本根有持仓 → 触发开仓回调（含止损单成交、手动开仓等）
         if has_pos and not self._last_had_position and self.on_trade_opened:
+            self._ensure_position_tp_sl()
             order = self._paper_trader.current_position
             if order:
                 try:
@@ -600,7 +638,7 @@ class LiveTradingEngine:
         if self._paper_trader.has_position():
             self._process_holding(kline, atr)
         else:
-            print(f"[LiveEngine] 尝试入场匹配...")
+            self._throttled_print("try_entry", "[LiveEngine] 尝试入场匹配...", interval=10.0)
             self._process_entry(kline, atr)
     
     def _update_features(self, kline: KlineData) -> bool:
@@ -650,6 +688,36 @@ class LiveTradingEngine:
             low = float(self._df_buffer['low'].iloc[-1])
             atr = max(high - low, high * 0.001)
         return atr
+
+    def _ensure_position_tp_sl(self):
+        """确保当前持仓拥有 TP/SL（兼容手动开仓/交易所同步仓位）"""
+        order = self._paper_trader.current_position
+        if order is None:
+            return
+        if order.take_profit is not None and order.stop_loss is not None:
+            return
+        try:
+            direction = order.side.value
+            atr = self._get_current_atr()
+            if atr <= 0:
+                atr = max(order.entry_price * 0.001, 1.0)
+            tp, sl = self._calculate_dynamic_tp_sl(
+                entry_price=order.entry_price,
+                direction=direction,
+                prototype=self._current_prototype if self.use_prototypes else None,
+                atr=atr,
+            )
+            if order.take_profit is None:
+                order.take_profit = tp
+            if order.stop_loss is None:
+                order.stop_loss = sl
+                if getattr(order, "original_stop_loss", None) is None:
+                    order.original_stop_loss = sl
+            self.state.last_event = (
+                f"[风控补全] TP/SL已补全 | TP={order.take_profit:.2f} SL={order.stop_loss:.2f}"
+            )
+        except Exception as e:
+            print(f"[LiveEngine] 补全TP/SL失败: {e}")
     
     def _process_entry(self, kline: KlineData, atr: float):
         """处理入场逻辑：实现 Ready-Aim-Fire 三重过滤 (已优化：支持信号动态替换)"""
@@ -672,10 +740,13 @@ class LiveTradingEngine:
             return
         
         if self._fv_engine is None:
+            self.state.last_event = "[入场跳过] 特征引擎未就绪"
             return
         if self.use_prototypes and self._proto_matcher is None:
+            self.state.last_event = "[入场跳过] 原型匹配器未就绪"
             return
         if (not self.use_prototypes) and self._matcher is None:
+            self.state.last_event = "[入场跳过] 模板匹配器未就绪"
             return
         
         try:
@@ -688,6 +759,7 @@ class LiveTradingEngine:
             
             if pre_entry_traj.size == 0:
                 self.state.matching_phase = "等待"
+                self.state.last_event = "[入场跳过] 轨迹为空"
                 return
             
             direction = None
@@ -705,6 +777,7 @@ class LiveTradingEngine:
                     # UNKNOWN 状态下，不进行入场匹配，等待市场状态明确
                     self.state.decision_reason = "[等待] 市场状态未明确 (需 ≥4 个摆动点)，暂不入场。"
                     self.state.fingerprint_status = "状态未知"
+                    self.state.last_event = "[入场跳过] 市场状态未知"
                     return
                 
                 long_result = self._proto_matcher.match_entry(
@@ -727,16 +800,15 @@ class LiveTradingEngine:
                 elif short_result.get("matched"):
                     direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
 
-                # 提取投票信息和DTW相似度
+                # 提取匹配信息（DTW已移除）
                 long_votes = long_result.get("vote_long", 0)
                 short_votes = short_result.get("vote_short", 0)
                 long_cosine = long_result.get("cosine_similarity", long_sim)
-                long_dtw = long_result.get("dtw_similarity", 0.0)
                 short_cosine = short_result.get("cosine_similarity", short_sim)
-                short_dtw = short_result.get("dtw_similarity", 0.0)
-                print(f"[LiveEngine] 原型匹配结果: "
-                      f"LONG=综合{long_sim:.1%}(余弦{long_cosine:.1%}+DTW{long_dtw:.1%},投票{long_votes}) | "
-                      f"SHORT=综合{short_sim:.1%}(余弦{short_cosine:.1%}+DTW{short_dtw:.1%},投票{short_votes})")
+                self._throttled_print("proto_match",
+                    f"[LiveEngine] 原型匹配结果: "
+                    f"LONG={long_sim:.1%}(余弦{long_cosine:.1%},投票{long_votes}) | "
+                    f"SHORT={short_sim:.1%}(余弦{short_cosine:.1%},投票{short_votes})")
                 
                 if direction is not None and chosen_proto is not None:
                     # 显示包含市场状态的原型名称
@@ -744,7 +816,8 @@ class LiveTradingEngine:
                     chosen_fp = f"proto_{chosen_proto.direction}_{chosen_proto.prototype_id}_{regime_short}"
                     self._current_prototype = chosen_proto
                     self._current_template = None
-                    print(f"[LiveEngine] 匹配成功! 方向={direction} | 原型={chosen_fp} | 相似度={similarity:.2%}")
+                    self._throttled_print("proto_matched",
+                        f"[LiveEngine] 匹配成功! 方向={direction} | 原型={chosen_fp} | 相似度={similarity:.2%}")
                     self.state.last_event = f"匹配成功 {direction} | {chosen_fp} | {similarity:.1%}"
                     
             else:
@@ -801,6 +874,7 @@ class LiveTradingEngine:
                         self._paper_trader.cancel_entry_stop_orders()
                     else:
                         # 维持原样，不重复下单
+                        self.state.last_event = "[入场跳过] 挂单未变化"
                         return
 
                 price = kline.close
@@ -842,13 +916,21 @@ class LiveTradingEngine:
                     if has_pending: 
                         # 如果指标变了不再满足，撤掉之前的单子
                         self._paper_trader.cancel_entry_stop_orders()
-                    self.state.decision_reason = f"[等待瞄准] 指纹匹配成功({similarity:.1%}), 但 MACD/KDJ 动能未对齐。"
+                    self.state.decision_reason = (
+                        f"[等待瞄准] 指纹匹配成功({similarity:.1%}), 但 MACD/KDJ 动能未对齐。"
+                        f"(MACD={self.state.macd_ready}, KDJ={self.state.kdj_ready})"
+                    )
+                    self.state.last_event = f"[门控] 未通过 | MACD={self.state.macd_ready} KDJ={self.state.kdj_ready}"
                     self.state.best_match_similarity = similarity
                     self.state.best_match_template = chosen_fp
                     return
                 
                 # B. 计算触发价格 (Fire 开火指令)
                 trigger_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
+                self.state.last_event = (
+                    f"[门控] 通过 | MACD={self.state.macd_ready} KDJ={self.state.kdj_ready} | "
+                    f"触发价={trigger_price:.2f}"
+                )
                 
                 # C. 直接向交易器下达“预埋开火单” (Exchange-side Stop Order)
                 order_id = self._paper_trader.place_stop_order(
@@ -867,7 +949,10 @@ class LiveTradingEngine:
                 self.state.best_match_template = chosen_fp
                 self.state.matching_phase = "待定执行"
                 self.state.fingerprint_status = "等待触发"
-                self.state.decision_reason = f"[🎯瞄准中] 指纹已布防({similarity:.1%})，等待价格触碰 {trigger_price:.2f}"
+                self.state.decision_reason = (
+                    f"[🎯瞄准中] 指纹已布防({similarity:.1%})，等待价格触碰 {trigger_price:.2f}"
+                    f"(MACD={self.state.macd_ready}, KDJ={self.state.kdj_ready})"
+                )
                 self.state.last_event = f"🎯瞄准信号 {direction} | 预埋触发 {trigger_price:.2f}"
                 return
             else:
@@ -880,12 +965,14 @@ class LiveTradingEngine:
                     self.state.matching_phase = "等待"
                     self.state.fingerprint_status = "待匹配"
                     self.state.decision_reason = "之前的指纹信号已消失或不再符合相似度要求，重回扫描模式。"
+                    self.state.last_event = "[入场取消] 信号失效，撤销挂单"
                     return
                 
                 self.state.matching_phase = "等待"
                 self.state.fingerprint_status = "未匹配"
                 self.state.best_match_similarity = 0.0
                 self.state.best_match_template = None
+                self.state.last_event = "[入场跳过] 未匹配到信号"
             
             # 没有匹配
             self.state.matching_phase = "等待"
@@ -949,13 +1036,23 @@ class LiveTradingEngine:
         prev = df.iloc[-2]
 
         if not is_exit_gate:
-            # 入场逻辑 (Aim 瞄准阶段)
+            # 入场逻辑 (Aim 瞄准阶段) - 趋势一致性判定（非单根动能）
             if direction == "LONG":
-                self.state.macd_ready = curr['macd_hist'] > prev['macd_hist']
-                self.state.kdj_ready = (curr['j'] < 85) and (curr['j'] > prev['j'])
+                # MACD 多头趋势：柱体在零轴上方，或至少近两根在回升
+                self.state.macd_ready = (curr['macd_hist'] > 0) or (curr['macd_hist'] > prev['macd_hist'])
+                # KDJ 多头趋势：J/K 站上 D 且动能向上（不再用 90 上限硬限制）
+                self.state.kdj_ready = (
+                    ((curr['j'] >= curr['d']) or (curr['k'] >= curr['d'])) and
+                    ((curr['j'] >= prev['j']) or (curr['k'] >= prev['k']))
+                )
             else: # SHORT
-                self.state.macd_ready = curr['macd_hist'] < prev['macd_hist']
-                self.state.kdj_ready = (curr['j'] > 15) and (curr['j'] < prev['j'])
+                # MACD 空头趋势：柱体在零轴下方，或至少近两根在走弱
+                self.state.macd_ready = (curr['macd_hist'] < 0) or (curr['macd_hist'] < prev['macd_hist'])
+                # KDJ 空头趋势：J/K 位于 D 下方且动能向下（不再用 10 下限硬限制）
+                self.state.kdj_ready = (
+                    ((curr['j'] <= curr['d']) or (curr['k'] <= curr['d'])) and
+                    ((curr['j'] <= prev['j']) or (curr['k'] <= prev['k']))
+                )
         else:
             # 离场逻辑 (Ready 表示门控已打开，允许平仓)
             if direction == "LONG":
@@ -1045,25 +1142,35 @@ class LiveTradingEngine:
         if df is None or len(df) < 5:
             return False
             
-        # 获取最新两根数据进行对比
+        # 获取最新两根数据进行对比（趋势一致口径）
         curr = df.iloc[-1]
         prev = df.iloc[-2]
         
         if direction == "LONG":
-            # 1. MACD 扳机：柱状图不再变深 (下跌动能衰竭)
-            macd_ok = curr['macd_hist'] > prev['macd_hist']
+            # MACD 多头趋势：零轴上方或近两根回升
+            macd_ok = (curr['macd_hist'] > 0) or (curr['macd_hist'] > prev['macd_hist'])
+            self.state.macd_ready = macd_ok
             
-            # 2. KDJ 扳机：J 线不在超买区，且方向向上
-            kdj_ok = (curr['j'] < 85) and (curr['j'] > prev['j'])
+            # KDJ 多头趋势：J/K 站上 D 且动能向上（不使用90上限硬限制）
+            kdj_ok = (
+                ((curr['j'] >= curr['d']) or (curr['k'] >= curr['d'])) and
+                ((curr['j'] >= prev['j']) or (curr['k'] >= prev['k']))
+            )
+            self.state.kdj_ready = kdj_ok
             
             return macd_ok and kdj_ok
             
         elif direction == "SHORT":
-            # 1. MACD 扳机：柱状图不再变浅 (上涨动能衰竭)
-            macd_ok = curr['macd_hist'] < prev['macd_hist']
+            # MACD 空头趋势：零轴下方或近两根走弱
+            macd_ok = (curr['macd_hist'] < 0) or (curr['macd_hist'] < prev['macd_hist'])
+            self.state.macd_ready = macd_ok
             
-            # 2. KDJ 扳机：J 线不在超卖区，且方向向下
-            kdj_ok = (curr['j'] > 15) and (curr['j'] < prev['j'])
+            # KDJ 空头趋势：J/K 位于 D 下方且动能向下（不使用10下限硬限制）
+            kdj_ok = (
+                ((curr['j'] <= curr['d']) or (curr['k'] <= curr['d'])) and
+                ((curr['j'] <= prev['j']) or (curr['k'] <= prev['k']))
+            )
+            self.state.kdj_ready = kdj_ok
             
             return macd_ok and kdj_ok
             
@@ -1093,6 +1200,57 @@ class LiveTradingEngine:
                 return True
                 
         return False
+    # ══════════════════════════════════════════════════════════════════
+    #  统一平仓出口 — 交易大师的铁律：所有退出必经同一扇门
+    # ══════════════════════════════════════════════════════════════════
+
+    def _reset_position_state(self, reason_text: str = ""):
+        """
+        平仓后统一重置所有持仓相关状态 — 唯一清理出口
+
+        无论平仓由谁触发（TP/SL、信号、脱轨、超时），都经过此处，
+        确保不会遗留任何"幽灵状态"影响下一次决策。
+        """
+        self.state.matching_phase = "等待"
+        self.state.tracking_status = "-"
+        self.state.position_side = "-"
+        self.state.hold_reason = ""
+        self.state.exit_reason = ""
+        self.state.danger_level = 0.0
+        self.state.fingerprint_status = "待匹配"
+        self._current_template = None
+        self._current_prototype = None
+        if reason_text:
+            self.state.decision_reason = reason_text
+
+    def _close_and_reset(self, price: float, bar_idx: int, reason: CloseReason,
+                          order=None, reason_text: str = "") -> bool:
+        """
+        主动平仓 + 状态重置 — 唯一的主动平仓出口
+
+        所有由引擎主动触发的平仓（超时、信号离场等）必须走此方法，
+        确保平仓动作与状态清理原子化执行。
+
+        Returns:
+            True 平仓成功, False 平仓失败（需等待重试）
+        """
+        closed = self._paper_trader.close_position(price, bar_idx, reason)
+        if not closed:
+            self.state.exit_reason = "下单失败，等待重试。"
+            return False
+        # close_position 内部会触发 _on_trade_closed_internal → _reset_position_state()
+        # 这里再次调用以设置具体的 decision_reason
+        if not reason_text and order:
+            reason_text = self._build_exit_reason(reason.value, order)
+        elif not reason_text:
+            reason_text = f"[平仓] {reason.value}"
+        self._reset_position_state(reason_text)
+        return True
+
+    # ══════════════════════════════════════════════════════════════════
+    #  持仓管理主流程
+    # ══════════════════════════════════════════════════════════════════
+
     def _process_holding(self, kline: KlineData, atr: float):
         """处理持仓逻辑"""
         self.state.matching_phase = "持仓中"
@@ -1124,12 +1282,18 @@ class LiveTradingEngine:
         )
         
         if close_reason:
-            self.state.matching_phase = "等待"
-            self.state.tracking_status = "-"
-            self._current_template = None
-            self._current_prototype = None
-            self.state.position_side = "-"
-            self.state.decision_reason = self._build_exit_reason(close_reason.value, order)
+            self._reset_position_state(self._build_exit_reason(close_reason.value, order))
+            return
+
+        # 新开仓保护期：8秒内仅监控TP/SL，不执行相似度离场
+        hold_seconds = 0.0
+        try:
+            hold_seconds = max(0.0, (datetime.now() - order.entry_time).total_seconds())
+        except Exception:
+            hold_seconds = 0.0
+        if hold_seconds < 8:
+            self.state.hold_reason = "新开仓保护期，暂不执行相似度离场。"
+            self.state.exit_reason = "保护期内仅监控TP/SL。"
             return
         
         # 三阶段追踪止损 + 追踪止盈
@@ -1142,17 +1306,15 @@ class LiveTradingEngine:
         max_hold = getattr(self, 'max_hold_bars', 240)
         if max_hold > 0 and order.hold_bars >= max_hold:
             print(f"[LiveEngine] 超过最大持仓时间 {max_hold} 根K线，强制平仓")
-            self._paper_trader.close_position(
-                kline.close, self._current_bar_idx, CloseReason.MAX_HOLD
-            )
-            self.state.decision_reason = f"[平仓] 超时平仓: 持仓{order.hold_bars}根K线"
-            self.state.matching_phase = "等待"
-            self._current_template = None
-            self._current_prototype = None
+            self._close_and_reset(kline.close, self._current_bar_idx, CloseReason.MAX_HOLD, order)
             return
         
-        # 动态追踪检查
-        if order.hold_bars > 0 and order.hold_bars % self.hold_check_interval == 0:
+        # 动态追踪检查：首根K线必检（早期脱轨检测）+ 每N根定期检查
+        should_check = (
+            order.hold_bars == 1  # 首根K线必检
+            or (order.hold_bars > 0 and order.hold_bars % self.hold_check_interval == 0)
+        )
+        if should_check:
             self._check_holding_similarity(kline)
     
     def _check_holding_similarity(self, kline: KlineData):
@@ -1255,8 +1417,7 @@ class LiveTradingEngine:
                 
                 # 如果离场模式检测建议离场，且通过指标确认闸门
                 if exit_check["should_exit"]:
-                    # 【新增】离场指标确认 (Triple Verification - Exit)
-                    # 包含 MACD 动能 + KDJ J线翻转
+                    # 离场指标确认 (MACD + KDJ 共振)
                     if not self._check_exit_indicator_gate(self._df_buffer, direction):
                         msg = "形态拟出场，但指标动能支撑(MACD/KDJ)，暂缓离场。"
                         self.state.exit_reason = msg
@@ -1265,26 +1426,10 @@ class LiveTradingEngine:
                         exit_reason_str = exit_check["exit_reason"]
                         print(f"[LiveEngine] 离场模式触发: {exit_reason_str} "
                               f"(信号强度: {exit_check['exit_signal_strength']:.0%})")
-                        
-                        # 执行信号离场
-                        closed = self._paper_trader.close_position(
-                            kline.close,
-                            self._current_bar_idx,
-                            CloseReason.SIGNAL,
-                        )
-                        if not closed:
-                            self.state.exit_reason = "离场信号触发，但下单失败，等待重试。"
-                            return
-                        
-                        self.state.matching_phase = "等待"
-                        self.state.tracking_status = "-"
-                        self.state.hold_reason = ""
-                        self.state.danger_level = 0.0
-                        self.state.exit_reason = ""
-                        self._current_template = None
-                        self._current_prototype = None
-                        self.state.position_side = "-"
-                        self.state.decision_reason = self._build_exit_reason(f"信号({exit_reason_str})", order)
+                        reason_text = self._build_exit_reason(f"信号({exit_reason_str})", order)
+                        if not self._close_and_reset(kline.close, self._current_bar_idx,
+                                                     CloseReason.SIGNAL, order, reason_text):
+                            return  # 下单失败，等待重试
                         return
                 
                 # 更新状态中的出场预估
@@ -1336,15 +1481,7 @@ class LiveTradingEngine:
                     self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
             
             if close_reason:
-                self.state.matching_phase = "等待"
-                self.state.tracking_status = "-"
-                self.state.hold_reason = ""
-                self.state.danger_level = 0.0
-                self.state.exit_reason = ""
-                self._current_template = None
-                self._current_prototype = None
-                self.state.position_side = "-"
-                self.state.decision_reason = self._build_exit_reason("脱轨", order)
+                self._reset_position_state(self._build_exit_reason("脱轨", order))
             
         except Exception as e:
             import traceback
@@ -1441,16 +1578,11 @@ class LiveTradingEngine:
         pass  # 由状态更新回调处理
     
     def _on_trade_closed_internal(self, order: PaperOrder):
-        """交易关闭内部回调"""
+        """交易关闭内部回调 — 安全网，确保任何平仓路径都能清理状态"""
         if self.on_trade_closed:
             self.on_trade_closed(order)
-        
-        self._current_template = None
-        self._current_prototype = None
-        self.state.matching_phase = "等待"
-        self.state.tracking_status = "-"
-        self.state.fingerprint_status = "待匹配"
-        self.state.position_side = "-"
+        # 统一走 _reset_position_state，不设 reason_text（由调用方设定具体原因）
+        self._reset_position_state()
     
     def _infer_market_regime(self) -> str:
         """
@@ -1565,7 +1697,8 @@ class LiveTradingEngine:
         self._swing_points = self._filter_alternating_swings(self._swing_points)
         
         if len(self._swing_points) > 0:
-             print(f"[LiveEngine] 当前摆动点: {len(self._swing_points)} (原始: {raw_count}) | 序列: {[('H' if s.is_high else 'L') + '@' + str(s.index) for s in self._swing_points]}")
+             self._throttled_print("swing_points",
+                 f"[LiveEngine] 当前摆动点: {len(self._swing_points)} (原始: {raw_count}) | 序列: {[('H' if s.is_high else 'L') + '@' + str(s.index) for s in self._swing_points]}")
     
     def _filter_alternating_swings(self, swings: List[SwingPoint]) -> List[SwingPoint]:
         """过滤为严格交替的高低点序列"""
@@ -1611,23 +1744,18 @@ class LiveTradingEngine:
     def _build_no_entry_reason(self, regime: str, long_sim: float, short_sim: float,
                                  long_votes: int = 0, short_votes: int = 0,
                                  threshold: float = 0.70, min_agree: int = 1) -> str:
-        """交易员风格不开仓因果说明（含投票信息）"""
+        """交易员风格不开仓因果说明"""
         best_side = "LONG" if long_sim >= short_sim else "SHORT"
         best_sim = max(long_sim, short_sim)
-        best_votes = long_votes if long_sim >= short_sim else short_votes
-        
         # 判断失败原因
         reasons = []
         if best_sim < threshold:
             reasons.append(f"相似度{best_sim:.1%}<阈值{threshold:.0%}")
-        if best_votes < min_agree:
-            reasons.append(f"投票{best_votes}<最低{min_agree}")
         
         fail_reason = "；".join(reasons) if reasons else "条件未满足"
         
         return (
-            f"[观望] 市场={regime} | 最佳={best_side}({best_sim:.1%}) | "
-            f"投票={best_votes}/{min_agree} | ❌{fail_reason}"
+            f"[观望] 市场={regime} | 最佳={best_side}({best_sim:.1%}) | ❌{fail_reason}"
         )
     
     @staticmethod

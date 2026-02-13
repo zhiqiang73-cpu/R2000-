@@ -108,6 +108,25 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
         return []
 
 
+def save_trade_history_to_file(orders: List["PaperOrder"], filepath: str) -> None:
+    """
+    保存交易记录到 JSON 文件（与 load_trade_history_from_file 兼容）
+    """
+    try:
+        data = {
+            "trades": [
+                o.to_dict() if hasattr(o, "to_dict") else o
+                for o in (orders or [])
+            ]
+        }
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[PaperTrader] 交易记录已保存: {filepath}")
+    except Exception as e:
+        print(f"[PaperTrader] 保存历史记录失败 {filepath}: {e}")
+
+
 @dataclass
 class PaperOrder:
     """虚拟订单"""
@@ -606,7 +625,7 @@ class PaperTrader:
                                    CloseReason.TAKE_PROFIT, use_limit_order=False) # 强制市价
                 return CloseReason.TAKE_PROFIT
 
-        # 检查止损
+        # 检查止损（若已进入盈利区，则视为追踪止盈）
         if order.stop_loss is not None:
             sl_triggered = False
             if order.side == OrderSide.LONG and low <= order.stop_loss:
@@ -615,12 +634,17 @@ class PaperTrader:
                 sl_triggered = True
             
             if sl_triggered:
-                print(f"[PaperTrader] 触发止损! Price={price} Low={low} SL={order.stop_loss}")
-                # 触发止损，立即取消挂单并市价平仓
+                is_profit_sl = (
+                    (order.side == OrderSide.LONG and order.stop_loss >= order.entry_price) or
+                    (order.side == OrderSide.SHORT and order.stop_loss <= order.entry_price)
+                )
+                sl_reason = CloseReason.TAKE_PROFIT if is_profit_sl else CloseReason.STOP_LOSS
+                print(f"[PaperTrader] 触发止损/止盈保护! Price={price} Low={low} SL={order.stop_loss}")
+                # 触发止损/止盈保护，立即取消挂单并市价平仓
                 order.pending_limit_order = False
                 self.close_position(order.stop_loss, bar_idx or self.current_bar_idx,
-                                   CloseReason.STOP_LOSS, use_limit_order=False) # 强制市价
-                return CloseReason.STOP_LOSS
+                                   sl_reason, use_limit_order=False) # 强制市价
+                return sl_reason
 
         # ==========================================================
         # 检查待成交的限价平仓单（如果没触发紧急止损）

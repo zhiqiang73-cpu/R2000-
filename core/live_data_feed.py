@@ -101,7 +101,9 @@ class LiveDataFeed:
                  market_type: str = "spot",
                  http_proxy: Optional[str] = None,
                  socks_proxy: Optional[str] = None,
-                 rest_poll_seconds: float = 1.0):
+                 rest_poll_seconds: float = 1.0,
+                 emit_realtime: bool = False,
+                 realtime_emit_interval: float = 0.2):
         """
         Args:
             symbol: 交易对 (如 "BTCUSDT")
@@ -131,7 +133,9 @@ class LiveDataFeed:
         self.market_type = (market_type or "spot").lower()
         self.http_proxy = http_proxy
         self.socks_proxy = socks_proxy
-        self.rest_poll_seconds = max(0.5, float(rest_poll_seconds))
+        self.rest_poll_seconds = max(0.05, float(rest_poll_seconds))
+        self.emit_realtime = bool(emit_realtime)
+        self.realtime_emit_interval = max(0.01, float(realtime_emit_interval))
         
         # 解析端点（主网/测试网 + 现货/合约）
         self._ws_base_url, self._rest_base_url, self._rest_path_prefix = self._resolve_endpoints()
@@ -153,6 +157,7 @@ class LiveDataFeed:
         
         # 上一个已触发回调的收线K线时间戳（用于避免WebSocket/REST重复触发）
         self._last_emitted_closed_ts: int = 0
+        self._last_emitted_realtime_ts: float = 0.0
         
         # 消息队列（用于线程安全的回调）
         self._msg_queue = queue.Queue()
@@ -447,8 +452,15 @@ class LiveDataFeed:
                     emit_kline = kline
             else:
                 self._current_kline = kline
+                # 允许REST实时触发（用于秒级决策/预览）
+                if self.emit_realtime and self.on_kline:
+                    now = time.time()
+                    if now - self._last_emitted_realtime_ts >= self.realtime_emit_interval:
+                        self._last_emitted_realtime_ts = now
+                        emit_kline = kline
         if emit_kline is not None and self.on_kline:
-            print(f"[REST] 备用触发K线收线: {emit_kline.open_time} | 收盘={emit_kline.close:.2f}")
+            if emit_kline.is_closed:
+                print(f"[REST] 备用触发K线收线: {emit_kline.open_time} | 收盘={emit_kline.close:.2f}")
             try:
                 self.on_kline(emit_kline)
             except Exception as e:

@@ -1,8 +1,12 @@
 """
 R3000 Binance 测试网执行器
 真实下单到 Binance Futures Testnet：
-  - 入场：市价单
-  - 离场：限价单（reduceOnly + IOC，确保按限价语义且尽量即时成交）
+  - 入场：限价单（LIMIT + GTC，在 trigger_price 挂单等待，争取 Maker 0.02%）
+  - 离场：限价单（LIMIT + IOC，reduceOnly，确保快速平仓）
+  
+手续费优化策略：
+  - 入场距离 0.02%（约$13），有较大概率挂单等待成交（Maker）
+  - 超时 5 根K线未成交自动撤单
 """
 
 import hashlib
@@ -77,7 +81,14 @@ class BinanceTestnetTrader:
         self._last_sync_ts = 0.0
         self._sync_interval_sec = 2.0
         self._pending_close = None  # (price, bar_idx, reason) 若离场失败则记录待重试
-        self._entry_stop_orders: List[dict] = []  # [{order_id, client_id, expire_bar}]
+        # [{order_id, client_id, expire_bar, take_profit, stop_loss}]
+        self._entry_stop_orders: List[dict] = []
+        # 记录最近一次入场的TP/SL，用于交易所同步建仓时回填
+        self._last_entry_tp: Optional[float] = None
+        self._last_entry_sl: Optional[float] = None
+        self._last_entry_side: Optional[OrderSide] = None
+        self._last_entry_price: Optional[float] = None
+        self._last_entry_ts: float = 0.0
 
         self._validate_credentials()
         self._load_symbol_filters()
@@ -294,22 +305,8 @@ class BinanceTestnetTrader:
             if order.side == OrderSide.SHORT and exit_price >= sl:
                 return CloseReason.STOP_LOSS
         
-        # 根据盈亏方向推断
-        entry = order.entry_price
-        if order.side == OrderSide.LONG:
-            pnl_direction = exit_price - entry
-        else:
-            pnl_direction = entry - exit_price
-        
-        # 如果是盈利且有TP设置，可能是止盈
-        if pnl_direction > 0 and order.take_profit is not None:
-            return CloseReason.TAKE_PROFIT
-        
-        # 如果是亏损且有SL设置，可能是止损
-        if pnl_direction < 0 and order.stop_loss is not None:
-            return CloseReason.STOP_LOSS
-        
-        # 无法确定，使用 SIGNAL（表示系统自动平仓，而非手动）
+        # 无法确定，不要按盈亏方向硬推止损/止盈，统一标记为 SIGNAL
+        # （避免“真实是信号离场/脱轨离场”却被误记为止损）
         return CloseReason.SIGNAL
 
     def _sync_from_exchange(self, force: bool = False):
@@ -380,6 +377,13 @@ class BinanceTestnetTrader:
             existing.margin_used = margin
             existing.unrealized_pnl = pnl
             existing.profit_pct = pnl_pct
+            # 若本地缺失TP/SL，则尝试回填（来自最新入场信号）
+            if existing.take_profit is None and self._last_entry_tp is not None:
+                existing.take_profit = self._last_entry_tp
+            if existing.stop_loss is None and self._last_entry_sl is not None:
+                existing.stop_loss = self._last_entry_sl
+                if existing.original_stop_loss is None:
+                    existing.original_stop_loss = self._last_entry_sl
             # 更新峰值追踪
             if side == OrderSide.LONG:
                 if mark > existing.peak_price:
@@ -391,6 +395,35 @@ class BinanceTestnetTrader:
                 existing.peak_profit_pct = pnl_pct
         else:
             # 新仓位（首次发现或方向变了），创建新对象
+            # 回填最近一次入场的TP/SL（仅限“刚由本系统触发”的仓位）
+            # 避免手动仓位错误继承旧TP/SL，导致异常快速止损
+            entry_tp = None
+            entry_sl = None
+            entry_bar_idx = self.current_bar_idx
+            entry_fp = None
+            entry_sim = 0.0
+            entry_reason = ""
+            if self._entry_stop_orders:
+                last_entry = self._entry_stop_orders[-1]
+                entry_tp = last_entry.get("take_profit")
+                entry_sl = last_entry.get("stop_loss")
+                entry_bar_idx = int(last_entry.get("start_bar", self.current_bar_idx))
+                entry_fp = last_entry.get("template_fingerprint")
+                entry_sim = float(last_entry.get("entry_similarity", 0.0) or 0.0)
+                entry_reason = last_entry.get("entry_reason", "")
+            else:
+                # 没有挂单记录时，只允许短时间内且方向/价格近似一致才回填
+                recent_window_sec = 180.0
+                is_recent = (time.time() - self._last_entry_ts) <= recent_window_sec
+                side_match = (self._last_entry_side == side) if self._last_entry_side is not None else False
+                price_match = False
+                if self._last_entry_price is not None and entry > 0:
+                    price_match = abs(self._last_entry_price - entry) / entry <= 0.005  # 0.5%
+                if is_recent and side_match and price_match:
+                    entry_tp = self._last_entry_tp
+                    entry_sl = self._last_entry_sl
+                    entry_bar_idx = self.current_bar_idx
+
             self.current_position = PaperOrder(
                 order_id="EXCHANGE_SYNC",
                 symbol=self.symbol,
@@ -399,10 +432,16 @@ class BinanceTestnetTrader:
                 margin_used=margin,
                 entry_price=entry,
                 entry_time=datetime.now(),
-                entry_bar_idx=self.current_bar_idx,
+                entry_bar_idx=entry_bar_idx,
+                take_profit=entry_tp,
+                stop_loss=entry_sl,
+                original_stop_loss=entry_sl,
                 unrealized_pnl=pnl,
                 profit_pct=pnl_pct,
                 peak_price=mark,
+                template_fingerprint=entry_fp,
+                entry_similarity=entry_sim,
+                entry_reason=entry_reason,
             )
         # 若交易所已有持仓，说明入场单已成交或不再有效
         if self._entry_stop_orders:
@@ -412,14 +451,14 @@ class BinanceTestnetTrader:
         return self.current_position is not None
 
     def has_pending_stop_orders(self) -> bool:
-        """检查是否有活跃的止损开仓挂单"""
+        """检查是否有活跃的入场挂单"""
         try:
             # 获取所有挂单
             open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
-            # 查找带有 ENTRY_STOP 前缀的挂单
+            # 查找带有 ENTRY_LIMIT 或 ENTRY_STOP 前缀的挂单（兼容旧版本）
             for o in open_orders:
                 client_id = o.get("clientOrderId", "")
-                if "ENTRY_STOP" in client_id:
+                if "ENTRY_LIMIT" in client_id or "ENTRY_STOP" in client_id:
                     return True
             return False
         except Exception as e:
@@ -427,12 +466,13 @@ class BinanceTestnetTrader:
             return False
 
     def cancel_entry_stop_orders(self):
-        """取消所有挂起的入场止损单"""
+        """取消所有挂起的入场挂单"""
         try:
             open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
             for o in open_orders:
                 client_id = o.get("clientOrderId", "")
-                if "ENTRY_STOP" in client_id:
+                # 兼容新旧版本的订单前缀
+                if "ENTRY_LIMIT" in client_id or "ENTRY_STOP" in client_id:
                     print(f"[BinanceTrader] 正在撤销过期/替换入场单: {client_id}")
                     self._signed_request("DELETE", "/fapi/v1/order", {
                         "symbol": self.symbol,
@@ -505,7 +545,11 @@ class BinanceTestnetTrader:
                          entry_similarity: float = 0.0,
                          entry_reason: str = "",
                          timeout_bars: int = 5) -> Optional[str]:
-        """放置止损开仓单 (STOP_MARKET)"""
+        """
+        放置限价开仓单 (LIMIT + GTC)
+        在 trigger_price 挂限价单，等待价格触及成交（争取 Maker 0.02%）
+        超时未成交会自动撤单
+        """
         self._sync_from_exchange(force=True)
         if self.current_position is not None:
             return None
@@ -519,15 +563,16 @@ class BinanceTestnetTrader:
         p_prec = len(str(self._price_tick).split('.')[-1]) if '.' in str(self._price_tick) else 0
         trigger_str = f"{trigger_price:.{p_prec}f}"
 
-        print(f"[BinanceTrader] 放置开仓止损单: {side_str} {qty_str} @ 触发价 {trigger_str}")
+        print(f"[BinanceTrader] 放置限价开仓单: {side_str} {qty_str} @ {trigger_str} (GTC挂单)")
 
-        client_id = self._new_client_order_id("ENTRY_STOP")
+        client_id = self._new_client_order_id("ENTRY_LIMIT")
         resp = self._place_order({
             "symbol": self.symbol,
             "side": side_str,
-            "type": "STOP_MARKET",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
             "quantity": qty_str,
-            "stopPrice": trigger_str,
+            "price": trigger_str,
             "newClientOrderId": client_id,
         })
         order_id = resp.get("orderId")
@@ -536,7 +581,19 @@ class BinanceTestnetTrader:
                 "order_id": order_id,
                 "client_id": client_id,
                 "expire_bar": bar_idx + timeout_bars,
+                "start_bar": bar_idx,
+                "take_profit": take_profit,
+                "stop_loss": stop_loss,
+                "template_fingerprint": template_fingerprint,
+                "entry_similarity": entry_similarity,
+                "entry_reason": entry_reason,
             })
+            # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
+            self._last_entry_tp = take_profit
+            self._last_entry_sl = stop_loss
+            self._last_entry_side = side
+            self._last_entry_price = trigger_price
+            self._last_entry_ts = time.time()
         return order_id
 
     def open_position(self,
@@ -607,6 +664,12 @@ class BinanceTestnetTrader:
             entry_reason=entry_reason,
             peak_price=avg_price,  # 初始峰值 = 入场价
         )
+        # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
+        self._last_entry_tp = take_profit
+        self._last_entry_sl = stop_loss
+        self._last_entry_side = side
+        self._last_entry_price = avg_price
+        self._last_entry_ts = time.time()
         self.current_position = order
         if self.on_order_update:
             self.on_order_update(order)
@@ -720,7 +783,7 @@ class BinanceTestnetTrader:
             realized_pnl=net_pnl,
             unrealized_pnl=0.0,
             profit_pct=pnl_pct,
-            hold_bars=bar_idx - order.entry_bar_idx,
+            hold_bars=max(0, bar_idx - order.entry_bar_idx),
             total_fee=fee,
         )
 
@@ -774,7 +837,7 @@ class BinanceTestnetTrader:
 
         order = self.current_position
         if bar_idx is not None:
-            order.hold_bars = bar_idx - order.entry_bar_idx
+            order.hold_bars = max(0, bar_idx - order.entry_bar_idx)
 
         high = high if high is not None else price
         low = low if low is not None else price
@@ -801,12 +864,18 @@ class BinanceTestnetTrader:
                 return CloseReason.TAKE_PROFIT if closed else None
 
         if order.stop_loss is not None:
+            # 如果止损价已进入盈利区（如追踪止盈），则按“止盈”记录
+            is_profit_sl = (
+                (order.side == OrderSide.LONG and order.stop_loss >= order.entry_price) or
+                (order.side == OrderSide.SHORT and order.stop_loss <= order.entry_price)
+            )
+            sl_reason = CloseReason.TAKE_PROFIT if is_profit_sl else CloseReason.STOP_LOSS
             if order.side == OrderSide.LONG and low <= order.stop_loss:
-                closed = self.close_position(order.stop_loss, bar_idx or self.current_bar_idx, CloseReason.STOP_LOSS)
-                return CloseReason.STOP_LOSS if closed else None
+                closed = self.close_position(order.stop_loss, bar_idx or self.current_bar_idx, sl_reason)
+                return sl_reason if closed else None
             if order.side == OrderSide.SHORT and high >= order.stop_loss:
-                closed = self.close_position(order.stop_loss, bar_idx or self.current_bar_idx, CloseReason.STOP_LOSS)
-                return CloseReason.STOP_LOSS if closed else None
+                closed = self.close_position(order.stop_loss, bar_idx or self.current_bar_idx, sl_reason)
+                return sl_reason if closed else None
 
         if self.on_order_update:
             self.on_order_update(order)
