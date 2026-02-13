@@ -856,9 +856,9 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         
         # 表格页
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(13)
+        self.table.setColumnCount(14)
         self.table.setHorizontalHeaderLabels([
-            "时间", "方向", "入场价", "出场价", "止盈", "止损", "盈亏%", "盈亏(USDT)", "手续费", "原因", "相似度", "持仓", "操作"
+            "时间", "方向", "数量", "入场价", "出场价", "止盈", "止损", "盈亏%", "盈亏(USDT)", "手续费", "原因", "相似度", "持仓", "操作"
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
@@ -957,26 +957,32 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         side_item.setForeground(side_color)
         self.table.setItem(row, 1, side_item)
         
+        # 数量
+        quantity = getattr(order, "quantity", 0.0)
+        qty_item = QtWidgets.QTableWidgetItem(f"{quantity:.4f}")
+        qty_item.setForeground(QtGui.QColor("#9e9e9e"))  # 灰色
+        self.table.setItem(row, 2, qty_item)
+        
         # 入场价
-        self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{order.entry_price:.2f}"))
+        self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{order.entry_price:.2f}"))
         
         # 出场价
         exit_price = order.exit_price if order.exit_price else "-"
-        self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{exit_price:.2f}" if isinstance(exit_price, float) else exit_price))
+        self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{exit_price:.2f}" if isinstance(exit_price, float) else exit_price))
 
         # 止盈 / 止损
         tp_val = getattr(order, "take_profit", None)
         sl_val = getattr(order, "stop_loss", None)
         tp_text = f"{tp_val:.2f}" if isinstance(tp_val, float) else "-"
         sl_text = f"{sl_val:.2f}" if isinstance(sl_val, float) else "-"
-        self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(tp_text))
-        self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(sl_text))
+        self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(tp_text))
+        self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(sl_text))
 
         # 盈亏%
         pnl_pct_item = QtWidgets.QTableWidgetItem(f"{order.profit_pct:+.2f}%")
         pnl_color = QtGui.QColor("#089981") if order.profit_pct >= 0 else QtGui.QColor("#f23645")
         pnl_pct_item.setForeground(pnl_color)
-        self.table.setItem(row, 6, pnl_pct_item)
+        self.table.setItem(row, 7, pnl_pct_item)
         
         # 盈亏(USDT) - 开仓显示未实现，平仓显示已实现
         is_closed = getattr(order, "status", None) == OrderStatus.CLOSED or order.exit_time is not None
@@ -986,25 +992,25 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             pnl_val = getattr(order, "unrealized_pnl", 0.0)
         pnl_usdt_item = QtWidgets.QTableWidgetItem(f"{pnl_val:+,.2f}")
         pnl_usdt_item.setForeground(pnl_color)
-        self.table.setItem(row, 7, pnl_usdt_item)
+        self.table.setItem(row, 8, pnl_usdt_item)
         
         # 手续费
         fee_val = getattr(order, "total_fee", 0.0)
         fee_item = QtWidgets.QTableWidgetItem(f"{fee_val:.4f}")
         fee_item.setForeground(QtGui.QColor("#f9a825"))  # 黄色
-        self.table.setItem(row, 8, fee_item)
+        self.table.setItem(row, 9, fee_item)
         
         # 原因
         reason = order.close_reason.value if order.close_reason else "-"
-        self.table.setItem(row, 9, QtWidgets.QTableWidgetItem(reason))
+        self.table.setItem(row, 10, QtWidgets.QTableWidgetItem(reason))
         
-        # 相似度（从第11列移到第10列）
-        self.table.setItem(row, 10, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
+        # 相似度
+        self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
         
-        # 持仓时长（从第12列移到第11列）
-        self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
+        # 持仓时长
+        self.table.setItem(row, 12, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
         
-        # 操作按钮（第12列）
+        # 操作按钮（第13列）
         delete_btn = QtWidgets.QPushButton("删除")
         delete_btn.setStyleSheet("""
             QPushButton {
@@ -1023,7 +1029,7 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             }
         """)
         delete_btn.clicked.connect(lambda checked=False, o=order: self._on_delete_clicked(o))
-        self.table.setCellWidget(row, 12, delete_btn)
+        self.table.setCellWidget(row, 13, delete_btn)
     
     def _on_delete_clicked(self, order):
         """删除按钮点击事件"""

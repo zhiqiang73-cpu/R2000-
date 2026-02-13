@@ -3301,8 +3301,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if order.close_reason:
                 reason_val = order.close_reason.value  # "止盈"/"止损"/"脱轨"/"超时"/"信号"/"手动"
                 trailing = getattr(order, "trailing_stage", 0)
-                if reason_val == "止盈" and trailing >= 1 and order.profit_pct < 1.0:
-                    # 追踪止损触发在保本区 (利润<1%) → 保本平仓
+                if reason_val == "止盈" and trailing >= 1 and order.profit_pct < 0.3:
+                    # 追踪止损触发在保本区 (利润<0.3%) → 保本平仓
                     close_reason_str = "保本"
                 elif reason_val == "止盈":
                     # 真正的止盈（利润较大）
