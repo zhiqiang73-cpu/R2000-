@@ -581,9 +581,12 @@ class PaperTrader:
         return None  # 返回None表示未立即平仓
     
     def update_price(self, price: float, high: float = None, low: float = None,
-                     bar_idx: int = None) -> Optional[CloseReason]:
+                     bar_idx: int = None, protection_mode: bool = False) -> Optional[CloseReason]:
         """
         更新价格，检查止盈止损和限价单成交
+        
+        Args:
+            protection_mode: 保护期模式（True时止损暂缓触发，允许止盈）
         """
         if bar_idx is not None:
             self.current_bar_idx = bar_idx
@@ -638,13 +641,20 @@ class PaperTrader:
                     (order.side == OrderSide.LONG and order.stop_loss >= order.entry_price) or
                     (order.side == OrderSide.SHORT and order.stop_loss <= order.entry_price)
                 )
-                sl_reason = CloseReason.TAKE_PROFIT if is_profit_sl else CloseReason.STOP_LOSS
-                print(f"[PaperTrader] 触发止损/止盈保护! Price={price} Low={low} SL={order.stop_loss}")
-                # 触发止损/止盈保护，立即取消挂单并市价平仓
-                order.pending_limit_order = False
-                self.close_position(order.stop_loss, bar_idx or self.current_bar_idx,
-                                   sl_reason, use_limit_order=False) # 强制市价
-                return sl_reason
+                
+                # 保护期内：只允许盈利止损，阻止亏损止损
+                if protection_mode and not is_profit_sl:
+                    print(f"[PaperTrader] 保护期内，止损暂缓触发 | SL={order.stop_loss:.2f} Entry={order.entry_price:.2f}")
+                    # 不触发，继续持有
+                    pass
+                else:
+                    sl_reason = CloseReason.TAKE_PROFIT if is_profit_sl else CloseReason.STOP_LOSS
+                    print(f"[PaperTrader] 触发止损/止盈保护! Price={price} Low={low} SL={order.stop_loss}")
+                    # 触发止损/止盈保护，立即取消挂单并市价平仓
+                    order.pending_limit_order = False
+                    self.close_position(order.stop_loss, bar_idx or self.current_bar_idx,
+                                       sl_reason, use_limit_order=False) # 强制市价
+                    return sl_reason
 
         # ==========================================================
         # 检查待成交的限价平仓单（如果没触发紧急止损）

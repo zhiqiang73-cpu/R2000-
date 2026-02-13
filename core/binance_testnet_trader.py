@@ -819,7 +819,7 @@ class BinanceTestnetTrader:
         return closed_order
 
     def update_price(self, price: float, high: float = None, low: float = None,
-                     bar_idx: int = None) -> Optional[CloseReason]:
+                     bar_idx: int = None, protection_mode: bool = False) -> Optional[CloseReason]:
         if bar_idx is not None:
             self.current_bar_idx = bar_idx
 
@@ -870,12 +870,18 @@ class BinanceTestnetTrader:
                 (order.side == OrderSide.SHORT and order.stop_loss <= order.entry_price)
             )
             sl_reason = CloseReason.TAKE_PROFIT if is_profit_sl else CloseReason.STOP_LOSS
-            if order.side == OrderSide.LONG and low <= order.stop_loss:
-                closed = self.close_position(order.stop_loss, bar_idx or self.current_bar_idx, sl_reason)
-                return sl_reason if closed else None
-            if order.side == OrderSide.SHORT and high >= order.stop_loss:
-                closed = self.close_position(order.stop_loss, bar_idx or self.current_bar_idx, sl_reason)
-                return sl_reason if closed else None
+            
+            # 保护期内：只允许盈利止损，阻止亏损止损
+            if protection_mode and not is_profit_sl:
+                # 保护期内止损暂缓，不触发
+                pass
+            else:
+                if order.side == OrderSide.LONG and low <= order.stop_loss:
+                    closed = self.close_position(order.stop_loss, bar_idx or self.current_bar_idx, sl_reason)
+                    return sl_reason if closed else None
+                if order.side == OrderSide.SHORT and high >= order.stop_loss:
+                    closed = self.close_position(order.stop_loss, bar_idx or self.current_bar_idx, sl_reason)
+                    return sl_reason if closed else None
 
         if self.on_order_update:
             self.on_order_update(order)

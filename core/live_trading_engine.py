@@ -1273,27 +1273,32 @@ class LiveTradingEngine:
         pnl_pct = order.profit_pct
         self.state.decision_reason = f"[持仓中] {order.side.value} | 相似度={order.current_similarity:.1%} | 收益={pnl_pct:+.2f}%"
         
-        # 更新价格，检查止盈止损
+        # 新开仓保护期：8秒内止损暂缓触发，允许止盈
+        hold_seconds = 0.0
+        try:
+            hold_seconds = max(0.0, (datetime.now() - order.entry_time).total_seconds())
+        except Exception:
+            hold_seconds = 0.0
+        
+        in_protection = hold_seconds < 8
+        
+        # 更新价格，检查止盈止损（保护期内禁止止损）
         close_reason = self._paper_trader.update_price(
             kline.close,
             high=kline.high,
             low=kline.low,
             bar_idx=self._current_bar_idx,
+            protection_mode=in_protection  # 传递保护期状态
         )
         
         if close_reason:
             self._reset_position_state(self._build_exit_reason(close_reason.value, order))
             return
 
-        # 新开仓保护期：8秒内仅监控TP/SL，不执行相似度离场
-        hold_seconds = 0.0
-        try:
-            hold_seconds = max(0.0, (datetime.now() - order.entry_time).total_seconds())
-        except Exception:
-            hold_seconds = 0.0
-        if hold_seconds < 8:
-            self.state.hold_reason = "新开仓保护期，暂不执行相似度离场。"
-            self.state.exit_reason = "保护期内仅监控TP/SL。"
+        # 保护期内跳过相似度检查和追踪止损调整
+        if in_protection:
+            self.state.hold_reason = "新开仓保护期(8秒)，止损暂缓、允许止盈。"
+            self.state.exit_reason = "保护期内不执行相似度离场和追踪止损调整。"
             return
         
         # 三阶段追踪止损 + 追踪止盈
@@ -1534,9 +1539,9 @@ class LiveTradingEngine:
         atr_based_sl_pct = (atr / entry_price) * 2.0
         
         # ========== 因子3: 固定百分比下限（避免噪声止损）==========
-        # BTC 1分钟线，至少 0.15% 距离（约 $100）
+        # BTC 1分钟线，至少 0.2% 距离（约 $130+），强制保护
         # 其他币种可根据价格自动调整
-        min_fixed_pct = 0.0015  # 0.15%
+        min_fixed_pct = 0.002  # 0.2% - 增强保护，防止过快止损
         
         # ========== 风险收益比（基于胜率）==========
         if win_rate >= 0.70:
@@ -1562,6 +1567,18 @@ class LiveTradingEngine:
         else:  # SHORT
             take_profit = entry_price * (1 - take_profit_pct)
             stop_loss = entry_price * (1 + stop_loss_pct)
+        
+        # ========== 最终安全检查：确保止损距离至少 0.2% ==========
+        actual_sl_distance = abs(stop_loss - entry_price)
+        min_sl_distance = entry_price * min_fixed_pct
+        if actual_sl_distance < min_sl_distance:
+            print(f"[LiveEngine] ⚠️ 止损距离过小({actual_sl_distance:.2f})，强制调整到 {min_sl_distance:.2f}")
+            if direction == "LONG":
+                stop_loss = entry_price * (1 - min_fixed_pct)
+            else:
+                stop_loss = entry_price * (1 + min_fixed_pct)
+            # 重新计算实际百分比
+            stop_loss_pct = min_fixed_pct
         
         # 详细日志
         print(f"[LiveEngine] 三因子TP/SL:")
