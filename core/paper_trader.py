@@ -427,8 +427,16 @@ class PaperTrader:
             return self.current_position.side
         return None
     
-    def has_pending_stop_orders(self) -> bool:
-        """检查是否有待成交的止损单"""
+    def has_pending_stop_orders(self, current_bar_idx: int = None) -> bool:
+        """检查是否有待成交的止损单（排除已超时）"""
+        if not self.pending_stop_orders:
+            return False
+        
+        # 如果提供了 bar_idx，过滤掉已超时的订单
+        if current_bar_idx is not None:
+            valid_orders = [o for o in self.pending_stop_orders if current_bar_idx <= o["expire_bar"]]
+            return len(valid_orders) > 0
+        
         return len(self.pending_stop_orders) > 0
     
     def open_position(self,

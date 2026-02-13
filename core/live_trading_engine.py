@@ -863,7 +863,7 @@ class LiveTradingEngine:
             if direction is not None and chosen_fp:
                 # 【新增：动态信号管理】
                 # 如果已经有挂单，检查是否需要“更新”或“撤销”
-                has_pending = self._paper_trader.has_pending_stop_orders()
+                has_pending = self._paper_trader.has_pending_stop_orders(current_bar_idx=self._current_bar_idx)
                 if has_pending:
                     # 只有当指纹变化，或者相似度显著提升（>1%）时，才重新布防
                     is_different = (chosen_fp != self.state.best_match_template)
