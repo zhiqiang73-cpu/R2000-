@@ -1637,6 +1637,36 @@ class LiveTradingEngine:
             # 4. 分类当前K线的市场状态
             current_idx = len(self._df_buffer) - 1
             regime = self._regime_classifier.classify_at(current_idx)
+
+            # 5. 短期趋势修正（让 regime 更贴近 K 线走势）
+            try:
+                from config import MARKET_REGIME_CONFIG
+                lookback = int(MARKET_REGIME_CONFIG.get("SHORT_TREND_LOOKBACK", 12))
+                threshold = float(MARKET_REGIME_CONFIG.get("SHORT_TREND_THRESHOLD", 0.002))
+                if lookback > 0 and len(self._df_buffer) >= lookback + 1:
+                    start_px = float(self._df_buffer["close"].iloc[-lookback - 1])
+                    end_px = float(self._df_buffer["close"].iloc[-1])
+                    if start_px > 0:
+                        short_trend = (end_px - start_px) / start_px
+                        # 短期明显向上：偏空/弱空 → 修正为震荡偏多/弱多
+                        if short_trend > threshold:
+                            if short_trend > threshold * 2:
+                                if regime in (MarketRegime.RANGE_BEAR, MarketRegime.WEAK_BEAR, MarketRegime.STRONG_BEAR, MarketRegime.UNKNOWN):
+                                    return MarketRegime.WEAK_BULL
+                            else:
+                                if regime in (MarketRegime.RANGE_BEAR, MarketRegime.WEAK_BEAR, MarketRegime.STRONG_BEAR, MarketRegime.UNKNOWN):
+                                    return MarketRegime.RANGE_BULL
+                        # 短期明显向下：偏多/弱多 → 修正为震荡偏空/弱空
+                        if short_trend < -threshold:
+                            if short_trend < -threshold * 2:
+                                if regime in (MarketRegime.RANGE_BULL, MarketRegime.WEAK_BULL, MarketRegime.STRONG_BULL, MarketRegime.UNKNOWN):
+                                    return MarketRegime.WEAK_BEAR
+                            else:
+                                if regime in (MarketRegime.RANGE_BULL, MarketRegime.WEAK_BULL, MarketRegime.STRONG_BULL, MarketRegime.UNKNOWN):
+                                    return MarketRegime.RANGE_BEAR
+            except Exception:
+                pass
+
             return regime
             
         except Exception as e:

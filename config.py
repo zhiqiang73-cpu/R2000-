@@ -215,6 +215,9 @@ MARKET_REGIME_CONFIG = {
     "DIR_WEAK_THRESHOLD": 0.001,         # 方向弱趋势阈值 (0.1%，更灵敏)
     "STRENGTH_STRONG_THRESHOLD": 0.006,  # 强度阈值 (振幅/均价 > 0.6%)
     "LOOKBACK_SWINGS": 6,               # 回看摆动点数量 (增加到6个，更全面)
+    # 短期趋势修正（让 regime 更贴近 K 线走势）
+    "SHORT_TREND_LOOKBACK": 12,         # 近 N 根 K 线方向
+    "SHORT_TREND_THRESHOLD": 0.002,     # 0.2% 视为短期趋势明显
 }
 
 # ==================== UI 配置 ====================
