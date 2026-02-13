@@ -1320,6 +1320,15 @@ class PrototypeMatcher:
         if recent_trajectory.size == 0 or current_prototype is None:
             return result
         
+        # 【关键防御】轨迹不足3根K线时，模式匹配结果不可靠，直接跳过
+        # 避免用1-2行数据做 pre_exit 匹配导致随机离场信号
+        MIN_TRAJECTORY_ROWS = 3
+        if recent_trajectory.ndim >= 2 and recent_trajectory.shape[0] < MIN_TRAJECTORY_ROWS:
+            result["details"]["skipped"] = f"轨迹仅{recent_trajectory.shape[0]}行，需≥{MIN_TRAJECTORY_ROWS}行"
+            return result
+        elif recent_trajectory.ndim < 2:
+            return result
+        
         # ══════════════════════════════════════════════════════════
         # 1. Pre-exit 模式匹配：当前轨迹是否像原型的出场段？
         # ══════════════════════════════════════════════════════════

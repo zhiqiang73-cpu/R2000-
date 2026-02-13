@@ -402,6 +402,14 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        # 心跳监控
+        self._heartbeats = {}  # {模块名: 最后更新时间}
+        self._heartbeat_indicators = {}  # {模块名: QLabel}
+        self._heartbeat_timer = QtCore.QTimer()
+        self._heartbeat_timer.timeout.connect(self._update_heartbeats)
+        self._heartbeat_timer.start(500)  # 每500ms检查一次
+        self._heartbeat_blink_state = False
+        
         self._init_ui()
     
     def _init_ui(self):
@@ -493,16 +501,40 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         market_group = QtWidgets.QGroupBox("匹配与市场状态")
         market_layout = QtWidgets.QFormLayout(market_group)
         
+        # 市场状态 + 心跳指示器
+        market_regime_container = QtWidgets.QWidget()
+        market_regime_h_layout = QtWidgets.QHBoxLayout(market_regime_container)
+        market_regime_h_layout.setContentsMargins(0, 0, 0, 0)
+        market_regime_h_layout.setSpacing(5)
+        
         self.market_regime_label = QtWidgets.QLabel("未知")
-        market_layout.addRow("市场状态:", self.market_regime_label)
+        market_regime_h_layout.addWidget(self.market_regime_label)
+        
+        self._heartbeat_indicators["market"] = self._create_heartbeat_indicator()
+        market_regime_h_layout.addWidget(self._heartbeat_indicators["market"])
+        market_regime_h_layout.addStretch()
+        
+        market_layout.addRow("市场状态:", market_regime_container)
         
         self.swing_points_label = QtWidgets.QLabel(f"0 / {MARKET_REGIME_CONFIG.get('LOOKBACK_SWINGS', 4)}")
         self.swing_points_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
         self.swing_points_label.setToolTip(f"已检测到的摆动点数量 / 激活分类所需的最少点数({MARKET_REGIME_CONFIG.get('LOOKBACK_SWINGS', 4)}: 3高+3低)")
         market_layout.addRow("摆动点检测:", self.swing_points_label)
         
+        # 指纹匹配 + 心跳指示器
+        fingerprint_container = QtWidgets.QWidget()
+        fingerprint_h_layout = QtWidgets.QHBoxLayout(fingerprint_container)
+        fingerprint_h_layout.setContentsMargins(0, 0, 0, 0)
+        fingerprint_h_layout.setSpacing(5)
+        
         self.fingerprint_status_label = QtWidgets.QLabel("待匹配")
-        market_layout.addRow("指纹匹配:", self.fingerprint_status_label)
+        fingerprint_h_layout.addWidget(self.fingerprint_status_label)
+        
+        self._heartbeat_indicators["fingerprint"] = self._create_heartbeat_indicator()
+        fingerprint_h_layout.addWidget(self._heartbeat_indicators["fingerprint"])
+        fingerprint_h_layout.addStretch()
+        
+        market_layout.addRow("指纹匹配:", fingerprint_container)
 
         self.matched_fingerprint_label = QtWidgets.QLabel("-")
         self.matched_fingerprint_label.setWordWrap(True)
@@ -528,7 +560,12 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.reason_label.setStyleSheet("color: #bbb;")
         market_layout.addRow("决策说明:", self.reason_label)
         
-        # 动能门控 (Aim/Exit)
+        # 动能门控 (Aim/Exit) + 心跳指示器
+        indicators_main_container = QtWidgets.QWidget()
+        indicators_main_layout = QtWidgets.QHBoxLayout(indicators_main_container)
+        indicators_main_layout.setContentsMargins(0, 0, 0, 0)
+        indicators_main_layout.setSpacing(5)
+        
         self.indicators_container = QtWidgets.QWidget()
         indicators_h_layout = QtWidgets.QHBoxLayout(self.indicators_container)
         indicators_h_layout.setContentsMargins(0, 5, 0, 5)
@@ -545,7 +582,12 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         indicators_h_layout.addWidget(self.kdj_status_badge)
         indicators_h_layout.addStretch()
         
-        market_layout.addRow("动能门控:", self.indicators_container)
+        indicators_main_layout.addWidget(self.indicators_container)
+        self._heartbeat_indicators["gate"] = self._create_heartbeat_indicator()
+        indicators_main_layout.addWidget(self._heartbeat_indicators["gate"])
+        indicators_main_layout.addStretch()
+        
+        market_layout.addRow("动能门控:", indicators_main_container)
         
         layout.addWidget(market_group)
 
@@ -553,8 +595,20 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         monitor_group = QtWidgets.QGroupBox("持仓监控与说明")
         monitor_layout = QtWidgets.QVBoxLayout(monitor_group)
 
+        # 添加心跳指示器到标题行
+        monitor_title_container = QtWidgets.QWidget()
+        monitor_title_layout = QtWidgets.QHBoxLayout(monitor_title_container)
+        monitor_title_layout.setContentsMargins(0, 0, 0, 0)
+        monitor_title_layout.setSpacing(5)
+        
+        monitor_title_layout.addWidget(QtWidgets.QLabel("【持仓理由】"))
+        self._heartbeat_indicators["holding"] = self._create_heartbeat_indicator()
+        monitor_title_layout.addWidget(self._heartbeat_indicators["holding"])
+        monitor_title_layout.addStretch()
+        
+        monitor_layout.addWidget(monitor_title_container)
+        
         # 1. 为何继续持仓
-        monitor_layout.addWidget(QtWidgets.QLabel("【持仓理由】"))
         self.hold_reason_label = QtWidgets.QLabel("未持仓")
         self.hold_reason_label.setWordWrap(True)
         self.hold_reason_label.setStyleSheet("color: #ccc; padding: 2px;")
@@ -667,6 +721,9 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             
     def update_monitoring(self, hold_reason: str, danger_level: float, exit_reason: str):
         """更新持仓监控说明 (NEW)"""
+        # 触发心跳
+        self._trigger_heartbeat("holding")
+        
         self.hold_reason_label.setText(hold_reason or "未持仓")
         self.danger_bar.setValue(int(danger_level))
         self.exit_monitor_label.setText(exit_reason or "-")
@@ -678,6 +735,11 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                                 macd_ready: bool = False,
                                 kdj_ready: bool = False):
         """更新匹配状态和因果说明"""
+        # 触发心跳
+        self._trigger_heartbeat("market")
+        self._trigger_heartbeat("fingerprint")
+        self._trigger_heartbeat("gate")
+        
         self.macd_status_badge.setStyleSheet(self._badge_style(macd_ready))
         self.kdj_status_badge.setStyleSheet(self._badge_style(kdj_ready))
         regime = market_regime or "未知"
@@ -797,6 +859,55 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                 min-width: 45px;
             }}
         """
+    
+    def _create_heartbeat_indicator(self) -> QtWidgets.QLabel:
+        """创建心跳指示器（圆点）"""
+        indicator = QtWidgets.QLabel("●")
+        indicator.setStyleSheet("""
+            QLabel {
+                color: #666;
+                font-size: 12px;
+                padding: 0px;
+                margin: 0px;
+            }
+        """)
+        indicator.setFixedWidth(15)
+        indicator.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        indicator.setToolTip("系统心跳指示器\n绿色闪烁=正常运行\n灰色=停止/异常")
+        return indicator
+    
+    def _update_heartbeats(self):
+        """更新心跳显示（每500ms调用）"""
+        import time
+        current_time = time.time()
+        self._heartbeat_blink_state = not self._heartbeat_blink_state
+        
+        for module, indicator in self._heartbeat_indicators.items():
+            last_update = self._heartbeats.get(module, 0)
+            time_since_update = current_time - last_update
+            
+            # 超过3秒未更新 = 掉线/停止
+            if time_since_update > 3.0:
+                indicator.setStyleSheet("""
+                    QLabel {
+                        color: #666;
+                        font-size: 12px;
+                    }
+                """)
+            else:
+                # 心跳闪烁：绿色 <-> 深绿
+                color = "#00E676" if self._heartbeat_blink_state else "#089981"
+                indicator.setStyleSheet(f"""
+                    QLabel {{
+                        color: {color};
+                        font-size: 12px;
+                    }}
+                """)
+    
+    def _trigger_heartbeat(self, module: str):
+        """触发心跳（在数据更新时调用）"""
+        import time
+        self._heartbeats[module] = time.time()
 
     @staticmethod
     def _fmt_percent(value: float) -> str:
@@ -856,9 +967,9 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         
         # 表格页
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(14)
+        self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
-            "时间", "方向", "数量", "入场价", "出场价", "止盈", "止损", "盈亏%", "盈亏(USDT)", "手续费", "原因", "相似度", "持仓", "操作"
+            "时间", "方向", "数量", "入场价", "出场价", "止盈", "止损", "盈亏%", "盈亏(USDT)", "手续费", "原因", "持仓", "操作"
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
@@ -1000,15 +1111,15 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         fee_item.setForeground(QtGui.QColor("#f9a825"))  # 黄色
         self.table.setItem(row, 9, fee_item)
         
-        # 原因
-        reason = order.close_reason.value if order.close_reason else "-"
-        self.table.setItem(row, 10, QtWidgets.QTableWidgetItem(reason))
-        
-        # 相似度
-        self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(f"{order.entry_similarity:.2%}"))
+        # 原因（具体分类）
+        reason_display = self._classify_exit_reason(order)
+        reason_item = QtWidgets.QTableWidgetItem(reason_display)
+        if hasattr(order, 'decision_reason') and order.decision_reason:
+            reason_item.setToolTip(order.decision_reason)  # 悬停显示完整原因
+        self.table.setItem(row, 10, reason_item)
         
         # 持仓时长
-        self.table.setItem(row, 12, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
+        self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
         
         # 操作按钮（第13列）
         delete_btn = QtWidgets.QPushButton("删除")
@@ -1029,7 +1140,62 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             }
         """)
         delete_btn.clicked.connect(lambda checked=False, o=order: self._on_delete_clicked(o))
-        self.table.setCellWidget(row, 13, delete_btn)
+        self.table.setCellWidget(row, 12, delete_btn)
+    
+    def _classify_exit_reason(self, order) -> str:
+        """
+        从订单信息中提取具体的离场分类
+        
+        Returns:
+            具体的离场原因分类字符串
+        """
+        if not order.close_reason:
+            return "-"
+        
+        # 获取详细原因
+        detail = getattr(order, 'decision_reason', '')
+        
+        # 基于decision_reason和close_reason综合判断
+        if "触及止盈价" in detail:
+            return "固定止盈"
+        elif "追踪止盈" in detail:
+            if "保本" in detail:
+                return "保本止盈"
+            elif "锁利" in detail:
+                return "锁利止盈"
+            elif "紧追" in detail:
+                return "紧追止盈"
+            else:
+                return "追踪止盈"
+        elif "阶梯止盈" in detail or "partial" in detail.lower():
+            return "分段减仓"
+        elif "触及止损价" in detail or order.close_reason.value == "STOP_LOSS":
+            return "止损"
+        elif "市场反转" in detail:
+            # 提取具体的市场反转原因
+            if "MACD" in detail and "KDJ" in detail:
+                return "市场反转"
+            else:
+                return "市场反转"
+        elif "信号" in detail or "离场模式" in detail:
+            # 提取具体的信号类型
+            if "反转形态" in detail:
+                return "反转信号"
+            elif "加速" in detail:
+                return "加速信号"
+            elif "脱轨" in detail:
+                return "脱轨信号"
+            else:
+                return "形态信号"
+        elif order.close_reason.value == "DERAIL":
+            return "相似度脱轨"
+        elif order.close_reason.value == "MAX_HOLD":
+            return "超时离场"
+        elif order.close_reason.value == "MANUAL":
+            return "手动平仓"
+        else:
+            # 回退到原始CloseReason
+            return order.close_reason.value
     
     def _on_delete_clicked(self, order):
         """删除按钮点击事件"""

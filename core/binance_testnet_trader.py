@@ -550,7 +550,14 @@ class BinanceTestnetTrader:
         return self.current_position is not None
 
     def has_pending_stop_orders(self, current_bar_idx: int = None) -> bool:
-        """检查是否有活跃的入场挂单（current_bar_idx仅用于兼容接口）"""
+        """检查是否有活跃的入场挂单（优先本地记录，必要时查交易所）"""
+        # 先用本地挂单缓存，避免频繁 API 查询
+        if self._entry_stop_orders:
+            if current_bar_idx is None:
+                return True
+            valid = [o for o in self._entry_stop_orders if current_bar_idx <= o.get("expire_bar", -1)]
+            if valid:
+                return True
         try:
             # 获取所有挂单
             open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
@@ -753,7 +760,16 @@ class BinanceTestnetTrader:
                 entry_trades = self._get_user_trades(order_id=order_id)
                 entry_fee = sum(self._to_float(t.get("commission", 0.0)) for t in entry_trades)
         except Exception:
-            entry_fee = 0.0
+            pass
+        
+        # 如果API获取失败，使用费率估算（限价单=Maker 0.02%，市价单=Taker 0.05%）
+        if entry_fee == 0.0:
+            # 检查订单类型
+            order_type = resp.get("type", "MARKET")
+            if order_type == "LIMIT":
+                entry_fee = (executed_qty * avg_price) * 0.0002  # Maker费率
+            else:
+                entry_fee = (executed_qty * avg_price) * 0.0005  # Taker费率
 
         order = PaperOrder(
             order_id=str(resp.get("orderId", self._new_client_order_id("ENTRY_LOCAL"))),
@@ -888,6 +904,20 @@ class BinanceTestnetTrader:
         exit_fee = agg["exit_fee"]
         entry_fee = order.total_fee or agg["entry_fee"]
         realized_pnl = agg["realized_pnl"]
+        
+        # 如果API获取失败，使用费率估算手续费
+        if exit_fee == 0.0:
+            # 先尝试限价IOC（Maker费率），如果限价单失败就是市价单（Taker费率）
+            order_type = resp.get("type", "LIMIT")
+            if order_type == "LIMIT":
+                exit_fee = (closed_qty * exit_price) * 0.0002  # Maker费率
+            else:
+                exit_fee = (closed_qty * exit_price) * 0.0005  # Taker费率
+        
+        if entry_fee == 0.0:
+            # 入场大概率是限价单成交（系统设计）
+            entry_fee = (order.quantity * order.entry_price) * 0.0002
+        
         # 交易所 realizedPnl 通常不含手续费，按净值计算
         net_pnl = realized_pnl - exit_fee - entry_fee
         margin_portion = order.margin_used * (closed_qty / max(original_qty, 1e-12))

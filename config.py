@@ -120,7 +120,7 @@ BACKTEST_CONFIG = {
 
 # ==================== 实盘风控配置 ====================
 LIVE_RISK_CONFIG = {
-    "MAX_DRAWDOWN_PCT": 30.0,   # 触发阈值(%), 达到后暂停开仓
+    "MAX_DRAWDOWN_PCT": None,   # 已禁用，不再自动锁定开仓
 }
 
 # ==================== 标注回测配置（基于标记点） ====================
@@ -141,7 +141,7 @@ VECTOR_SPACE_CONFIG = {
     "LOST_THRESHOLD": 20.0,      # 迷失信号阈值 (%) - entry和exit都低于此值
     "EXIT_CONFIRM_BARS": 3,      # 出场信号需连续确认的K线数
     "PRECISION": 3,              # 坐标精度（小数位）
-    "ENTRY_CONFIRM_PCT": 0.0002, # 入场价格确认比例 (0.02%)，优化Maker成交概率
+    "ENTRY_CONFIRM_PCT": 0.0008, # 入场价格确认比例 (0.08%)，要求价格先朝目标方向走~$53(BTC)才成交
     "TRIGGER_TIMEOUT_BARS": 5,   # 信号触发超时（K线数）
     "ENTRY_COOLDOWN_SEC": 8,     # 连续开仓冷却时间（秒）
     # GA权重搜索范围

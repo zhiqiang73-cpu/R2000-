@@ -574,17 +574,17 @@ class LiveTradingEngine:
             if kline.is_closed:
                 self._process_closed_kline(kline)
             else:
-                # 实时更新持仓盈亏 + TP/SL检查（含挂起重试）
+                # 实时 tick：只更新界面显示，不做任何平仓决策
+                # 所有 TP/SL/信号离场 统一在 K 线收线时处理（有完整保护期）
                 if self._paper_trader.has_position():
-                    # 手动/同步仓位可能缺失TP/SL，先补全风险保护
-                    self._ensure_position_tp_sl()
-                    close_reason = self._paper_trader.update_price(
-                        kline.close,
-                        high=kline.high,
-                        low=kline.low,
-                    )
-                    if close_reason:
-                        self._reset_position_state(f"实时TP/SL触发: {close_reason.value}")
+                    order = self._paper_trader.current_position
+                    if order is not None:
+                        # 仅更新浮动盈亏供 UI 展示，不触发任何平仓
+                        pnl = ((kline.close - order.entry_price) * order.quantity
+                               if order.side == OrderSide.LONG
+                               else (order.entry_price - kline.close) * order.quantity)
+                        order.unrealized_pnl = pnl
+                        order.profit_pct = (pnl / max(order.margin_used, 1e-9)) * 100.0
                 else:
                     # 未持仓时，按秒级决策频率做预匹配/入场判断
                     now = time.time()
@@ -937,17 +937,17 @@ class LiveTradingEngine:
                     self.state.best_match_template = chosen_fp
                     return
                 
-                # B. 计算触发价格 (Fire 开火指令)
-                trigger_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
+                # B. 计算挂单价格（限价单入场价）
+                limit_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
                 self.state.last_event = (
                     f"[门控] 通过 | MACD={self.state.macd_ready} KDJ={self.state.kdj_ready} | "
-                    f"触发价={trigger_price:.2f}"
+                    f"限价={limit_price:.2f}"
                 )
                 
                 # C. 直接向交易器下达“预埋开火单” (Exchange-side Stop Order)
                 order_id = self._paper_trader.place_stop_order(
                     side=side,
-                    trigger_price=trigger_price,
+                    trigger_price=limit_price,
                     bar_idx=self._current_bar_idx,
                     take_profit=take_profit,
                     stop_loss=stop_loss,
@@ -957,15 +957,18 @@ class LiveTradingEngine:
                     timeout_bars=timeout
                 )
                 
+                print(f"[LiveEngine] 🎯 挂限价单入场: {direction} @ {limit_price:.2f} "
+                      f"(当前价={price:.2f}, 需涨跌{abs(limit_price-price):.2f})")
+                
                 self.state.best_match_similarity = similarity
                 self.state.best_match_template = chosen_fp
                 self.state.matching_phase = "待定执行"
-                self.state.fingerprint_status = "等待触发"
+                self.state.fingerprint_status = "等待成交"
                 self.state.decision_reason = (
-                    f"[🎯瞄准中] 指纹已布防({similarity:.1%})，等待价格触碰 {trigger_price:.2f}"
+                    f"[🎯挂单中] 限价单已挂({similarity:.1%}) @ {limit_price:.2f} "
                     f"(MACD={self.state.macd_ready}, KDJ={self.state.kdj_ready})"
                 )
-                self.state.last_event = f"🎯瞄准信号 {direction} | 预埋触发 {trigger_price:.2f}"
+                self.state.last_event = f"🎯限价单 {direction} | 挂单价 {limit_price:.2f}"
                 return
             else:
                 # 如果当前没有匹配到任何符合门槛的信号，但手里还有挂单
@@ -1256,6 +1259,11 @@ class LiveTradingEngine:
             reason_text = self._build_exit_reason(reason.value, order)
         elif not reason_text:
             reason_text = f"[平仓] {reason.value}"
+        
+        # 将详细原因写入最近关闭的订单记录
+        if self._paper_trader.order_history:
+            self._paper_trader.order_history[-1].decision_reason = reason_text
+        
         self._reset_position_state(reason_text)
         return True
 
@@ -1304,7 +1312,14 @@ class LiveTradingEngine:
         )
         
         if close_reason:
-            self._reset_position_state(self._build_exit_reason(close_reason.value, order))
+            # 详细的平仓决策日志
+            reason_detail = self._get_tp_sl_trigger_reason(order, close_reason, kline)
+            reason_text = self._build_exit_reason(reason_detail, order)
+            print(f"[LiveEngine] 💰 {reason_text}")
+            # 将详细原因写入最近关闭的订单记录
+            if self._paper_trader.order_history:
+                self._paper_trader.order_history[-1].decision_reason = reason_text
+            self._reset_position_state(reason_text)
             return
 
         # 保护期内跳过相似度检查和追踪止损调整
@@ -1312,6 +1327,33 @@ class LiveTradingEngine:
             self.state.hold_reason = "新开仓保护期(8秒)，止损暂缓、允许止盈。"
             self.state.exit_reason = "保护期内不执行相似度离场和追踪止损调整。"
             return
+        
+        # ══════════════════════════════════════════════════════════
+        # 【新增】市场因素一致性监控：市场状态 + MACD + KDJ
+        # 如果三者一致反转，主动触发离场
+        # ══════════════════════════════════════════════════════════
+        self.state.market_regime = self._infer_market_regime()  # 持仓期间持续更新市场状态
+        
+        if order.hold_bars >= 3:  # 与信号离场保护一致
+            market_reversal = self._check_market_reversal(order)
+            if market_reversal["should_exit"]:
+                # 输出详细的决策依据
+                d = market_reversal["details"]
+                curr = self._df_buffer.iloc[-1]
+                prev = self._df_buffer.iloc[-2]
+                print(f"[LiveEngine] 🔄 市场因素一致反转触发:")
+                print(f"  ├─ 方向: {order.side.value} | 持仓: {order.hold_bars}根K线")
+                print(f"  ├─ 市场状态: {d['regime']}")
+                print(f"  ├─ MACD柱: {prev['macd_hist']:.2f} → {curr['macd_hist']:.2f} "
+                      f"({'转空✓' if d['macd_bearish'] else '转多✓' if d['macd_bullish'] else '中性✗'})")
+                print(f"  ├─ KDJ-J: {prev['j']:.1f} → {curr['j']:.1f} "
+                      f"({'转空✓' if d['kdj_bearish'] else '转多✓' if d['kdj_bullish'] else '中性✗'})")
+                print(f"  └─ 结论: {market_reversal['reason']}")
+                
+                reason_text = self._build_exit_reason(f"市场反转({market_reversal['reason']})", order)
+                if self._close_and_reset(kline.close, self._current_bar_idx,
+                                         CloseReason.SIGNAL, order, reason_text):
+                    return
         
         # 三阶段追踪止损 + 追踪止盈
         self._update_trailing_stop(order, kline, atr)
@@ -1416,46 +1458,68 @@ class LiveTradingEngine:
                 # ══════════════════════════════════════════════════════════
                 # 阶段3：离场模式检测
                 # ══════════════════════════════════════════════════════════
-                # 取最近的轨迹（持仓末尾）用于出场模式匹配
-                from config import TRAJECTORY_CONFIG
-                pre_exit_window = TRAJECTORY_CONFIG.get("PRE_EXIT_WINDOW", 10)
-                recent_traj = holding_traj[-pre_exit_window:] if len(holding_traj) >= pre_exit_window else holding_traj
-                
-                exit_check = self._proto_matcher.check_exit_pattern(
-                    recent_trajectory=recent_traj,
-                    current_prototype=self._current_prototype,
-                    direction=direction,
-                    entry_price=order.entry_price,
-                    current_price=kline.close,
-                    stop_loss=order.stop_loss or order.entry_price,
-                    take_profit=order.take_profit or order.entry_price,
-                    current_regime=self.state.market_regime,
-                )
-                
-                # 如果离场模式检测建议离场，且通过指标确认闸门
-                if exit_check["should_exit"]:
-                    # 离场指标确认 (MACD + KDJ 共振)
-                    if not self._check_exit_indicator_gate(self._df_buffer, direction):
-                        msg = "形态拟出场，但指标动能支撑(MACD/KDJ)，暂缓离场。"
-                        self.state.exit_reason = msg
-                        self.state.decision_reason = f"[持仓中] {msg}"
-                    else:
-                        exit_reason_str = exit_check["exit_reason"]
-                        print(f"[LiveEngine] 离场模式触发: {exit_reason_str} "
-                              f"(信号强度: {exit_check['exit_signal_strength']:.0%})")
-                        reason_text = self._build_exit_reason(f"信号({exit_reason_str})", order)
-                        if not self._close_and_reset(kline.close, self._current_bar_idx,
-                                                     CloseReason.SIGNAL, order, reason_text):
-                            return  # 下单失败，等待重试
-                        return
-                
-                # 更新状态中的出场预估
-                if exit_check["exit_signal_strength"] > 0.3:
+                # 【关键保护】持仓不足3根K线时，轨迹数据不可靠，
+                # 禁止信号离场，只允许 TP/SL 硬保护（已在 update_price 中处理）
+                MIN_HOLD_BARS_FOR_SIGNAL_EXIT = 3
+                if order.hold_bars < MIN_HOLD_BARS_FOR_SIGNAL_EXIT:
                     self.state.exit_reason = (
-                        f"出场信号 {exit_check['exit_signal_strength']:.0%} | "
-                        f"模式匹配 {exit_check['pattern_similarity']:.0%} | "
-                        f"价格位置 {exit_check['price_position']:+.0%}"
+                        f"持仓{order.hold_bars}根K线，需≥{MIN_HOLD_BARS_FOR_SIGNAL_EXIT}根才启用信号离场，"
+                        f"当前仅TP/SL硬保护生效。"
                     )
+                else:
+                    # 取最近的轨迹（持仓末尾）用于出场模式匹配
+                    from config import TRAJECTORY_CONFIG
+                    pre_exit_window = TRAJECTORY_CONFIG.get("PRE_EXIT_WINDOW", 10)
+                    recent_traj = holding_traj[-pre_exit_window:] if len(holding_traj) >= pre_exit_window else holding_traj
+                    
+                    exit_check = self._proto_matcher.check_exit_pattern(
+                        recent_trajectory=recent_traj,
+                        current_prototype=self._current_prototype,
+                        direction=direction,
+                        entry_price=order.entry_price,
+                        current_price=kline.close,
+                        stop_loss=order.stop_loss or order.entry_price,
+                        take_profit=order.take_profit or order.entry_price,
+                        current_regime=self.state.market_regime,
+                    )
+                    
+                    # 如果离场模式检测建议离场，且通过指标确认闸门
+                    if exit_check["should_exit"]:
+                        # 离场指标确认 (MACD + KDJ 共振)
+                        gate_result = self._check_exit_indicator_gate(self._df_buffer, direction)
+                        
+                        # 输出详细的决策依据
+                        print(f"[LiveEngine] 📊 信号离场决策分析:")
+                        print(f"  ├─ 方向: {direction} | 持仓: {order.hold_bars}根K线")
+                        print(f"  ├─ 形态匹配: {exit_check['pattern_similarity']:.1%} | 信号强度: {exit_check['exit_signal_strength']:.1%}")
+                        print(f"  ├─ 离场原因: {exit_check['exit_reason']}")
+                        
+                        if "details" in gate_result and gate_result["details"]:
+                            d = gate_result["details"]
+                            print(f"  ├─ MACD柱: {d['macd_prev']:.2f} → {d['macd_curr']:.2f} ({d['macd_status']})")
+                            print(f"  ├─ KDJ-J: {d['kdj_prev']:.1f} → {d['kdj_curr']:.1f} ({d['kdj_status']})")
+                        
+                        print(f"  └─ 指标闸门: {'通过✓' if gate_result['passed'] else '未通过✗'} ({gate_result['reason']})")
+                        
+                        if not gate_result["passed"]:
+                            msg = f"形态拟出场，但指标动能支撑({gate_result['reason']})，暂缓离场。"
+                            self.state.exit_reason = msg
+                            self.state.decision_reason = f"[持仓中] {msg}"
+                        else:
+                            exit_reason_str = exit_check["exit_reason"]
+                            reason_text = self._build_exit_reason(f"信号({exit_reason_str})", order)
+                            if not self._close_and_reset(kline.close, self._current_bar_idx,
+                                                         CloseReason.SIGNAL, order, reason_text):
+                                return  # 下单失败，等待重试
+                            return
+                    
+                    # 更新状态中的出场预估
+                    if exit_check["exit_signal_strength"] > 0.3:
+                        self.state.exit_reason = (
+                            f"出场信号 {exit_check['exit_signal_strength']:.0%} | "
+                            f"模式匹配 {exit_check['pattern_similarity']:.0%} | "
+                            f"价格位置 {exit_check['price_position']:+.0%}"
+                        )
                 
             else:
                 # 模板模式（旧逻辑）
@@ -1819,13 +1883,99 @@ class LiveTradingEngine:
     
     @staticmethod
     def _build_exit_reason(reason: str, order) -> str:
-        """交易员风格平仓因果说明"""
-        side = order.side.value if order is not None else "-"
-        hold = order.hold_bars if order is not None else "-"
-        return (
-            f"[平仓逻辑] 方向={side} | 持仓K线={hold} | 触发条件={reason}。"
-            f" 因为风险控制条件触发，所以执行平仓。"
-        )
+        """交易员风格平仓因果说明 - 详细版"""
+        if order is None:
+            return f"[平仓] 触发条件={reason}"
+        
+        side = order.side.value
+        hold = order.hold_bars
+        entry = order.entry_price
+        pnl_pct = order.profit_pct
+        peak_pct = order.peak_profit_pct
+        trailing_stage = order.trailing_stage
+        sl = order.stop_loss
+        tp = order.take_profit
+        original_sl = order.original_stop_loss
+        
+        # 构建详细的决策逻辑说明
+        stage_names = {0: "未启动", 1: "保本阶段", 2: "锁利阶段", 3: "紧追阶段"}
+        stage_name = stage_names.get(trailing_stage, "未知")
+        
+        # 判断是否是追踪止损触发（SL已经移动到盈利区）
+        sl_moved = False
+        if sl and original_sl:
+            if side == "LONG" and sl > original_sl:
+                sl_moved = True
+            elif side == "SHORT" and sl < original_sl:
+                sl_moved = True
+        
+        # 生成决策逻辑
+        logic_parts = [
+            f"方向={side}",
+            f"持仓={hold}根K线",
+            f"入场价={entry:.2f}",
+            f"当前盈亏={pnl_pct:+.2f}%",
+            f"峰值盈利={peak_pct:.2f}%",
+            f"追踪阶段={stage_name}",
+        ]
+        
+        if sl_moved:
+            logic_parts.append(f"SL已上移({original_sl:.2f}→{sl:.2f})")
+        
+        logic_str = " | ".join(logic_parts)
+        
+        return f"[平仓决策] {logic_str} | 触发={reason}"
+    
+    def _get_tp_sl_trigger_reason(self, order, close_reason: CloseReason, kline) -> str:
+        """
+        根据触发情况生成详细的平仓原因说明
+        """
+        if order is None:
+            return close_reason.value
+        
+        entry = order.entry_price
+        sl = order.stop_loss
+        tp = order.take_profit
+        original_sl = order.original_stop_loss
+        trailing_stage = order.trailing_stage
+        peak_pct = order.peak_profit_pct
+        side = order.side.value
+        
+        # 判断 SL 是否已移动（追踪止损生效）
+        sl_moved = False
+        if sl and original_sl:
+            if side == "LONG" and sl > original_sl:
+                sl_moved = True
+            elif side == "SHORT" and sl < original_sl:
+                sl_moved = True
+        
+        # 判断 SL 是否在盈利区
+        sl_in_profit = False
+        if sl:
+            if side == "LONG" and sl >= entry:
+                sl_in_profit = True
+            elif side == "SHORT" and sl <= entry:
+                sl_in_profit = True
+        
+        stage_names = {0: "未启动", 1: "保本", 2: "锁利", 3: "紧追"}
+        stage_name = stage_names.get(trailing_stage, "")
+        
+        if close_reason == CloseReason.TAKE_PROFIT:
+            # 细分止盈类型
+            if tp and ((side == "LONG" and kline.high >= tp) or (side == "SHORT" and kline.low <= tp)):
+                return f"触及止盈价(TP={tp:.2f})"
+            elif sl_moved and sl_in_profit:
+                return f"追踪止盈({stage_name}阶段, SL={sl:.2f}, 峰值盈利{peak_pct:.1f}%)"
+            elif sl_in_profit:
+                return f"保本止盈(SL={sl:.2f}已在成本价之上)"
+            else:
+                return f"止盈(TP={tp:.2f})"
+        
+        elif close_reason == CloseReason.STOP_LOSS:
+            return f"触及止损价(SL={sl:.2f}, 原始SL={original_sl:.2f})"
+        
+        else:
+            return close_reason.value
     
     def get_history_df(self) -> pd.DataFrame:
         """获取历史K线DataFrame（含 MACD/KDJ 等指标，供图表显示）"""
@@ -1934,16 +2084,22 @@ class LiveTradingEngine:
         """
         三阶段渐进式追踪止损 + 追踪止盈
         
-        █ 阶段0（未激活）: profit < 0.8% → 保持原始止损
-        █ 阶段1（保本）:   profit >= 0.8% → SL移至入场价+微利（保本）
-        █ 阶段2（锁利）:   profit >= 2.0% → SL锁住峰值利润的40%
-        █ 阶段3（紧追）:   profit >= 4.0% → SL紧跟峰值利润的60%，追踪TP上移
+        █ 阶段0（未激活）: profit < 1.5% → 保持原始止损
+        █ 阶段1（保本）:   profit >= 1.5% → SL移至入场价附近（保本）
+        █ 阶段2（锁利）:   profit >= 3.0% → SL锁住峰值利润的40%
+        █ 阶段3（紧追）:   profit >= 5.0% → SL紧跟峰值利润的60%，追踪TP上移
         
         核心原则：
         - 止损只能往有利方向移动，永不回退
         - 止盈跟随价格上移（多）/下移（空），永不降低
+        - 持仓不足3根K线时不启动追踪（让交易有发展空间）
         """
         if atr <= 0:
+            return
+        
+        # 【关键保护】持仓不足3根K线，不启动追踪止损
+        # 与信号离场保护一致：前3根K线只靠TP/SL硬保护
+        if order.hold_bars < 3:
             return
         
         entry = order.entry_price
@@ -1951,30 +2107,34 @@ class LiveTradingEngine:
         current_tp = order.take_profit
         profit_pct = order.profit_pct
         peak_pct = order.peak_profit_pct
+        leverage = float(self._paper_trader.leverage)
         
         new_sl = current_sl
         new_tp = current_tp
         new_stage = order.trailing_stage
         
-        # ── 阶段判定 ──
-        if peak_pct >= 4.0:
+        # ── 阶段判定（阈值已提高，给交易更多发展空间）──
+        if peak_pct >= 5.0:
             new_stage = max(order.trailing_stage, 3)
-        elif peak_pct >= 2.0:
+        elif peak_pct >= 3.0:
             new_stage = max(order.trailing_stage, 2)
-        elif peak_pct >= 0.8:
+        elif peak_pct >= 1.5:
             new_stage = max(order.trailing_stage, 1)
         
-        # ── 阶段1：保本 ──
+        # ── 阶段1：保本（杠杆感知）──
         if new_stage >= 1:
-            # SL = 入场价 + 0.2% 微利缓冲（覆盖手续费）
-            if order.side == OrderSide.LONG:
-                breakeven_sl = entry * 1.002
-            else:
-                breakeven_sl = entry * 0.998
+            # 根据实际峰值利润和杠杆计算合理的保本缓冲
+            # peak_pct 是杠杆化利润，换算为价格百分比：peak_pct / leverage / 100
+            peak_price_pct = peak_pct / leverage / 100.0
+            # 保本缓冲 = 实际价格移动的 40%，但不超过 0.2%，不低于 0.03%
+            breakeven_buffer = min(0.002, peak_price_pct * 0.4)
+            breakeven_buffer = max(breakeven_buffer, 0.0003)
             
             if order.side == OrderSide.LONG:
+                breakeven_sl = entry * (1 + breakeven_buffer)
                 new_sl = max(new_sl, breakeven_sl)
             else:
+                breakeven_sl = entry * (1 - breakeven_buffer)
                 new_sl = min(new_sl, breakeven_sl)
         
         # ── 阶段2：锁利（锁住峰值利润的40%）──
@@ -2035,29 +2195,107 @@ class LiveTradingEngine:
                   f"峰值利润={peak_pct:.1f}%")
             order.trailing_stage = new_stage
 
-    def _check_exit_indicator_gate(self, df: pd.DataFrame, direction: str) -> bool:
+    def _check_exit_indicator_gate(self, df: pd.DataFrame, direction: str) -> dict:
         """
         离场指标确认门槛 (MACD + KDJ 共振)
         只有当指标也显示反向动能时，才允许基于形态的离场
+        
+        Returns:
+            {"passed": bool, "reason": str, "details": dict}
         """
         if df is None or len(df) < 3:
-            return True
+            return {"passed": True, "reason": "指标数据不足，默认通过", "details": {}}
             
         curr = df.iloc[-1]
         prev = df.iloc[-2]
+        
+        details = {
+            "macd_prev": prev['macd_hist'],
+            "macd_curr": curr['macd_hist'],
+            "kdj_prev": prev['j'],
+            "kdj_curr": curr['j'],
+        }
         
         if direction == "LONG":
             # 1. MACD 柱状图在收缩或转负
             macd_exit = curr['macd_hist'] < prev['macd_hist'] or curr['macd_hist'] < 0
             # 2. KDJ J线不再创新高（已经掉头或走平）
             kdj_exit = curr['j'] < prev['j']
-            return macd_exit and kdj_exit
+            passed = macd_exit and kdj_exit
+            
+            details["macd_status"] = "收缩/转负✓" if macd_exit else "仍扩张✗"
+            details["kdj_status"] = "掉头✓" if kdj_exit else "仍上行✗"
         else:
             # 1. MACD 柱状图在回升或转正
             macd_exit = curr['macd_hist'] > prev['macd_hist'] or curr['macd_hist'] > 0
             # 2. KDJ J线不再创新低（已经拉升或走平）
             kdj_exit = curr['j'] > prev['j']
-            return macd_exit and kdj_exit
+            passed = macd_exit and kdj_exit
+            
+            details["macd_status"] = "回升/转正✓" if macd_exit else "仍下行✗"
+            details["kdj_status"] = "拉升✓" if kdj_exit else "仍下行✗"
+        
+        reason = f"MACD {details['macd_status']}, KDJ {details['kdj_status']}"
+        return {"passed": passed, "reason": reason, "details": details}
+
+    def _check_market_reversal(self, order: PaperOrder) -> dict:
+        """
+        检查市场因素是否一致反转（市场状态 + MACD + KDJ）
+        
+        做多持仓：如果市场变空 + MACD转空 + KDJ转空 → 建议离场
+        做空持仓：如果市场变多 + MACD转多 + KDJ转多 → 建议离场
+        
+        Returns:
+            {"should_exit": bool, "reason": str, "details": dict}
+        """
+        result = {"should_exit": False, "reason": "", "details": {}}
+        
+        if self._df_buffer is None or len(self._df_buffer) < 3:
+            return result
+        
+        direction = order.side.value  # "LONG" or "SHORT"
+        curr = self._df_buffer.iloc[-1]
+        prev = self._df_buffer.iloc[-2]
+        
+        # 1. 市场状态检查
+        current_regime = self.state.market_regime
+        bull_regimes = {MarketRegime.STRONG_BULL, MarketRegime.WEAK_BULL, MarketRegime.RANGE_BULL}
+        bear_regimes = {MarketRegime.STRONG_BEAR, MarketRegime.WEAK_BEAR, MarketRegime.RANGE_BEAR}
+        
+        regime_bullish = current_regime in bull_regimes
+        regime_bearish = current_regime in bear_regimes
+        
+        # 2. MACD 趋势检查（连续2根K线确认）
+        macd_bullish = curr['macd_hist'] > 0 and curr['macd_hist'] > prev['macd_hist']
+        macd_bearish = curr['macd_hist'] < 0 and curr['macd_hist'] < prev['macd_hist']
+        
+        # 3. KDJ 趋势检查（J线方向）
+        kdj_bullish = curr['j'] > prev['j'] and curr['j'] > 50
+        kdj_bearish = curr['j'] < prev['j'] and curr['j'] < 50
+        
+        result["details"] = {
+            "regime": str(current_regime),
+            "regime_bullish": regime_bullish,
+            "regime_bearish": regime_bearish,
+            "macd_bullish": macd_bullish,
+            "macd_bearish": macd_bearish,
+            "kdj_bullish": kdj_bullish,
+            "kdj_bearish": kdj_bearish,
+        }
+        
+        # 判断是否一致反转
+        if direction == "LONG":
+            # 做多时，三者一致转空 → 离场
+            if regime_bearish and macd_bearish and kdj_bearish:
+                result["should_exit"] = True
+                result["reason"] = f"市场={current_regime} + MACD转空 + KDJ转空"
+        else:  # SHORT
+            # 做空时，三者一致转多 → 离场
+            if regime_bullish and macd_bullish and kdj_bullish:
+                result["should_exit"] = True
+                result["reason"] = f"市场={current_regime} + MACD转多 + KDJ转多"
+        
+        return result
 
     def _round_to_step(self, qty: float) -> float:
         """按交易所最小步进对齐数量"""

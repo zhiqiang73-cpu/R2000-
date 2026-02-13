@@ -99,6 +99,7 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 template_fingerprint=t.get("template_fingerprint"),
                 entry_similarity=float(t.get("entry_similarity", 0)),
                 entry_reason=t.get("entry_reason", ""),
+                decision_reason=t.get("decision_reason", ""),
                 hold_bars=int(t.get("hold_bars", 0)),
             )
             loaded.append(order)
@@ -161,6 +162,7 @@ class PaperOrder:
     template_fingerprint: Optional[str] = None
     entry_similarity: float = 0.0
     entry_reason: str = ""    # 开仓因果说明
+    decision_reason: str = "" # 平仓决策说明（详细原因）
     
     # 动态追踪状态
     tracking_status: str = "安全"     # "安全" / "警戒" / "脱轨"
@@ -248,6 +250,7 @@ class PaperOrder:
             "template_fingerprint": self.template_fingerprint,
             "entry_similarity": self.entry_similarity,
             "entry_reason": self.entry_reason,
+            "decision_reason": self.decision_reason,
             "hold_bars": self.hold_bars,
             "peak_profit_pct": self.peak_profit_pct,
             "trailing_stage": self.trailing_stage,
