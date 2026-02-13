@@ -143,6 +143,7 @@ VECTOR_SPACE_CONFIG = {
     "PRECISION": 3,              # 坐标精度（小数位）
     "ENTRY_CONFIRM_PCT": 0.0002, # 入场价格确认比例 (0.02%)，优化Maker成交概率
     "TRIGGER_TIMEOUT_BARS": 5,   # 信号触发超时（K线数）
+    "ENTRY_COOLDOWN_SEC": 8,     # 连续开仓冷却时间（秒）
     # GA权重搜索范围
     "WEIGHT_MIN": -10.0,
     "WEIGHT_MAX": 10.0,

@@ -729,6 +729,10 @@ class LiveTradingEngine:
             self.state.decision_reason = "风控触发：最大回撤已达阈值，暂停开仓。"
             self.state.last_event = "⚠ 风控暂停开仓"
             return
+        # 实盘/测试网：只在收线时决策，避免实时tick疯狂下单
+        if hasattr(self._paper_trader, "sync_from_exchange") and not kline.is_closed:
+            self.state.last_event = "[入场跳过] 实盘仅在收线决策"
+            return
         try:
             # 准备阶段
             self.state.matching_phase = "匹配入场"
@@ -863,6 +867,14 @@ class LiveTradingEngine:
             if direction is not None and chosen_fp:
                 # 【新增：动态信号管理】
                 # 如果已经有挂单，检查是否需要“更新”或“撤销”
+                # 连续开仓冷却（避免信号抖动造成频繁挂单）
+                from config import VECTOR_SPACE_CONFIG
+                cooldown = float(VECTOR_SPACE_CONFIG.get("ENTRY_COOLDOWN_SEC", 8))
+                last_ts = getattr(self._paper_trader, "_last_entry_ts", 0.0) or 0.0
+                if cooldown > 0 and (time.time() - last_ts) < cooldown:
+                    self.state.last_event = f"[入场跳过] 冷却中({cooldown:.0f}s)"
+                    return
+
                 has_pending = self._paper_trader.has_pending_stop_orders(current_bar_idx=self._current_bar_idx)
                 if has_pending:
                     # 只有当指纹变化，或者相似度显著提升（>1%）时，才重新布防
