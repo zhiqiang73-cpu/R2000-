@@ -38,10 +38,13 @@ class CloseReason(Enum):
     """平仓原因"""
     TAKE_PROFIT = "止盈"
     STOP_LOSS = "止损"
+    TRAILING_STOP = "追踪止损"    # 追踪止损/保本止损触发（有盈利但未到TP）
     DERAIL = "脱轨"          # 动态追踪脱轨
     MAX_HOLD = "超时"        # 超过最大持仓时间
     MANUAL = "手动"          # 手动平仓
     SIGNAL = "信号"          # 模板匹配离场信号
+    EXCHANGE_CLOSE = "交易所平仓"  # 交易所侧被动平仓（非本系统主动触发）
+    POSITION_FLIP = "位置翻转"    # 价格到达区间极端位置，主动平仓+反手
 
 
 def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
@@ -101,6 +104,10 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 entry_reason=t.get("entry_reason", ""),
                 decision_reason=t.get("decision_reason", ""),
                 hold_bars=int(t.get("hold_bars", 0)),
+                exit_signals_triggered=t.get("exit_signals_triggered", []),
+                entry_atr=float(t.get("entry_atr", 0)),
+                is_flip_trade=bool(t.get("is_flip_trade", False)),
+                flip_reason=t.get("flip_reason", ""),
             )
             loaded.append(order)
         return loaded
@@ -177,6 +184,14 @@ class PaperOrder:
     peak_profit_pct: float = 0.0      # 持仓期间峰值收益率 (%)
     trailing_stage: int = 0           # 追踪止损阶段: 0=未激活, 1=保本, 2=锁利, 3=紧追
     partial_tp_count: int = 0         # 已执行减仓次数
+    
+    # 离场信号学习（用于自适应优化）
+    exit_signals_triggered: List[tuple] = field(default_factory=list)  # [(signal_name, profit_at_trigger), ...]
+    entry_atr: float = 0.0            # 入场时的 ATR（用于学习最优 TP 距离）
+    
+    # 翻转单标记（用于贝叶斯加权学习）
+    is_flip_trade: bool = False       # 是否由价格位置翻转触发
+    flip_reason: str = ""             # 翻转原因（"底部翻转做多"/"顶部翻转做空"）
     
     # 限价单相关
     pending_limit_order: bool = False      # 是否有待成交限价单
@@ -255,6 +270,10 @@ class PaperOrder:
             "peak_profit_pct": self.peak_profit_pct,
             "trailing_stage": self.trailing_stage,
             "partial_tp_count": self.partial_tp_count,
+            "exit_signals_triggered": self.exit_signals_triggered,
+            "entry_atr": self.entry_atr,
+            "is_flip_trade": self.is_flip_trade,
+            "flip_reason": self.flip_reason,
         }
 
 
@@ -659,9 +678,13 @@ class PaperTrader:
                     # 不触发，继续持有
                     pass
                 else:
-                    sl_reason = CloseReason.TAKE_PROFIT if is_profit_sl else CloseReason.STOP_LOSS
-                    print(f"[PaperTrader] 触发止损/止盈保护! Price={price} Low={low} SL={order.stop_loss}")
-                    # 触发止损/止盈保护，立即取消挂单并市价平仓
+                    # 【修复】区分"追踪止损/保本止损"和"真正止盈"
+                    # 保本止损：SL被移到入场价以上，有盈利但未到TP → 标记为TRAILING_STOP
+                    # 真正止损：SL在入场价以下，亏损 → 标记为STOP_LOSS
+                    sl_reason = CloseReason.TRAILING_STOP if is_profit_sl else CloseReason.STOP_LOSS
+                    label = "追踪止损(保本)" if is_profit_sl else "止损"
+                    print(f"[PaperTrader] 触发{label}! Price={price} Low={low} SL={order.stop_loss}")
+                    # 立即取消挂单并市价平仓
                     order.pending_limit_order = False
                     self.close_position(order.stop_loss, bar_idx or self.current_bar_idx,
                                        sl_reason, use_limit_order=False) # 强制市价

@@ -213,11 +213,10 @@ PROTOTYPE_CONFIG = {
 # ==================== 市场状态分类配置 ====================
 MARKET_REGIME_CONFIG = {
     "DIR_STRONG_THRESHOLD": 0.008,       # 方向强趋势阈值 (0.8%)
-    "DIR_WEAK_THRESHOLD": 0.001,         # 方向弱趋势阈值 (0.1%，更灵敏)
     "STRENGTH_STRONG_THRESHOLD": 0.006,  # 强度阈值 (振幅/均价 > 0.6%)
-    "LOOKBACK_SWINGS": 6,               # 回看摆动点数量 (增加到6个，更全面)
+    "LOOKBACK_SWINGS": 4,               # 回看摆动点数量（只看最近走势）
     # 短期趋势修正（让 regime 更贴近 K 线走势）
-    "SHORT_TREND_LOOKBACK": 12,         # 近 N 根 K 线方向
+    "SHORT_TREND_LOOKBACK": 6,          # 近 N 根 K 线方向（更聚焦当前）
     "SHORT_TREND_THRESHOLD": 0.002,     # 0.2% 视为短期趋势明显
 }
 
@@ -283,11 +282,52 @@ PAPER_TRADING_CONFIG = {
     "TAKE_PROFIT_ATR": 3.0,
     "MAX_HOLD_BARS": 240,
     
+    # ── 止损保护参数（防止正常波动被扫损）──
+    "MIN_SL_PCT": 0.005,        # 最小止损距离 0.5%（BTC≈$475），挡住1分钟正常波动
+    "ATR_SL_MULTIPLIER": 3.0,   # ATR 止损倍数（越大越宽松），原来 2.0 太紧
+    "SL_PROTECTION_SEC": 60,    # 新仓保护期（秒），保护期内止损暂缓，原来 8 秒太短
+    
+    # ── 前3根K线紧急止损守卫 (Early Exit Guard) ──
+    # 问题：前3根保护期内只有硬止损保护，形成致命盲区（3根就能亏3-4%）
+    # 方案1：亏损超阈值 → 紧急平仓
+    # 方案2：原始市场状态与持仓方向冲突 → 收紧止损至入场价附近
+    "EARLY_EXIT_ADVERSE_PCT": 1.5,     # 保护期内亏损超此%（杠杆后）→ 紧急平仓
+    "EARLY_EXIT_TIGHTEN_PCT": 0.005,   # 市场冲突时止损收紧到入场价±此%（0.5%）
+    
+    # ── 反手单 (Stop-and-Reverse) ──
+    # 止损说明方向判断错误，自动反手做反方向
+    "REVERSE_ON_STOPLOSS": True,      # 是否启用止损反手
+    "REVERSE_MAX_COUNT": 1,           # 最多连续反手次数（防止来回被扫）
+    "REVERSE_BLOCK_SAME_DIR_SEC": 300,  # 止损后禁止同方向入场的时间（秒）
+    
     # 动态追踪
     "HOLD_SAFE_THRESHOLD": 0.7,
     "HOLD_ALERT_THRESHOLD": 0.5,
     "HOLD_DERAIL_THRESHOLD": 0.3,
+    
+    # ── 追踪止损阶段阈值（降低以更早锁定利润）──
+    "TRAILING_STAGE1_PCT": 1.0,       # 阶段1(保本)激活阈值：峰值利润>=1%（原1.5%）
+    "TRAILING_STAGE2_PCT": 2.0,       # 阶段2(锁利40%)激活阈值：峰值利润>=2%（原3%）
+    "TRAILING_STAGE3_PCT": 3.5,       # 阶段3(紧追60%)激活阈值：峰值利润>=3.5%（原5%）
+    "TRAILING_LOCK_PCT_STAGE2": 0.50, # 阶段2锁定峰值利润的比例（50%，原40%）
+    "TRAILING_LOCK_PCT_STAGE3": 0.70, # 阶段3锁定峰值利润的比例（70%，原60%）
+    
+    # ── 价格动量衰减离场（新增）──
+    # 当价格接近峰值但动能衰减时主动离场
+    "MOMENTUM_EXIT_ENABLED": True,     # 是否启用动量衰减离场
+    "MOMENTUM_MIN_PROFIT_PCT": 1.5,    # 最低利润阈值（至少盈利1.5%才检测）
+    "MOMENTUM_LOOKBACK_BARS": 3,       # 动量检测回看K线数
+    "MOMENTUM_DECAY_THRESHOLD": 0.5,   # K线实体缩小阈值（当前<峰值的50%视为衰减）
+    "MOMENTUM_PEAK_RETRACEMENT": 0.8,  # 从峰值回撤阈值（回撤80%的利润触发）
     "HOLD_CHECK_INTERVAL": 3,
+    
+    # ── 离场信号学习系统（自适应优化）──
+    "EXIT_LEARNING_ENABLED": True,     # 是否启用离场信号学习
+    "EXIT_LEARNING_STATE_FILE": "data/exit_learning_state.json",  # 持久化文件路径
+    "EXIT_LEARNING_DECAY_ENABLED": True,  # 是否启用时间衰减
+    "EXIT_LEARNING_DECAY_HOURS": 48.0,    # 衰减间隔（小时）
+    "EXIT_LEARNING_DECAY_FACTOR": 0.95,   # 衰减因子（0-1）
+    "EXIT_LEARNING_MIN_SAMPLES": 10,      # 最少样本数（少于此值使用默认策略）
 
     # 实时决策频率（秒）
     "REALTIME_DECISION_SEC": 0.05,
@@ -301,6 +341,27 @@ PAPER_TRADING_CONFIG = {
     # 数据目录
     "HISTORY_DIR": "data/paper_trading",
     "VERIFIED_DIR": "data/sim_verified",
+
+    # 离场限价 IOC 价格缓冲（%），更激进 = 更高 IOC 成交率、减少市价降级（省 Taker 费）
+    # 0.001=0.1%（原值）, 0.003=0.3%（推荐）, 0.005=0.5%（极端波动）
+    "EXIT_IOC_BUFFER_PCT": 0.003,
+    
+    # ── 贝叶斯交易过滤器（Thompson Sampling + 凯利公式）──
+    "BAYESIAN_ENABLED": True,              # 是否启用贝叶斯门控
+    "BAYESIAN_PRIOR_STRENGTH": 10.0,       # 先验强度（历史回测数据相当于多少笔实盘交易）
+    "BAYESIAN_MIN_WIN_RATE": 0.40,         # 最低胜率阈值（低于此值拒绝交易）
+    "BAYESIAN_THOMPSON_SAMPLING": True,    # 是否使用 Thompson Sampling（探索与利用平衡）
+    "BAYESIAN_DECAY_ENABLED": True,        # 是否启用时间衰减（适应市场变化）
+    "BAYESIAN_DECAY_HOURS": 24.0,          # 衰减间隔（小时）
+    "BAYESIAN_DECAY_FACTOR": 0.95,         # 衰减因子（0-1，越小遗忘越快）
+    "BAYESIAN_STATE_FILE": "data/bayesian_state.json",  # 持久化文件路径
+    
+    # ── 凯利公式动态仓位管理 ──
+    "KELLY_ENABLED": True,                 # 是否启用凯利公式动态仓位
+    "KELLY_FRACTION": 0.25,                # 凯利分数（0.25=四分之一凯利，推荐范围 0.25-0.5）
+    "KELLY_MAX_POSITION": 0.5,             # 凯利仓位上限（50% 本金）
+    "KELLY_MIN_POSITION": 0.05,            # 凯利仓位下限（5% 本金，样本不足时保守试探）
+    "KELLY_MIN_SAMPLES": 5,                # 凯利计算最少样本数（少于此值用最小仓位）
 }
 
 # ==================== 日志配置 ====================

@@ -1065,22 +1065,10 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 print(f"[MarketRegime] 初始化失败: {e}")
 
-        # 初始化特征向量引擎 + 记忆体
+        # 仅做轻量初始化：重计算（FV precompute）延后到标注完成阶段，避免“开始标记”卡UI
         if self.df is not None:
             try:
-                from core.feature_vector import FeatureVectorEngine
-                from core.vector_memory import VectorMemory
                 from core.trajectory_engine import TrajectoryMemory
-                self.fv_engine = FeatureVectorEngine()
-                self.fv_engine.precompute(self.df)
-                self.vector_memory = VectorMemory(
-                    k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
-                    min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
-                )
-                self._fv_ready = True
-                print("[FeatureVector] 引擎和记忆体就绪")
-                
-                # 初始化轨迹记忆体（用于实时积累指纹模板）
                 if self.trajectory_memory is None:
                     src_symbol, src_interval = self._infer_source_meta()
                     self.trajectory_memory = TrajectoryMemory(
@@ -1089,8 +1077,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     print("[TrajectoryMemory] 轨迹记忆体就绪（实时积累模式）")
             except Exception as e:
-                print(f"[FeatureVector] 初始化失败: {e}")
-                traceback.print_exc()
+                print(f"[TrajectoryMemory] 初始化失败: {e}")
 
         # 启动回测追赶（避免主线程卡顿）
         if self.df is not None:
@@ -2666,6 +2653,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 socks_proxy=socks_proxy,
                 on_state_update=self._on_live_state_update,
                 on_kline=self._on_live_kline,
+                on_price_tick=self._on_live_price_tick,
                 on_trade_opened=self._on_live_trade_opened,
                 on_trade_closed=self._on_live_trade_closed,
                 on_error=self._handle_live_error,
@@ -2822,6 +2810,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 matched_fp = state.best_match_template
                 matched_sim = getattr(state, "best_match_similarity", None)
 
+            # 【UI层防护】regime-direction 不一致时清除显示，防止误导
+            if matched_fp and not (order is not None and getattr(order, "template_fingerprint", "")):
+                regime = state.market_regime
+                bull_set = {"强多头", "弱多头", "震荡偏多"}
+                bear_set = {"强空头", "弱空头", "震荡偏空"}
+                if regime in bull_set and "SHORT" in matched_fp.upper():
+                    matched_fp = ""
+                    matched_sim = 0.0
+                elif regime in bear_set and "LONG" in matched_fp.upper():
+                    matched_fp = ""
+                    matched_sim = 0.0
+
+            # UI展示用：如果state里暂时没有贝叶斯胜率，按当前匹配原型即时读取后验均值
+            bayesian_wr = getattr(state, "bayesian_win_rate", 0.0)
+            if bayesian_wr <= 0 and matched_fp and self._live_engine:
+                bf = getattr(self._live_engine, "_bayesian_filter", None)
+                if bf is not None:
+                    try:
+                        bayesian_wr = bf.get_expected_win_rate(matched_fp, state.market_regime)
+                    except Exception:
+                        bayesian_wr = 0.0
+
             self.paper_trading_tab.status_panel.update_matching_context(
                 state.market_regime,
                 state.fingerprint_status,
@@ -2832,6 +2842,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 entry_threshold=getattr(state, "entry_threshold", None),
                 macd_ready=getattr(state, "macd_ready", False),
                 kdj_ready=getattr(state, "kdj_ready", False),
+                bayesian_win_rate=bayesian_wr,
+                kelly_position_pct=getattr(state, "kelly_position_pct", 0.0),
+            )
+            self.paper_trading_tab.control_panel.update_kelly_position_display(
+                getattr(state, "kelly_position_pct", 0.0)
             )
             
             # 【决策说明日志】decision_reason 变化时追加到事件日志
@@ -2847,6 +2862,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 state.danger_level,
                 state.exit_reason
             )
+            pending_orders = []
+            try:
+                current_bar_idx = getattr(self._live_engine, "_current_bar_idx", None)
+                pending_orders = self._live_engine.paper_trader.get_pending_entry_orders_snapshot(current_bar_idx)
+            except Exception:
+                pending_orders = []
+            self.paper_trading_tab.status_panel.update_pending_orders(pending_orders)
             self.paper_trading_tab.control_panel.update_match_preview(
                 matched_fp,
                 matched_sim,
@@ -2874,6 +2896,25 @@ class MainWindow(QtWidgets.QMainWindow):
             # 更新指纹轨迹叠加显示
             self._update_fingerprint_trajectory_overlay(state)
     
+    def _on_live_price_tick(self, price: float, ts_ms: int):
+        """低延迟逐笔价格更新（避免重UI流程）"""
+        QtCore.QMetaObject.invokeMethod(
+            self, "_update_live_price_tick",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(float, float(price)),
+        )
+
+    @QtCore.pyqtSlot(float)
+    def _update_live_price_tick(self, price: float):
+        """主线程更新价格标签（轻量）"""
+        if not self._live_running:
+            return
+        try:
+            self.paper_trading_tab.control_panel.update_price(price)
+            self.paper_trading_tab.status_panel.update_current_price(price)
+        except Exception:
+            pass
+
     def _on_live_kline(self, kline):
         """实时K线更新"""
         # 在主线程中更新图表

@@ -91,6 +91,7 @@ class LiveDataFeed:
                  symbol: str = "BTCUSDT",
                  interval: str = "1m",
                  on_kline: Optional[Callable[[KlineData], None]] = None,
+                 on_price: Optional[Callable[[float, int], None]] = None,
                  on_connected: Optional[Callable[[], None]] = None,
                  on_disconnected: Optional[Callable[[str], None]] = None,
                  on_error: Optional[Callable[[str], None]] = None,
@@ -123,6 +124,7 @@ class LiveDataFeed:
         self.symbol = symbol.upper()
         self.interval = interval
         self.on_kline = on_kline
+        self.on_price = on_price
         self.on_connected = on_connected
         self.on_disconnected = on_disconnected
         self.on_error = on_error
@@ -143,6 +145,8 @@ class LiveDataFeed:
         # 状态
         self._ws: Optional[websocket.WebSocketApp] = None
         self._ws_thread: Optional[threading.Thread] = None
+        self._price_ws: Optional[websocket.WebSocketApp] = None
+        self._price_ws_thread: Optional[threading.Thread] = None
         self._rest_poll_thread: Optional[threading.Thread] = None
         self._running = False
         self._connected = False
@@ -226,6 +230,8 @@ class LiveDataFeed:
         
         # 启动 WebSocket
         self._start_websocket()
+        # 启动逐笔成交价通道（仅用于低延迟价格显示）
+        self._start_price_websocket()
         # 启动 1s 级 REST 快照轮询（仅更新当前未收线K，保证UI持续流动）
         self._start_rest_poller()
         
@@ -236,8 +242,12 @@ class LiveDataFeed:
         self._running = False
         if self._ws:
             self._ws.close()
+        if self._price_ws:
+            self._price_ws.close()
         if self._ws_thread and self._ws_thread.is_alive():
             self._ws_thread.join(timeout=3)
+        if self._price_ws_thread and self._price_ws_thread.is_alive():
+            self._price_ws_thread.join(timeout=3)
         if self._rest_poll_thread and self._rest_poll_thread.is_alive():
             self._rest_poll_thread.join(timeout=3)
         self._connected = False
@@ -609,6 +619,100 @@ class LiveDataFeed:
             daemon=True
         )
         self._ws_thread.start()
+
+    def _start_price_websocket(self):
+        """启动逐笔成交价通道（低延迟价格，仅用于UI显示）"""
+        if self.on_price is None:
+            return
+
+        stream_name = f"{self.symbol.lower()}@aggTrade"
+        ws_url = f"{self._ws_base_url}/{stream_name}"
+        print(f"[LiveDataFeed] 正在连接Price WS: {ws_url}")
+
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                # aggTrade: p=price, T=trade time
+                if "p" in data:
+                    price = float(data["p"])
+                    ts_ms = int(data.get("T", int(time.time() * 1000)))
+                    try:
+                        self.on_price(price, ts_ms)
+                    except Exception as cb_e:
+                        print(f"[LiveDataFeed] Price回调异常: {cb_e}")
+            except Exception as e:
+                print(f"[LiveDataFeed] 解析Price消息失败: {e}")
+
+        def on_error(ws, error):
+            print(f"[LiveDataFeed] Price WS错误: {error}")
+
+        def on_close(ws, close_status_code, close_msg):
+            print(f"[LiveDataFeed] Price WS断开: code={close_status_code} msg={close_msg}")
+            if self._running:
+                time.sleep(1.0)
+                if self._running:
+                    self._start_price_websocket()
+
+        def on_open(ws):
+            print(f"[LiveDataFeed] Price WS已连接: {self.symbol}")
+
+        self._price_ws = websocket.WebSocketApp(
+            ws_url,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            on_open=on_open,
+        )
+
+        ssl_opt = {"cert_reqs": ssl.CERT_NONE}
+        ws_kwargs = {
+            "sslopt": ssl_opt,
+            "ping_interval": 20,
+            "ping_timeout": 10,
+            "reconnect": 0,
+        }
+
+        proxy_host = None
+        proxy_port = None
+        proxy_type = None
+        proxy_auth = None
+        if self.http_proxy:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(self.http_proxy)
+                proxy_host = parsed.hostname
+                proxy_port = parsed.port
+                proxy_type = "http"
+                if parsed.username and parsed.password:
+                    proxy_auth = (parsed.username, parsed.password)
+            except Exception:
+                pass
+        elif self.socks_proxy:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(self.socks_proxy)
+                proxy_host = parsed.hostname
+                proxy_port = parsed.port
+                proxy_type = "socks5"
+                if parsed.username and parsed.password:
+                    proxy_auth = (parsed.username, parsed.password)
+            except Exception:
+                pass
+
+        if proxy_host and proxy_port:
+            ws_kwargs["http_proxy_host"] = proxy_host
+            ws_kwargs["http_proxy_port"] = proxy_port
+            if proxy_type:
+                ws_kwargs["proxy_type"] = proxy_type
+            if proxy_auth:
+                ws_kwargs["http_proxy_auth"] = proxy_auth
+
+        self._price_ws_thread = threading.Thread(
+            target=self._price_ws.run_forever,
+            kwargs=ws_kwargs,
+            daemon=True,
+        )
+        self._price_ws_thread.start()
     
     def _parse_ws_kline(self, k: dict) -> Optional[KlineData]:
         """解析 WebSocket K线数据"""

@@ -30,6 +30,11 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._kelly_last_update_ts = 0.0
+        self._kelly_blink_state = False
+        self._kelly_timer = QtCore.QTimer(self)
+        self._kelly_timer.timeout.connect(self._update_kelly_heartbeat)
+        self._kelly_timer.start(500)
         self._init_ui()
     
     def _init_ui(self):
@@ -161,9 +166,39 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         self.leverage_spin.setToolTip("实时执行固定为 10x")
         account_layout.addRow("杠杆:", self.leverage_spin)
 
+        # 单次仓位 + 凯利公式标识 + 心跳灯
+        position_size_container = QtWidgets.QWidget()
+        position_size_h_layout = QtWidgets.QHBoxLayout(position_size_container)
+        position_size_h_layout.setContentsMargins(0, 0, 0, 0)
+        position_size_h_layout.setSpacing(5)
+        
         self.position_size_hint_label = QtWidgets.QLabel("50%")
-        self.position_size_hint_label.setStyleSheet("color: #9ad1ff;")
-        account_layout.addRow("单次仓位:", self.position_size_hint_label)
+        self.position_size_hint_label.setStyleSheet("color: #9ad1ff; font-weight: bold; font-size: 13px;")
+        position_size_h_layout.addWidget(self.position_size_hint_label)
+        
+        self.kelly_formula_badge = QtWidgets.QLabel("[凯利]")
+        self.kelly_formula_badge.setStyleSheet("""
+            QLabel {
+                color: #FFD700;
+                background-color: rgba(255, 215, 0, 0.15);
+                border: 1px solid #FFD700;
+                border-radius: 3px;
+                padding: 1px 4px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+        """)
+        self.kelly_formula_badge.setToolTip("凯利公式动态仓位（根据贝叶斯胜率和盈亏比计算）")
+        self.kelly_formula_badge.hide()  # 默认隐藏，有凯利仓位时显示
+        position_size_h_layout.addWidget(self.kelly_formula_badge)
+        
+        self.kelly_heartbeat_label = QtWidgets.QLabel("●")
+        self.kelly_heartbeat_label.setStyleSheet("color: #666; font-size: 12px;")
+        self.kelly_heartbeat_label.setToolTip("凯利仓位心跳\n绿色闪烁=动态仓位更新中\n灰色=固定仓位")
+        position_size_h_layout.addWidget(self.kelly_heartbeat_label)
+        position_size_h_layout.addStretch()
+        
+        account_layout.addRow("单次仓位:", position_size_container)
         
         # 实时统计（合并展示）
         self.snapshot_balance_label = QtWidgets.QLabel("-")
@@ -392,6 +427,38 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         else:
             self.pos_dir_label.setStyleSheet("color: #888;")
 
+    def update_kelly_position_display(self, kelly_position_pct: float):
+        """更新左侧单次仓位显示（凯利动态仓位）"""
+        import time
+        if kelly_position_pct and kelly_position_pct > 0:
+            self.position_size_hint_label.setText(f"{kelly_position_pct:.1%}")
+            self.kelly_formula_badge.show()
+            if kelly_position_pct >= 0.30:
+                color = "#00E676"
+            elif kelly_position_pct >= 0.15:
+                color = "#FFD700"
+            else:
+                color = "#9ad1ff"
+            self.position_size_hint_label.setStyleSheet(
+                f"color: {color}; font-weight: bold; font-size: 13px;"
+            )
+            self._kelly_last_update_ts = time.time()
+        else:
+            self.position_size_hint_label.setText("50%")
+            self.position_size_hint_label.setStyleSheet("color: #9ad1ff; font-weight: bold; font-size: 13px;")
+            self.kelly_formula_badge.hide()
+
+    def _update_kelly_heartbeat(self):
+        """更新凯利心跳灯"""
+        import time
+        elapsed = time.time() - self._kelly_last_update_ts
+        self._kelly_blink_state = not self._kelly_blink_state
+        if elapsed > 3.0:
+            self.kelly_heartbeat_label.setStyleSheet("color: #666; font-size: 12px;")
+        else:
+            color = "#00E676" if self._kelly_blink_state else "#0a5c33"
+            self.kelly_heartbeat_label.setStyleSheet(f"color: {color}; font-size: 12px;")
+
 
 class PaperTradingStatusPanel(QtWidgets.QWidget):
     """模拟交易状态面板（右侧）"""
@@ -541,6 +608,12 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.matched_fingerprint_label.setMinimumWidth(120)
         self.matched_fingerprint_label.setStyleSheet("color: #9fd6ff; font-weight: bold; font-size: 12px;")
         market_layout.addRow("匹配原型:", self.matched_fingerprint_label)
+        
+        # 贝叶斯胜率（原型旁边显示）
+        self.bayesian_win_rate_label = QtWidgets.QLabel("-")
+        self.bayesian_win_rate_label.setStyleSheet("color: #FFD700; font-weight: bold; font-size: 13px;")
+        self.bayesian_win_rate_label.setToolTip("贝叶斯预测的胜率（Thompson Sampling采样值）")
+        market_layout.addRow("贝叶斯胜率:", self.bayesian_win_rate_label)
 
         # 实时配合度 + 开仓阈值 + 距离
         self.matched_similarity_label = QtWidgets.QLabel("-")
@@ -590,6 +663,45 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         market_layout.addRow("动能门控:", indicators_main_container)
         
         layout.addWidget(market_group)
+
+        # === 委托单监控（新增） ===
+        pending_group = QtWidgets.QGroupBox("委托单监控")
+        pending_layout = QtWidgets.QVBoxLayout(pending_group)
+        pending_layout.setContentsMargins(6, 6, 6, 6)
+        pending_layout.setSpacing(6)
+
+        self.pending_orders_hint_label = QtWidgets.QLabel("当前无挂单")
+        self.pending_orders_hint_label.setStyleSheet("color: #888; font-size: 11px;")
+        pending_layout.addWidget(self.pending_orders_hint_label)
+
+        self.pending_orders_table = QtWidgets.QTableWidget()
+        self.pending_orders_table.setColumnCount(6)
+        self.pending_orders_table.setHorizontalHeaderLabels(["方向", "挂单价", "数量", "状态", "剩余K线", "原型"])
+        self.pending_orders_table.verticalHeader().setVisible(False)
+        self.pending_orders_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.pending_orders_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.pending_orders_table.setAlternatingRowColors(True)
+        self.pending_orders_table.setMinimumHeight(92)
+        self.pending_orders_table.horizontalHeader().setStretchLastSection(True)
+        self.pending_orders_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+                color: {UI_CONFIG['THEME_TEXT']};
+                gridline-color: #444;
+                font-size: 11px;
+            }}
+            QHeaderView::section {{
+                background-color: #333;
+                color: {UI_CONFIG['THEME_TEXT']};
+                border: 1px solid #444;
+                padding: 4px;
+            }}
+            QTableWidget::item:alternate {{
+                background-color: #2a2a2a;
+            }}
+        """)
+        pending_layout.addWidget(self.pending_orders_table)
+        layout.addWidget(pending_group)
 
         # === 持仓监控与说明 (NEW) ===
         monitor_group = QtWidgets.QGroupBox("持仓监控与说明")
@@ -733,7 +845,9 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                                 swing_points_count: int = 0,
                                 entry_threshold: float = None,
                                 macd_ready: bool = False,
-                                kdj_ready: bool = False):
+                                kdj_ready: bool = False,
+                                bayesian_win_rate: float = 0.0,
+                                kelly_position_pct: float = 0.0):
         """更新匹配状态和因果说明"""
         # 触发心跳
         self._trigger_heartbeat("market")
@@ -774,9 +888,12 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.market_regime_label.setStyleSheet(f"color: {color}; font-weight: bold;")
         self.fingerprint_status_label.setText(fp_status or "待匹配")
         if matched_fp:
-            # 完整显示原型名称，并设置 tooltip
-            self.matched_fingerprint_label.setText(matched_fp)
-            self.matched_fingerprint_label.setToolTip(matched_fp)
+            # 完整显示原型名称；若有贝叶斯概率，直接拼在原型旁边
+            fp_display = matched_fp
+            if bayesian_win_rate > 0:
+                fp_display = f"{matched_fp}  |  贝叶斯 {bayesian_win_rate:.1%}"
+            self.matched_fingerprint_label.setText(fp_display)
+            self.matched_fingerprint_label.setToolTip(fp_display)
             # 根据方向着色
             if "LONG" in matched_fp:
                 self.matched_fingerprint_label.setStyleSheet(
@@ -829,7 +946,55 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.entry_threshold_label.setText(f"{entry_threshold:.0%}")
             self.entry_threshold_label.setStyleSheet("color: #888;")
         
+        # 更新贝叶斯胜率
+        if bayesian_win_rate > 0:
+            self.bayesian_win_rate_label.setText(f"{bayesian_win_rate:.1%}")
+            # 根据胜率着色
+            if bayesian_win_rate >= 0.60:
+                wr_color = "#00E676"  # 绿色 - 高胜率
+            elif bayesian_win_rate >= 0.50:
+                wr_color = "#FFD700"  # 金色 - 及格
+            else:
+                wr_color = "#f23645"  # 红色 - 低胜率
+            self.bayesian_win_rate_label.setStyleSheet(f"color: {wr_color}; font-weight: bold; font-size: 13px;")
+        else:
+            self.bayesian_win_rate_label.setText("-")
+            self.bayesian_win_rate_label.setStyleSheet("color: #888; font-weight: bold; font-size: 13px;")
+        
         self.reason_label.setText(reason or "-")
+
+    def update_pending_orders(self, pending_orders: List[dict]):
+        """更新委托单监控表（挂单中）"""
+        rows = len(pending_orders or [])
+        self.pending_orders_table.setRowCount(rows)
+        if rows == 0:
+            self.pending_orders_hint_label.setText("当前无挂单")
+            self.pending_orders_hint_label.setStyleSheet("color: #888; font-size: 11px;")
+            return
+
+        self.pending_orders_hint_label.setText(f"挂单中: {rows} 笔")
+        self.pending_orders_hint_label.setStyleSheet("color: #FFD54F; font-size: 11px; font-weight: bold;")
+
+        for row, o in enumerate(pending_orders):
+            side = (o.get("side") or "-").upper()
+            side_item = QtWidgets.QTableWidgetItem(side)
+            # 颜色：LONG/BUY=绿色（做多/平空），SHORT/SELL=红色（做空/平多）
+            is_bullish = side in ("LONG", "BUY")
+            side_item.setForeground(QtGui.QColor("#089981") if is_bullish else QtGui.QColor("#f23645"))
+            self.pending_orders_table.setItem(row, 0, side_item)
+
+            self.pending_orders_table.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{float(o.get('trigger_price', 0.0)):.2f}"))
+            self.pending_orders_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{float(o.get('quantity', 0.0)):.3f}"))
+            self.pending_orders_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(o.get("status", "等待成交"))))
+
+            rb = o.get("remaining_bars", None)
+            rb_text = str(rb) if rb is not None else "-"
+            self.pending_orders_table.setItem(row, 4, QtWidgets.QTableWidgetItem(rb_text))
+
+            fp = str(o.get("template_fingerprint", "-"))
+            fp_item = QtWidgets.QTableWidgetItem(fp)
+            fp_item.setToolTip(fp)
+            self.pending_orders_table.setItem(row, 5, fp_item)
     
     def append_event(self, text: str):
         """追加右下事件日志"""
@@ -967,11 +1132,45 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         
         # 表格页
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(13)
+        self.table.setColumnCount(16)  # 原13列 + 新增3列 = 16列
         self.table.setHorizontalHeaderLabels([
-            "时间", "方向", "数量", "入场价", "出场价", "止盈", "止损", "盈亏%", "盈亏(USDT)", "手续费", "原因", "持仓", "操作"
+            "时间", "方向", "数量", "入场价", "出场价", "止盈", "止损", 
+            "盈亏%", "峰值%", "精准度", "信号",  # 新增3列：峰值利润、止盈精准度、信号触发
+            "盈亏(USDT)", "手续费", "原因", "持仓", "操作"
         ])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        
+        # 【自动调整列宽】确保所有内容都能完整显示
+        header = self.table.horizontalHeader()
+        
+        # 统一策略：所有列自适应内容
+        for col in range(self.table.columnCount()):
+            header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        
+        # 精细控制关键列的最小宽度（确保美观和可读性）
+        min_widths = {
+            0: 90,   # 时间：mm-dd HH:MM
+            1: 50,   # 方向：LONG/SHORT
+            2: 70,   # 数量：0.0340
+            3: 80,   # 入场价：67076.00
+            4: 80,   # 出场价：66983.26
+            5: 80,   # 止盈：67579.07
+            6: 80,   # 止损：66740.62
+            7: 70,   # 盈亏%：+7.5%
+            8: 70,   # 峰值%：+8.2%
+            9: 80,   # 精准度：91.5%✓
+            10: 50,  # 信号：2个
+            11: 90,  # 盈亏(USDT)：+45.00
+            12: 70,  # 手续费：0.0000
+            13: 80,  # 原因：追踪止盈
+            14: 50,  # 持仓：12
+            15: 60,  # 操作：删除按钮
+        }
+        
+        for col, min_width in min_widths.items():
+            current_width = self.table.columnWidth(col)
+            if current_width < min_width:
+                self.table.setColumnWidth(col, min_width)
+        
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setStyleSheet(f"""
@@ -1012,7 +1211,10 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         key = self._trade_key(order)
         if key in self._rows_by_key:
             # 已存在则更新（例如平仓、或同步更新）
-            self._update_trade_row(self._rows_by_key[key], order)
+            row_idx = self._rows_by_key[key]
+            self._update_trade_row(row_idx, order)
+            # 更新后重新调整该行高度
+            self.table.resizeRowToContents(row_idx)
         else:
             row = self._insert_trade_row(order)
             self._rows_by_key[key] = row
@@ -1026,6 +1228,9 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             row = self._insert_trade_row(order)
             self._rows_by_key[self._trade_key(order)] = row
         self._update_empty_state()
+        
+        # 批量加载后，再次调整所有行高（性能优化）
+        self.table.resizeRowsToContents()
             
     def _trade_key(self, order) -> str:
         """生成稳定的交易标识"""
@@ -1047,6 +1252,10 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         # 目前按时间顺序追加
         
         self._update_trade_row(row, order)
+        
+        # 自动调整行高
+        self.table.resizeRowToContents(row)
+        
         # 滚动到最新
         self.table.scrollToBottom()
         return row
@@ -1061,11 +1270,16 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             time_str = order.entry_time.strftime("%m-%d %H:%M") + "(持)"
         self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(time_str))
         
-        # 方向
+        # 方向（翻转单加标记）
         side_val = order.side.value
-        side_item = QtWidgets.QTableWidgetItem(side_val)
+        is_flip = getattr(order, 'is_flip_trade', False)
+        side_display = f"🔄{side_val}" if is_flip else side_val
+        side_item = QtWidgets.QTableWidgetItem(side_display)
         side_color = QtGui.QColor("#089981") if side_val == "LONG" else QtGui.QColor("#f23645")
         side_item.setForeground(side_color)
+        if is_flip:
+            flip_reason = getattr(order, 'flip_reason', '位置翻转')
+            side_item.setToolTip(f"翻转单: {flip_reason}")
         self.table.setItem(row, 1, side_item)
         
         # 数量
@@ -1095,33 +1309,114 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         pnl_pct_item.setForeground(pnl_color)
         self.table.setItem(row, 7, pnl_pct_item)
         
-        # 盈亏(USDT) - 开仓显示未实现，平仓显示已实现
+        # ========== 新增列：峰值利润% ==========
+        peak_pct = getattr(order, "peak_profit_pct", 0.0)
         is_closed = getattr(order, "status", None) == OrderStatus.CLOSED or order.exit_time is not None
+        
+        if is_closed and peak_pct != 0.0:
+            peak_item = QtWidgets.QTableWidgetItem(f"{peak_pct:+.2f}%")
+            # 峰值利润用紫色显示（区别于实际盈亏）
+            peak_item.setForeground(QtGui.QColor("#AB47BC"))
+            peak_item.setToolTip(f"持仓期间的最高利润：{peak_pct:+.2f}%")
+        else:
+            peak_item = QtWidgets.QTableWidgetItem("-")
+            peak_item.setForeground(QtGui.QColor("#666"))
+        self.table.setItem(row, 8, peak_item)
+        
+        # ========== 新增列：止盈精准度 ==========
+        if is_closed and peak_pct > 0.01:  # 峰值利润 > 0.01% 才计算精准度
+            accuracy = (order.profit_pct / peak_pct) * 100
+            accuracy_item = QtWidgets.QTableWidgetItem(f"{accuracy:.1f}%")
+            
+            # 根据精准度设置颜色
+            if accuracy >= 90:
+                accuracy_item.setForeground(QtGui.QColor("#089981"))  # 绿色：优秀
+                grade = "✓ 优秀"
+            elif accuracy >= 70:
+                accuracy_item.setForeground(QtGui.QColor("#FFD54F"))  # 黄色：良好
+                grade = "○ 良好"
+            elif accuracy >= 50:
+                accuracy_item.setForeground(QtGui.QColor("#FF9800"))  # 橙色：一般
+                grade = "△ 一般"
+            else:
+                accuracy_item.setForeground(QtGui.QColor("#f23645"))  # 红色：差
+                grade = "✗ 差"
+            
+            # 工具提示：详细说明
+            tooltip = (
+                f"止盈精准度：{accuracy:.1f}% ({grade})\n"
+                f"实际平仓：{order.profit_pct:+.2f}% / 峰值利润：{peak_pct:+.2f}%\n\n"
+                f"评级标准：\n"
+                f"  ≥90%  ✓ 优秀（几乎在最佳点位）\n"
+                f"  70-90% ○ 良好（可接受的回撤）\n"
+                f"  50-70% △ 一般（错过较多利润）\n"
+                f"  <50%   ✗ 差（严重卖飞）"
+            )
+            accuracy_item.setToolTip(tooltip)
+        elif is_closed and peak_pct < 0:
+            # 峰值为负（全程亏损），精准度无意义
+            accuracy_item = QtWidgets.QTableWidgetItem("N/A")
+            accuracy_item.setForeground(QtGui.QColor("#666"))
+            accuracy_item.setToolTip("全程亏损，无精准度数据")
+        else:
+            # 持仓中或峰值为0
+            accuracy_item = QtWidgets.QTableWidgetItem("-")
+            accuracy_item.setForeground(QtGui.QColor("#666"))
+        self.table.setItem(row, 9, accuracy_item)
+        
+        # ========== 新增列：离场信号触发 ==========
+        signals = getattr(order, "exit_signals_triggered", [])
+        signal_count = len(signals)
+        
+        if signal_count > 0:
+            signal_item = QtWidgets.QTableWidgetItem(f"{signal_count}个")
+            signal_item.setForeground(QtGui.QColor("#00BCD4"))  # 青色
+            
+            # 工具提示：显示所有触发的信号
+            signal_details = []
+            for i, (signal_name, profit_at_trigger) in enumerate(signals, 1):
+                # 翻译信号名称
+                signal_name_cn = {
+                    "momentum_decay": "动量衰减",
+                    "market_reversal": "市场反转",
+                    "pattern_exit": "形态离场",
+                    "derail": "脱轨",
+                }.get(signal_name, signal_name)
+                signal_details.append(f"{i}. {signal_name_cn} (触发时利润: {profit_at_trigger:+.2f}%)")
+            
+            tooltip = "持仓期间触发的离场信号：\n" + "\n".join(signal_details)
+            signal_item.setToolTip(tooltip)
+        else:
+            signal_item = QtWidgets.QTableWidgetItem("-")
+            signal_item.setForeground(QtGui.QColor("#666"))
+        self.table.setItem(row, 10, signal_item)
+        
+        # 盈亏(USDT) - 开仓显示未实现，平仓显示已实现（索引 +3）
         if is_closed:
             pnl_val = getattr(order, "realized_pnl", 0.0)
         else:
             pnl_val = getattr(order, "unrealized_pnl", 0.0)
         pnl_usdt_item = QtWidgets.QTableWidgetItem(f"{pnl_val:+,.2f}")
         pnl_usdt_item.setForeground(pnl_color)
-        self.table.setItem(row, 8, pnl_usdt_item)
+        self.table.setItem(row, 11, pnl_usdt_item)
         
-        # 手续费
+        # 手续费（索引 +3）
         fee_val = getattr(order, "total_fee", 0.0)
         fee_item = QtWidgets.QTableWidgetItem(f"{fee_val:.4f}")
         fee_item.setForeground(QtGui.QColor("#f9a825"))  # 黄色
-        self.table.setItem(row, 9, fee_item)
+        self.table.setItem(row, 12, fee_item)
         
-        # 原因（具体分类）
+        # 原因（具体分类）（索引 +3）
         reason_display = self._classify_exit_reason(order)
         reason_item = QtWidgets.QTableWidgetItem(reason_display)
         if hasattr(order, 'decision_reason') and order.decision_reason:
             reason_item.setToolTip(order.decision_reason)  # 悬停显示完整原因
-        self.table.setItem(row, 10, reason_item)
+        self.table.setItem(row, 13, reason_item)
         
-        # 持仓时长
-        self.table.setItem(row, 11, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
+        # 持仓时长（索引 +3）
+        self.table.setItem(row, 14, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
         
-        # 操作按钮（第13列）
+        # 操作按钮（索引 +3）
         delete_btn = QtWidgets.QPushButton("删除")
         delete_btn.setStyleSheet("""
             QPushButton {
@@ -1140,7 +1435,7 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             }
         """)
         delete_btn.clicked.connect(lambda checked=False, o=order: self._on_delete_clicked(o))
-        self.table.setCellWidget(row, 12, delete_btn)
+        self.table.setCellWidget(row, 15, delete_btn)
     
     def _classify_exit_reason(self, order) -> str:
         """
@@ -1158,18 +1453,29 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         # 基于decision_reason和close_reason综合判断
         if "触及止盈价" in detail:
             return "固定止盈"
-        elif "追踪止盈" in detail:
+        elif "追踪止损" in detail or order.close_reason.value == "追踪止损":
+            # 追踪止损/保本止损：SL移至盈利区后触发
             if "保本" in detail:
-                return "保本止盈"
+                return "保本止损"
             elif "锁利" in detail:
-                return "锁利止盈"
+                return "锁利止损"
             elif "紧追" in detail:
-                return "紧追止盈"
+                return "紧追止损"
             else:
-                return "追踪止盈"
+                return "追踪止损"
+        elif "追踪止盈" in detail:
+            # 兼容旧数据（修复前的记录可能用"追踪止盈"）
+            if "保本" in detail:
+                return "保本止损"
+            elif "锁利" in detail:
+                return "锁利止损"
+            elif "紧追" in detail:
+                return "紧追止损"
+            else:
+                return "追踪止损"
         elif "阶梯止盈" in detail or "partial" in detail.lower():
             return "分段减仓"
-        elif "触及止损价" in detail or order.close_reason.value == "STOP_LOSS":
+        elif "触及止损价" in detail or order.close_reason.value == "止损":
             return "止损"
         elif "市场反转" in detail:
             # 提取具体的市场反转原因
@@ -1193,6 +1499,16 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             return "超时离场"
         elif order.close_reason.value == "MANUAL":
             return "手动平仓"
+        elif order.close_reason.value == "交易所平仓":
+            return "交易所平仓"
+        elif order.close_reason.value == "位置翻转":
+            flip_reason = getattr(order, 'flip_reason', '')
+            if "底部" in detail or "底部" in flip_reason:
+                return "🔄底部翻转"
+            elif "顶部" in detail or "顶部" in flip_reason:
+                return "🔄顶部翻转"
+            else:
+                return "🔄位置翻转"
         else:
             # 回退到原始CloseReason
             return order.close_reason.value
@@ -1343,12 +1659,14 @@ class PaperTradingTab(QtWidgets.QWidget):
             # 根据 close_reason 映射到不同标记类型
             # 5=保本, 6=部分止盈, 7=脱轨, 8=信号离场, 9=超时, 2/-2=普通EXIT
             reason_map = {
-                "保本": 5,      # 追踪止损保本触发
-                "止盈": 6,      # 止盈
-                "脱轨": 7,      # 相似度脱轨
-                "信号": 8,      # 信号离场
-                "超时": 9,      # 超过最大持仓
-                "止损": 10,     # 止损
+                "保本": 5,          # 追踪止损保本触发
+                "止盈": 6,          # 止盈
+                "脱轨": 7,          # 相似度脱轨
+                "信号": 8,          # 信号离场
+                "超时": 9,          # 超过最大持仓
+                "止损": 10,         # 止损
+                "交易所平仓": 8,    # 交易所侧被动平仓（用信号标记颜色）
+                "位置翻转": 8,      # 价格位置翻转平仓（用信号标记颜色）
             }
             signal_type = reason_map.get(close_reason, 2 if side == "LONG" else -2)
         

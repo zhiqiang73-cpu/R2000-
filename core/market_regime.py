@@ -65,7 +65,6 @@ class MarketRegimeClassifier:
         self.swings = sorted(alternating_swings, key=lambda s: s.index)
         cfg = config or {}
         self.dir_strong   = cfg.get("DIR_STRONG_THRESHOLD", 0.008)
-        self.dir_weak     = cfg.get("DIR_WEAK_THRESHOLD", 0.002)
         self.str_strong   = cfg.get("STRENGTH_STRONG_THRESHOLD", 0.006)
         self.lookback     = cfg.get("LOOKBACK_SWINGS", 4)
         self.min_swings_required = 3  # 调整为 3 个更合理
@@ -121,18 +120,11 @@ class MarketRegimeClassifier:
 
         if direction > self.dir_strong:
             return MarketRegime.STRONG_BULL if is_strong else MarketRegime.WEAK_BULL
-        elif direction > self.dir_weak:
-            return MarketRegime.WEAK_BULL if is_strong else MarketRegime.RANGE_BULL
-        elif direction < -self.dir_strong:
+        if direction < -self.dir_strong:
             return MarketRegime.STRONG_BEAR if is_strong else MarketRegime.WEAK_BEAR
-        elif direction < -self.dir_weak:
-            return MarketRegime.WEAK_BEAR if is_strong else MarketRegime.RANGE_BEAR
-        else:
-            # 方向不明确 → 震荡
-            if direction >= 0:
-                return MarketRegime.RANGE_BULL
-            else:
-                return MarketRegime.RANGE_BEAR
+
+        # 中性区间：不再用弱阈值，避免轻微偏差触发趋势
+        return MarketRegime.RANGE_BULL if direction >= 0 else MarketRegime.RANGE_BEAR
 
     # ─── 批量分类 ───────────────────────────────────────
     def classify_trades(self, trades: list) -> Dict[int, str]:
