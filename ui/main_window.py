@@ -19,12 +19,15 @@ from core.paper_trader import load_trade_history_from_file, save_trade_history_t
 from config import (UI_CONFIG, DATA_CONFIG, LABEL_BACKTEST_CONFIG,
                     MARKET_REGIME_CONFIG, VECTOR_SPACE_CONFIG,
                     TRAJECTORY_CONFIG, WALK_FORWARD_CONFIG, MEMORY_CONFIG,
-                    PAPER_TRADING_CONFIG)
+                    PAPER_TRADING_CONFIG, WF_EVOLUTION_CONFIG, DEEPSEEK_CONFIG)
 from ui.chart_widget import ChartWidget
 from ui.control_panel import ControlPanel
 from ui.analysis_panel import AnalysisPanel
 from ui.optimizer_panel import OptimizerPanel
 from ui.paper_trading_tab import PaperTradingTab
+from ui.adaptive_learning_tab import AdaptiveLearningTab
+from core.adaptive_controller import AdaptiveController, TradeContext as AdaptiveTradeContext
+from core.deepseek_reviewer import DeepSeekReviewer, TradeContext as DeepSeekTradeContext
 
 
 class LabelingWorker(QtCore.QObject):
@@ -392,6 +395,9 @@ class MainWindow(QtWidgets.QMainWindow):
     # 批量 Walk-Forward 信号
     _batch_wf_progress_signal = QtCore.pyqtSignal(int, int, dict)  # round_idx, n_rounds, cumulative_stats
     _batch_wf_done_signal = QtCore.pyqtSignal(object)  # BatchWalkForwardResult
+    # WF Evolution 信号
+    _evo_progress_signal = QtCore.pyqtSignal(object)   # EvolutionProgress
+    _evo_done_signal = QtCore.pyqtSignal(object)       # EvolutionResult
     
     def __init__(self):
         super().__init__()
@@ -445,6 +451,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._batch_wf_running = False
         self._last_verified_prototype_fps = set()  # 批量WF后可用原型集合
         
+        # WF Evolution (特征权重进化)
+        self._evo_engine = None
+        self._evo_running = False
+        self._evo_result = None  # 最新 EvolutionResult（或做多结果，用于兼容）
+        self._evo_result_long = None   # 多空分开进化：做多结果
+        self._evo_result_short = None  # 多空分开进化：做空结果
+        
         # 模拟交易相关
         self._live_engine = None
         self._live_running = False
@@ -453,12 +466,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_chart_timer.setInterval(max(50, refresh_ms))  # UI刷新频率
         self._live_chart_timer.timeout.connect(self._on_live_chart_tick)
 
+        # 自适应控制器和DeepSeek复盘
+        self._adaptive_controller = AdaptiveController()
+        self._deepseek_reviewer = DeepSeekReviewer(DEEPSEEK_CONFIG)
+        if DEEPSEEK_CONFIG.get("ENABLED", False):
+            self._deepseek_reviewer.start_background_worker()
+        
+        # 自适应仪表板刷新定时器（每10秒）
+        self._adaptive_dashboard_timer = QtCore.QTimer(self)
+        self._adaptive_dashboard_timer.setInterval(10000)
+        self._adaptive_dashboard_timer.timeout.connect(self._refresh_adaptive_dashboard)
+        
+        # DeepSeek 复盘结果轮询定时器
+        self._deepseek_poll_timer = QtCore.QTimer(self)
+        self._deepseek_poll_timer.setInterval(5000)  # 每5秒检查一次
+        self._deepseek_poll_timer.timeout.connect(self._poll_deepseek_reviews)
+
         # GA 完成信号（analysis_panel 在后续 _init_ui 中创建后再连接按钮）
         self._ga_done_signal.connect(self._on_ga_finished)
         # Walk-Forward 信号
         # 批量WF信号
         self._batch_wf_progress_signal.connect(self._on_batch_wf_progress)
         self._batch_wf_done_signal.connect(self._on_batch_wf_finished)
+        # WF Evolution 信号
+        self._evo_progress_signal.connect(self._on_evo_progress)
+        self._evo_done_signal.connect(self._on_evo_finished)
         
         self._init_ui()
         self._connect_signals()
@@ -591,6 +623,43 @@ class MainWindow(QtWidgets.QMainWindow):
         # ============ Tab 2: 模拟交易 ============
         self.paper_trading_tab = PaperTradingTab()
         self.main_tabs.addTab(self.paper_trading_tab, "💹 模拟交易")
+
+        # ============ Tab 3: 自适应学习 ============
+        self.adaptive_learning_tab = AdaptiveLearningTab()
+        self.main_tabs.addTab(self.adaptive_learning_tab, "🧠 自适应学习")
+        # 引擎未启动时，从文件初始化冷启动面板显示
+        try:
+            from config import COLD_START_CONFIG, SIMILARITY_CONFIG
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            cs_state_path = os.path.join(project_root, "data", "cold_start_state.json")
+            cs_enabled = False
+            thresholds = COLD_START_CONFIG.get("THRESHOLDS", {})
+            normal_thresholds = {
+                "fusion": SIMILARITY_CONFIG.get("FUSION_THRESHOLD", 0.65),
+                "cosine": SIMILARITY_CONFIG.get("COSINE_MIN_THRESHOLD", 0.70),
+                "euclidean": 0.35,
+                "dtw": 0.30,
+            }
+            if os.path.exists(cs_state_path):
+                with open(cs_state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cs_enabled = bool(data.get("enabled", False))
+                thresholds = {
+                    "fusion": data.get("fusion_threshold", thresholds.get("fusion", 0.30)),
+                    "cosine": data.get("cosine_threshold", thresholds.get("cosine", 0.50)),
+                    "euclidean": data.get("euclidean_threshold", thresholds.get("euclidean", 0.25)),
+                    "dtw": data.get("dtw_threshold", thresholds.get("dtw", 0.10)),
+                }
+            self.adaptive_learning_tab.set_cold_start_enabled(cs_enabled)
+            self.adaptive_learning_tab.update_cold_start_thresholds(
+                fusion=thresholds.get("fusion", 0.30),
+                cosine=thresholds.get("cosine", 0.50),
+                euclidean=thresholds.get("euclidean", 0.25),
+                dtw=thresholds.get("dtw", 0.10),
+                normal_thresholds=normal_thresholds,
+            )
+        except Exception as e:
+            print(f"[UI] 初始化冷启动面板失败: {e}")
         
         # 连接删除交易记录信号
         self.paper_trading_tab.trade_log.delete_trade_signal.connect(self._on_trade_delete_requested)
@@ -686,6 +755,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_load_prototypes
         )
         
+        # WF Evolution 信号
+        self.analysis_panel.trajectory_widget.wf_evolution_requested.connect(
+            self._on_evolution_requested
+        )
+        self.analysis_panel.trajectory_widget.wf_evolution_stop_requested.connect(
+            self._on_evolution_stop
+        )
+        self.analysis_panel.trajectory_widget.wf_evolution_save_requested.connect(
+            self._on_evolution_save
+        )
+        self.analysis_panel.trajectory_widget.wf_evolution_apply_requested.connect(
+            self._on_evolution_apply
+        )
+        
         # 模拟交易信号
         self.paper_trading_tab.control_panel.start_requested.connect(
             self._on_paper_trading_start
@@ -699,11 +782,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.paper_trading_tab.control_panel.save_api_requested.connect(
             self._on_paper_api_save_requested
         )
+        # 反向下单模式信号连接
+        self.paper_trading_tab.control_panel.reverse_signal_checkbox.stateChanged.connect(
+            self._on_reverse_mode_changed
+        )
+        # 清除学习记忆信号
+        self.paper_trading_tab.control_panel.clear_memory_requested.connect(
+            self._on_clear_learning_memory
+        )
         self.paper_trading_tab.status_panel.save_profitable_requested.connect(
             self._on_save_profitable_templates
         )
         self.paper_trading_tab.status_panel.delete_losing_requested.connect(
             self._on_delete_losing_templates
+        )
+        # 门控拒绝追踪 - 阈值调整确认信号（迁移到自适应学习Tab）
+        self.adaptive_learning_tab.rejection_log_card.adjustment_confirmed.connect(
+            self._on_rejection_adjustment_confirmed
+        )
+        # 自适应学习其它面板的调整确认
+        self.adaptive_learning_tab.exit_timing_card.adjustment_confirmed.connect(
+            self._on_exit_timing_adjustment_confirmed
+        )
+        self.adaptive_learning_tab.tpsl_card.adjustment_confirmed.connect(
+            self._on_tpsl_adjustment_confirmed
+        )
+        self.adaptive_learning_tab.near_miss_card.adjustment_confirmed.connect(
+            self._on_near_miss_adjustment_confirmed
+        )
+        self.adaptive_learning_tab.regime_card.adjustment_confirmed.connect(
+            self._on_regime_adjustment_confirmed
+        )
+        self.adaptive_learning_tab.early_exit_card.adjustment_confirmed.connect(
+            self._on_early_exit_adjustment_confirmed
+        )
+        
+        # 冷启动系统信号
+        self.adaptive_learning_tab.cold_start_panel.cold_start_toggled.connect(
+            self._on_cold_start_toggled
+        )
+        # 自适应学习 Tab 内「清除」按钮（Tab 内已确认，直接执行清除并刷新）
+        self.adaptive_learning_tab.clear_memory_requested.connect(
+            self._on_clear_adaptive_learning_requested
         )
 
     def _infer_source_meta(self) -> tuple:
@@ -1820,6 +1940,502 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     # ══════════════════════════════════════════════════════════════════════════
+    # WF Evolution (特征权重进化)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _on_evolution_requested(self, config: dict):
+        """
+        开始 WF Evolution（UI 信号槽）
+
+        Args:
+            config: {"sample_size", "n_trials", "inner_folds", "holdout_ratio"}
+        """
+        if self._evo_running:
+            QtWidgets.QMessageBox.warning(self, "进化运行中", "请先停止当前进化再启动新的。")
+            return
+
+        if self._prototype_library is None:
+            QtWidgets.QMessageBox.warning(
+                self, "缺少原型库",
+                "需要先加载原型库才能运行特征权重进化。\n"
+                "请在「指纹模板库 → 原型」区域加载或生成原型。"
+            )
+            return
+
+        # 确认对话框
+        n_trials = config.get("n_trials", 60)
+        sample_size = config.get("sample_size", 300000)
+        inner_folds = config.get("inner_folds", 3)
+        holdout_pct = int(config.get("holdout_ratio", 0.30) * 100)
+
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认 WF 权重进化",
+            f"将启动 CMA-ES 特征权重进化:\n\n"
+            f"  数据量: {sample_size:,} 根K线\n"
+            f"  试验次数: {n_trials}\n"
+            f"  内部折数: {inner_folds} 折\n"
+            f"  Holdout: {holdout_pct}%\n"
+            f"  搜索维度: 8 组权重 + 2 阈值\n\n"
+            f"预计耗时较长（取决于数据量和试验次数）。\n"
+            f"继续吗？",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        # ── UI 更新 ──
+        self._evo_running = True
+        self._evo_result = None
+        self._evo_result_long = None
+        self._evo_result_short = None
+        self.analysis_panel.on_evolution_started()
+        self.statusBar().showMessage(f"WF Evolution 启动: {n_trials} trials, {inner_folds} folds...")
+
+        # ── 后台线程运行 ──
+        prototype_lib = self._prototype_library
+
+        def _run_evolution():
+            try:
+                from core.wf_evolution_engine import WFEvolutionEngine
+
+                def progress_callback(progress):
+                    self._evo_progress_signal.emit(progress)
+
+                self._evo_engine = WFEvolutionEngine(
+                    prototype_library=prototype_lib,
+                    on_progress=progress_callback,
+                    sample_size=config.get("sample_size"),
+                    n_trials=config.get("n_trials"),
+                    inner_folds=config.get("inner_folds"),
+                    holdout_ratio=config.get("holdout_ratio"),
+                )
+
+                # 多空分开进化：先做多，后做空，各保存并汇总
+                results = {"long": None, "short": None}
+                for direction in ("LONG", "SHORT"):
+                    if getattr(self._evo_engine, "_stop_requested", False):
+                        break
+                    result = self._evo_engine.run(direction=direction)
+                    if result.success:
+                        self._evo_engine.save_result(result)
+                    results[direction.lower()] = result
+                self._evo_done_signal.emit(results)
+
+            except Exception as e:
+                import traceback
+                print(f"[WF-Evo] 进化异常: {e}")
+                traceback.print_exc()
+                self._evo_done_signal.emit({"long": None, "short": None})
+
+        thread = threading.Thread(target=_run_evolution, daemon=True)
+        thread.start()
+
+    def _on_evolution_stop(self):
+        """停止 WF Evolution"""
+        if self._evo_engine is not None:
+            self._evo_engine.stop()
+            self.statusBar().showMessage("正在停止 WF Evolution...")
+
+    def _on_evo_progress(self, progress):
+        """
+        WF Evolution 进度更新（主线程槽函数）
+
+        Args:
+            progress: EvolutionProgress 实例
+        """
+        phase = getattr(progress, "phase", "optimizing")
+        trial_idx = getattr(progress, "trial_idx", 0)
+        n_trials = getattr(progress, "n_trials", 60)
+        best_fitness = getattr(progress, "best_fitness", -999)
+        eta_sec = getattr(progress, "eta_sec", 0.0)
+        fold_detail = getattr(progress, "fold_detail", "")
+        group_weights = getattr(progress, "group_weights", None)
+        fusion_th = getattr(progress, "fusion_threshold", 0.0)
+        cosine_min_th = getattr(progress, "cosine_min_threshold", 0.0)
+
+        if phase == "loading":
+            self.statusBar().showMessage("WF Evolution: 加载数据中...")
+            return
+
+        if phase == "holdout":
+            self.statusBar().showMessage("WF Evolution: Holdout 验证中...")
+            return
+
+        if phase == "done":
+            return  # 由 _on_evo_finished 处理
+
+        # ── 更新 UI ──
+        # 进度条和试验进度
+        self.analysis_panel.update_evolution_progress(
+            trial_idx=trial_idx,
+            n_trials=n_trials,
+            fold_idx=0,
+            n_folds=3,
+            best_fitness=best_fitness if best_fitness > -100 else 0.0,
+            eta_seconds=eta_sec,
+            phase=phase,
+        )
+
+        # 更新权重柱状图
+        if group_weights is not None:
+            weights_list = group_weights.tolist() if hasattr(group_weights, 'tolist') else list(group_weights)
+            self.analysis_panel.update_evolution_weights(
+                weights_list, fusion_th, cosine_min_th)
+
+        # 状态栏
+        fitness_str = f"{best_fitness:.4f}" if best_fitness > -100 else "--"
+        eta_min = int(eta_sec // 60) if eta_sec > 0 else 0
+        eta_s = int(eta_sec % 60) if eta_sec > 0 else 0
+        eta_str = f", ETA: {eta_min}m{eta_s}s" if eta_sec > 0 else ""
+        self.statusBar().showMessage(
+            f"WF Evolution: Trial {trial_idx}/{n_trials} | "
+            f"Best Sharpe: {fitness_str}{eta_str}"
+        )
+
+    def _on_evo_finished(self, result):
+        """
+        WF Evolution 完成（主线程槽函数）
+
+        Args:
+            result: EvolutionResult 实例、或 dict {"long": res, "short": res}（多空分开进化）
+        """
+        self._evo_running = False
+        # 多空分开进化：解析两套结果
+        if isinstance(result, dict):
+            self._evo_result_long = result.get("long")
+            self._evo_result_short = result.get("short")
+            self._evo_result = self._evo_result_long or self._evo_result_short
+        else:
+            self._evo_result = result
+            self._evo_result_long = None
+            self._evo_result_short = None
+        self.analysis_panel.on_evolution_finished()
+
+        # 至少有一个成功才算完成
+        any_ok = (self._evo_result_long and self._evo_result_long.success) or (
+            self._evo_result_short and self._evo_result_short.success)
+        if not any_ok:
+            self.statusBar().showMessage("WF Evolution 失败或已停止")
+            if self._evo_result is not None and not self._evo_result.success:
+                error_detail = getattr(self._evo_result, "error_message", "") or "未返回具体错误信息。"
+                QtWidgets.QMessageBox.warning(
+                    self, "进化未成功",
+                    "WF Evolution 未产生有效结果。\n"
+                    "可能原因：数据不足、试验次数太少、或用户中止。\n\n"
+                    f"详细原因：{error_detail}"
+                )
+            return
+
+        # ── 更新 holdout / 权重显示：做多 + 做空两套（多空分开时） ──
+        if self._evo_result_long and self._evo_result_long.success and self._evo_result_short and self._evo_result_short.success:
+            holdout_long = {
+                "sharpe": self._evo_result_long.holdout_sharpe,
+                "win_rate": self._evo_result_long.holdout_win_rate,
+                "profit": self._evo_result_long.holdout_profit,
+                "drawdown": self._evo_result_long.holdout_drawdown,
+                "n_trades": self._evo_result_long.holdout_n_trades,
+                "profit_factor": self._evo_result_long.holdout_profit_factor,
+                "passed": self._evo_result_long.holdout_passed,
+            }
+            holdout_short = {
+                "sharpe": self._evo_result_short.holdout_sharpe,
+                "win_rate": self._evo_result_short.holdout_win_rate,
+                "profit": self._evo_result_short.holdout_profit,
+                "drawdown": self._evo_result_short.holdout_drawdown,
+                "n_trades": self._evo_result_short.holdout_n_trades,
+                "profit_factor": self._evo_result_short.holdout_profit_factor,
+                "passed": self._evo_result_short.holdout_passed,
+            }
+            self.analysis_panel.update_evolution_holdout({"long": holdout_long, "short": holdout_short})
+            w_long = self._evo_result_long.group_weights.tolist() if self._evo_result_long.group_weights is not None else []
+            w_short = self._evo_result_short.group_weights.tolist() if self._evo_result_short.group_weights is not None else []
+            self.analysis_panel.update_evolution_weights(
+                w_long,
+                self._evo_result_long.fusion_threshold,
+                self._evo_result_long.cosine_min_threshold,
+                short_weights=w_short if w_short else None,
+                short_fusion=self._evo_result_short.fusion_threshold,
+                short_cosine=self._evo_result_short.cosine_min_threshold,
+            )
+        else:
+            primary = self._evo_result_long if (self._evo_result_long and self._evo_result_long.success) else self._evo_result_short
+            if primary is None and self._evo_result and self._evo_result.success:
+                primary = self._evo_result
+            if primary is not None:
+                holdout_data = {
+                    "sharpe": primary.holdout_sharpe,
+                    "win_rate": primary.holdout_win_rate,
+                    "profit": primary.holdout_profit,
+                    "drawdown": primary.holdout_drawdown,
+                    "n_trades": primary.holdout_n_trades,
+                    "profit_factor": primary.holdout_profit_factor,
+                    "passed": primary.holdout_passed,
+                }
+                self.analysis_panel.update_evolution_holdout(holdout_data)
+                if primary.group_weights is not None:
+                    weights_list = primary.group_weights.tolist()
+                    self.analysis_panel.update_evolution_weights(
+                        weights_list, primary.fusion_threshold, primary.cosine_min_threshold)
+
+        # ── 完成提示（多空分开时汇总做多/做空） ──
+        parts = []
+        if self._evo_result_long and self._evo_result_long.success:
+            r = self._evo_result_long
+            parts.append(f"做多: Sharpe={r.holdout_sharpe:.4f}, 通过={'✓' if r.holdout_passed else '✗'}")
+        if self._evo_result_short and self._evo_result_short.success:
+            r = self._evo_result_short
+            parts.append(f"做空: Sharpe={r.holdout_sharpe:.4f}, 通过={'✓' if r.holdout_passed else '✗'}")
+        time_str = ""
+        if primary is not None:
+            elapsed_min = int(primary.elapsed_sec // 60)
+            elapsed_sec = int(primary.elapsed_sec % 60)
+            time_str = f"{elapsed_min}分{elapsed_sec}秒" if elapsed_min > 0 else f"{elapsed_sec}秒"
+        self.statusBar().showMessage("WF Evolution 完成! " + ", ".join(parts) + (f", 耗时{time_str}" if time_str else ""))
+
+        msg_lines = ["WF 特征权重进化完成（多空分开进化）!\n"]
+        if self._evo_result_long and self._evo_result_long.success:
+            r = self._evo_result_long
+            msg_lines.append(f"── 做多 Holdout {'✓ 通过' if r.holdout_passed else '✗ 未通过'} ──\n  Sharpe: {r.holdout_sharpe:.4f}, 胜率: {r.holdout_win_rate:.1%}, 收益: {r.holdout_profit:.2f}%, 笔数: {r.holdout_n_trades}\n")
+        if self._evo_result_short and self._evo_result_short.success:
+            r = self._evo_result_short
+            msg_lines.append(f"── 做空 Holdout {'✓ 通过' if r.holdout_passed else '✗ 未通过'} ──\n  Sharpe: {r.holdout_sharpe:.4f}, 胜率: {r.holdout_win_rate:.1%}, 收益: {r.holdout_profit:.2f}%, 笔数: {r.holdout_n_trades}\n")
+        msg_lines.append("\n可以点击「保存权重」持久化，或「应用到实盘」立即生效。")
+        QtWidgets.QMessageBox.information(self, "WF Evolution 完成", "".join(msg_lines))
+
+    def _on_evolution_save(self):
+        """保存 WF Evolution 结果（多空分开时保存做多/做空两套文件）"""
+        to_save = []
+        if self._evo_result_long and self._evo_result_long.success:
+            to_save.append(("做多", self._evo_result_long))
+        if self._evo_result_short and self._evo_result_short.success:
+            to_save.append(("做空", self._evo_result_short))
+        if not to_save and self._evo_result and self._evo_result.success:
+            to_save.append(("进化", self._evo_result))
+        if not to_save:
+            QtWidgets.QMessageBox.warning(self, "无结果", "没有可保存的进化结果。")
+            return
+
+        try:
+            from core.wf_evolution_engine import WFEvolutionEngine
+            engine = WFEvolutionEngine(prototype_library=self._prototype_library)
+            paths = []
+            for label, res in to_save:
+                fp = engine.save_result(res)
+                paths.append(f"{label}: {fp}")
+            self.statusBar().showMessage("进化权重已保存: " + ", ".join(p for p in paths))
+            QtWidgets.QMessageBox.information(
+                self, "保存成功",
+                "进化后的特征权重已保存到:\n" + "\n".join(paths))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "保存失败", f"保存进化结果失败:\n{e}")
+
+    def _on_evolution_apply(self):
+        """
+        将进化后的特征权重应用到实盘/模拟盘（多空分开时做多/做空各一套）
+        """
+        has_long = self._evo_result_long and self._evo_result_long.success and self._evo_result_long.full_weights is not None
+        has_short = self._evo_result_short and self._evo_result_short.success and self._evo_result_short.full_weights is not None
+        if not has_long and not has_short:
+            if self._evo_result and self._evo_result.success and self._evo_result.full_weights is not None:
+                has_long = True  # 单组结果当作做多，共用一套
+            else:
+                QtWidgets.QMessageBox.warning(self, "无结果", "没有可应用的进化结果。")
+                return
+
+        # 多空两套或单组
+        if has_long and self._evo_result_long:
+            long_w = self._evo_result_long.full_weights
+            long_f = self._evo_result_long.fusion_threshold
+            long_c = self._evo_result_long.cosine_min_threshold
+            long_e = getattr(self._evo_result_long, "euclidean_min_threshold", 0.50)
+            long_d = getattr(self._evo_result_long, "dtw_min_threshold", 0.40)
+        elif self._evo_result and self._evo_result.full_weights is not None:
+            long_w = self._evo_result.full_weights
+            long_f = self._evo_result.fusion_threshold
+            long_c = self._evo_result.cosine_min_threshold
+            long_e = getattr(self._evo_result, "euclidean_min_threshold", 0.50)
+            long_d = getattr(self._evo_result, "dtw_min_threshold", 0.40)
+        else:
+            long_w = long_f = long_c = long_e = long_d = None
+        if has_short and self._evo_result_short:
+            short_w = self._evo_result_short.full_weights
+            short_f = self._evo_result_short.fusion_threshold
+            short_c = self._evo_result_short.cosine_min_threshold
+            short_e = getattr(self._evo_result_short, "euclidean_min_threshold", 0.50)
+            short_d = getattr(self._evo_result_short, "dtw_min_threshold", 0.40)
+        else:
+            short_w = short_f = short_c = short_e = short_d = None
+        if long_w is not None and short_w is None:
+            short_w, short_f, short_c, short_e, short_d = long_w, long_f, long_c, long_e, long_d
+        fusion_th = long_f or 0.65
+        cosine_min_th = long_c or 0.70
+        euclidean_min_th = long_e or 0.50
+        dtw_min_th = long_d or 0.40
+
+        # ── 绑定到当前聚合指纹图 ──
+        if self._prototype_library is not None:
+            try:
+                if has_long and has_short:
+                    self._prototype_library.set_evolved_params(
+                        long_weights=long_w, long_fusion=long_f, long_cosine=long_c, long_euclidean=long_e, long_dtw=long_d,
+                        short_weights=short_w, short_fusion=short_f, short_cosine=short_c, short_euclidean=short_e, short_dtw=short_d)
+                else:
+                    self._prototype_library.set_evolved_params(
+                        full_weights=long_w, fusion_threshold=fusion_th, cosine_min_threshold=cosine_min_th,
+                        euclidean_min_threshold=euclidean_min_th, dtw_min_threshold=dtw_min_th)
+            except Exception as e:
+                print(f"[WF-Evo] 绑定进化结果到原型库失败: {e}")
+
+        applied = False
+        if self._live_engine is not None and self._live_running:
+            try:
+                proto_matcher = getattr(self._live_engine, "_proto_matcher", None)
+                if proto_matcher is not None:
+                    proto_matcher.set_feature_weights(long_w, short_weights=short_w)
+                    proto_matcher.fusion_threshold = fusion_th
+                    proto_matcher.cosine_threshold = cosine_min_th
+                    proto_matcher.set_single_dimension_thresholds(
+                        long_euclidean=long_e, long_dtw=long_d,
+                        short_euclidean=short_e, short_dtw=short_d)
+                    self._live_engine.cosine_threshold = cosine_min_th
+                    if getattr(self._live_engine, "state", None) is not None:
+                        self._live_engine.state.entry_threshold = cosine_min_th
+                    print(f"[WF-Evo] 已注入进化权重到实盘引擎 (多空分开={bool(short_w)})")
+                    applied = True
+            except Exception as e:
+                print(f"[WF-Evo] 注入实盘引擎失败: {e}")
+
+        if applied:
+            self.statusBar().showMessage("进化权重已应用到实盘引擎并绑定到聚合指纹图")
+            QtWidgets.QMessageBox.information(
+                self, "应用成功",
+                "进化结果已给到当前聚合指纹图，并已注入运行中的交易引擎。\n"
+                "保存原型库时，进化权重会一并保存。"
+            )
+        else:
+            self.statusBar().showMessage("进化结果已绑定到当前聚合指纹图；保存原型库时会一并保存权重")
+            try:
+                from core.wf_evolution_engine import WFEvolutionEngine
+                engine = WFEvolutionEngine(prototype_library=self._prototype_library)
+                if has_long:
+                    engine.save_result(self._evo_result_long)
+                if has_short:
+                    engine.save_result(self._evo_result_short)
+                if not has_long and not has_short and self._evo_result:
+                    engine.save_result(self._evo_result)
+                QtWidgets.QMessageBox.information(
+                    self, "已给到聚合指纹图",
+                    "进化结果已绑定到当前聚合指纹图。\n"
+                    "保存原型库或启动模拟交易时将自动使用该权重。"
+                )
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "保存失败", f"保存权重失败:\n{e}")
+
+    def _inject_evolved_weights_to_engine(self):
+        """
+        将进化权重挂载到即将启动的 LiveTradingEngine。
+        优先级: 原型库自带 → 内存 _evo_result_long/_short → 磁盘 long/short 文件。
+        """
+        if self._live_engine is None:
+            return
+
+        long_w, long_f, long_c, long_e, long_d = None, None, None, None, None
+        short_w, short_f, short_c, short_e, short_d = None, None, None, None, None
+        source = ""
+
+        # 优先：当前原型库自带的进化结果（多空两套）
+        if self._prototype_library is not None:
+            (lw, lf, lc, le, ld), (sw, sf, sc, se, sd) = self._prototype_library.get_evolved_params()
+            if lw is not None:
+                long_w, long_f, long_c, long_e, long_d = lw, lf, lc, le, ld
+                short_w, short_f, short_c, short_e, short_d = sw, sf, sc, se, sd
+                source = "当前聚合指纹图（原型库）"
+        # 其次：内存中的进化结果
+        if long_w is None and self._evo_result_long and self._evo_result_long.success and self._evo_result_long.full_weights is not None:
+            long_w = self._evo_result_long.full_weights
+            long_f = self._evo_result_long.fusion_threshold
+            long_c = self._evo_result_long.cosine_min_threshold
+            long_e = getattr(self._evo_result_long, "euclidean_min_threshold", 0.50)
+            long_d = getattr(self._evo_result_long, "dtw_min_threshold", 0.40)
+            if self._evo_result_short and self._evo_result_short.success and self._evo_result_short.full_weights is not None:
+                short_w = self._evo_result_short.full_weights
+                short_f = self._evo_result_short.fusion_threshold
+                short_c = self._evo_result_short.cosine_min_threshold
+                short_e = getattr(self._evo_result_short, "euclidean_min_threshold", 0.50)
+                short_d = getattr(self._evo_result_short, "dtw_min_threshold", 0.40)
+            else:
+                short_w, short_f, short_c, short_e, short_d = long_w, long_f, long_c, long_e, long_d
+            source = "本次进化结果"
+        if long_w is None and self._evo_result and self._evo_result.success and self._evo_result.full_weights is not None:
+            long_w = self._evo_result.full_weights
+            long_f = self._evo_result.fusion_threshold
+            long_c = self._evo_result.cosine_min_threshold
+            long_e = getattr(self._evo_result, "euclidean_min_threshold", 0.50)
+            long_d = getattr(self._evo_result, "dtw_min_threshold", 0.40)
+            short_w, short_f, short_c, short_e, short_d = long_w, long_f, long_c, long_e, long_d
+            source = "本次进化结果"
+        # 再次：从磁盘 long/short 文件加载
+        if long_w is None:
+            try:
+                from config import WF_EVOLUTION_CONFIG
+                from core.wf_evolution_engine import WFEvolutionEngine
+                cfg = WF_EVOLUTION_CONFIG
+                long_path = cfg.get("EVOLVED_WEIGHTS_FILE_LONG") or (cfg.get("EVOLVED_WEIGHTS_FILE", "").replace(".json", "_long.json"))
+                short_path = cfg.get("EVOLVED_WEIGHTS_FILE_SHORT") or (cfg.get("EVOLVED_WEIGHTS_FILE", "").replace(".json", "_short.json"))
+                loaded_long = WFEvolutionEngine.load_result(long_path)
+                loaded_short = WFEvolutionEngine.load_result(short_path)
+                if loaded_long and loaded_long.success and loaded_long.full_weights is not None:
+                    long_w, long_f, long_c = loaded_long.full_weights, loaded_long.fusion_threshold, loaded_long.cosine_min_threshold
+                    long_e = getattr(loaded_long, "euclidean_min_threshold", 0.50)
+                    long_d = getattr(loaded_long, "dtw_min_threshold", 0.40)
+                    if loaded_short and loaded_short.success and loaded_short.full_weights is not None:
+                        short_w, short_f, short_c = loaded_short.full_weights, loaded_short.fusion_threshold, loaded_short.cosine_min_threshold
+                        short_e = getattr(loaded_short, "euclidean_min_threshold", 0.50)
+                        short_d = getattr(loaded_short, "dtw_min_threshold", 0.40)
+                    else:
+                        short_w, short_f, short_c, short_e, short_d = long_w, long_f, long_c, long_e, long_d
+                    source = f"文件 {long_path}"
+                elif loaded_short and loaded_short.success and loaded_short.full_weights is not None:
+                    short_w, short_f, short_c = loaded_short.full_weights, loaded_short.fusion_threshold, loaded_short.cosine_min_threshold
+                    short_e = getattr(loaded_short, "euclidean_min_threshold", 0.50)
+                    short_d = getattr(loaded_short, "dtw_min_threshold", 0.40)
+                    long_w, long_f, long_c, long_e, long_d = short_w, short_f, short_c, short_e, short_d
+                    source = f"文件 {short_path}"
+                else:
+                    single_path = cfg.get("EVOLVED_WEIGHTS_FILE", "data/wf_evolution/evolved_weights.json")
+                    loaded = WFEvolutionEngine.load_result(single_path)
+                    if loaded and loaded.success and loaded.full_weights is not None:
+                        long_w = loaded.full_weights
+                        long_f = loaded.fusion_threshold
+                        long_c = getattr(loaded, "cosine_min_threshold", None)
+                        long_e = getattr(loaded, "euclidean_min_threshold", 0.50)
+                        long_d = getattr(loaded, "dtw_min_threshold", 0.40)
+                        short_w, short_f, short_c, short_e, short_d = long_w, long_f, long_c, long_e, long_d
+                        source = f"文件 {single_path}"
+            except Exception as e:
+                print(f"[WF-Evo] 加载已保存权重失败: {e}")
+
+        if long_w is None:
+            return
+
+        try:
+            self._live_engine._pending_evolved_weights_long = long_w
+            self._live_engine._pending_evolved_weights_short = short_w if (short_w is not None and (short_w is not long_w or id(short_w) != id(long_w))) else None
+            self._live_engine._pending_evolved_fusion_th = long_f
+            self._live_engine._pending_evolved_cosine_th = long_c
+            self._live_engine._pending_evolved_euclidean_th_long = long_e
+            self._live_engine._pending_evolved_euclidean_th_short = short_e
+            self._live_engine._pending_evolved_dtw_th_long = long_d
+            self._live_engine._pending_evolved_dtw_th_short = short_d
+            # 兼容旧逻辑：单组时也写 _pending_evolved_weights
+            self._live_engine._pending_evolved_weights = long_w
+            print(f"[WF-Evo] 进化权重已挂载到引擎 (来源: {source}, 多空分开={bool(self._live_engine._pending_evolved_weights_short)})")
+        except Exception as e:
+            print(f"[WF-Evo] 挂载权重到引擎失败: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════════
     # 记忆持久化管理
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -1868,6 +2484,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._last_verified_prototype_fps = set()
                 self.analysis_panel.trajectory_widget.update_prototype_stats(library)
                 self._update_trajectory_ui()
+                # 原型库就绪 → 启用进化按钮
+                self.analysis_panel.enable_evolution(True)
                 print(f"[PrototypeLibrary] 自动加载: LONG={len(library.long_prototypes)}, "
                       f"SHORT={len(library.short_prototypes)}")
             else:
@@ -1915,6 +2533,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._last_verified_prototype_fps = set()
             self.analysis_panel.trajectory_widget.update_prototype_stats(library)
             self._update_trajectory_ui()
+            # 原型库就绪 → 启用进化按钮
+            self.analysis_panel.enable_evolution(True)
             
             self.statusBar().showMessage(
                 f"原型生成完成: LONG={len(library.long_prototypes)}, "
@@ -1952,6 +2572,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._last_verified_prototype_fps = set()
             self.analysis_panel.trajectory_widget.update_prototype_stats(library)
             self._update_trajectory_ui()
+            # 原型库就绪 → 启用进化按钮
+            self.analysis_panel.enable_evolution(True)
             
             QtWidgets.QMessageBox.information(
                 self, "加载成功",
@@ -2490,6 +3112,94 @@ class MainWindow(QtWidgets.QMainWindow):
             self.paper_trading_tab.control_panel.update_connection_status(False, msg)
             self.statusBar().showMessage(msg, 5000)
     
+    def _on_reverse_mode_changed(self, state):
+        """反向下单模式切换"""
+        from PyQt6 import QtCore
+        enabled = (state == QtCore.Qt.CheckState.Checked.value)
+        
+        # 更新引擎（如果运行中）
+        if self._live_engine:
+            self._live_engine._reverse_signal_mode = enabled
+        
+        # 日志
+        mode_text = "启用" if enabled else "关闭"
+        self.paper_trading_tab.status_panel.append_event(
+            f"[系统] 反向下单模式: {mode_text}"
+        )
+        
+        if enabled:
+            self.statusBar().showMessage("⚠️ 反向下单模式已启用！所有信号将反向操作", 5000)
+        else:
+            self.statusBar().showMessage("反向下单模式已关闭", 3000)
+    
+    def _clear_adaptive_learning_files_impl(self):
+        """实际执行：删除学习状态文件并重置引擎状态。返回删除的文件数。"""
+        import os
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        learning_files = [
+            "data/bayesian_state.json",
+            "data/rejection_tracker_state.json",
+            "data/tpsl_tracker_state.json",
+            "data/exit_timing_state.json",
+            "data/exit_learning_state.json",
+            "data/near_miss_tracker_state.json",
+            "data/early_exit_state.json",
+            "data/cold_start_state.json",
+            "data/adaptive_controller_state.json",
+        ]
+        deleted_count = 0
+        for rel_path in learning_files:
+            full_path = os.path.join(project_root, rel_path)
+            if os.path.exists(full_path):
+                try:
+                    os.remove(full_path)
+                    deleted_count += 1
+                    print(f"[MainWindow] 已删除学习记忆: {rel_path}")
+                except Exception as e:
+                    print(f"[MainWindow] 删除失败 {rel_path}: {e}")
+        if self._live_engine:
+            if hasattr(self._live_engine, '_bayesian_filter') and self._live_engine._bayesian_filter:
+                self._live_engine._bayesian_filter.distributions.clear()
+                self._live_engine._bayesian_filter.total_signals_received = 0
+                self._live_engine._bayesian_filter.total_signals_accepted = 0
+                self._live_engine._bayesian_filter.total_signals_rejected = 0
+            if hasattr(self._live_engine, '_adaptive_controller') and self._live_engine._adaptive_controller:
+                self._live_engine._adaptive_controller.reset_all()
+        return deleted_count
+
+    def _on_clear_adaptive_learning_requested(self):
+        """自适应学习 Tab 内「清除」已确认后调用：删除文件、重置引擎、刷新 Tab。"""
+        deleted_count = self._clear_adaptive_learning_files_impl()
+        self.paper_trading_tab.status_panel.append_event(
+            f"[系统] 已清除 {deleted_count} 个学习记忆文件"
+        )
+        self.statusBar().showMessage(f"已清除 {deleted_count} 个自适应学习记忆文件", 5000)
+        if hasattr(self, "adaptive_learning_tab") and hasattr(self.adaptive_learning_tab, "refresh_from_state_files"):
+            self.adaptive_learning_tab.refresh_from_state_files()
+
+    def _on_clear_learning_memory(self):
+        """清除所有自适应学习记忆（先确认再执行）"""
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认清空",
+            "确定要清空所有自适应学习记忆吗？\n（将删除各 tracker 的状态文件，学习数据需重新积累）",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        deleted_count = self._clear_adaptive_learning_files_impl()
+        self.paper_trading_tab.status_panel.append_event(
+            f"[系统] 已清除 {deleted_count} 个学习记忆文件"
+        )
+        self.statusBar().showMessage(f"已清除 {deleted_count} 个自适应学习记忆文件", 5000)
+        if hasattr(self, "adaptive_learning_tab") and hasattr(self.adaptive_learning_tab, "refresh_from_state_files"):
+            self.adaptive_learning_tab.refresh_from_state_files()
+        QtWidgets.QMessageBox.information(
+            self,
+            "清除完成",
+            f"已清除 {deleted_count} 个学习记忆文件。\n\n建议重启程序以确保所有组件使用新的初始状态。"
+        )
+
     def _on_paper_trading_test_connection(self):
         """测试API连接"""
         from core.live_data_feed import LiveDataFeed
@@ -2641,6 +3351,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 symbol=config["symbol"],
                 interval=config["interval"],
                 initial_balance=config["initial_balance"],
+                adaptive_controller=self._adaptive_controller,  # NEW: 传入自适应控制器
                 leverage=config["leverage"],
                 use_qualified_only=(config.get("use_qualified_only", True) and (not has_prototypes)),
                 qualified_fingerprints=qualified_fingerprints,
@@ -2659,10 +3370,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 on_error=self._handle_live_error,
             )
             
+            # 冷启动开关：在引擎启动前应用当前UI状态，确保阈值正确
+            try:
+                desired_cold_start = self.adaptive_learning_tab.is_cold_start_enabled()
+                self._live_engine.set_cold_start_enabled(desired_cold_start)
+            except Exception as e:
+                print(f"[MainWindow] 冷启动状态应用失败: {e}")
+
+            # ── 初始化 DeepSeek 复盘分析器（为本次交易会话创建新实例） ──
+            try:
+                self._deepseek_reviewer = DeepSeekReviewer(DEEPSEEK_CONFIG)
+                if self._deepseek_reviewer.enabled:
+                    self._deepseek_reviewer.start_background_worker()
+                    self._live_engine._deepseek_reviewer = self._deepseek_reviewer
+                    print("[MainWindow] DeepSeek 复盘分析器已启动")
+                else:
+                    self._deepseek_reviewer = None
+                    print("[MainWindow] DeepSeek 未启用（需配置 API Key）")
+            except Exception as e:
+                print(f"[MainWindow] DeepSeek 初始化失败: {e}")
+                self._deepseek_reviewer = None
+            
+            # ── 注入进化后的特征权重（如果有） ──
+            self._inject_evolved_weights_to_engine()
+            
             success = self._live_engine.start()
             if success:
                 self._live_running = True
                 self.paper_trading_tab.control_panel.set_running(True)
+                using_evolved = getattr(self._live_engine, "_using_evolved_weights", False)
+                self.paper_trading_tab.control_panel.update_weight_mode(using_evolved)
                 # 先获取历史记录（避免 reset 清空后无数据恢复）
                 history = self._live_engine.paper_trader.order_history
                 if not history:
@@ -2675,6 +3412,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.paper_trading_tab.status_panel.append_event(f"成功恢复 {len(history)} 条历史交易记录")
                 
                 self._live_chart_timer.start()
+                self._adaptive_dashboard_timer.start()
+                self._deepseek_poll_timer.start()
+                
+                # 初始化冷启动面板状态
+                self._init_cold_start_panel_from_engine()
+                
                 if has_prototypes:
                     mode_msg = f"聚合指纹图模式({ '已验证原型' if use_verified_protos else '全原型' })"
                     self.statusBar().showMessage(f"模拟交易已启动: {config['symbol']} | {mode_msg}")
@@ -2692,11 +3435,76 @@ class MainWindow(QtWidgets.QMainWindow):
         """停止模拟交易"""
         if self._live_engine:
             self._live_engine.stop()
+            # 检查会话结束报告中的调整建议
+            self._show_session_end_suggestions()
         
         self._live_running = False
         self._live_chart_timer.stop()
+        
+        # NEW: 停止自适应仪表板刷新
+        self._adaptive_dashboard_timer.stop()
+        self._deepseek_poll_timer.stop()
+        
+        # NEW: 停止DeepSeek后台工作线程
+        if hasattr(self, '_deepseek_reviewer'):
+            self._deepseek_reviewer.stop_background_worker()
+        
+        # NEW: 保存自适应控制器状态
+        if hasattr(self, '_adaptive_controller'):
+            self._adaptive_controller.save_state()
+        self._adaptive_dashboard_timer.stop()
+        self._deepseek_poll_timer.stop()
+        
+        # 停止DeepSeek后台工作线程
+        if self._deepseek_reviewer:
+            self._deepseek_reviewer.stop_background_worker()
         self.paper_trading_tab.control_panel.set_running(False)
+        self.paper_trading_tab.control_panel.update_weight_mode(None)
         self.statusBar().showMessage("模拟交易已停止")
+    
+    def _show_session_end_suggestions(self):
+        """
+        会话结束时展示调整建议。
+        
+        如果有待处理的门控阈值调整建议，弹出确认对话框供用户审核。
+        按照计划：调整在会话结束时提出，需手动确认。
+        """
+        if not self._live_engine:
+            return
+        
+        report = self._live_engine.get_session_end_report()
+        if not report:
+            return
+        
+        suggestions = report.get("pending_suggestions", [])
+        session_adjustments = report.get("session_adjustments", [])
+        stats = report.get("statistics", {})
+        
+        # 如果本次会话有已应用的调整，显示摘要
+        if session_adjustments:
+            adj_summary = "\n".join(
+                f"  · {adj.get('param_key')}: {adj.get('old_value')} → {adj.get('new_value')} "
+                f"({adj.get('timestamp_str', '')})"
+                for adj in session_adjustments
+            )
+            self.paper_trading_tab.status_panel.append_event(
+                f"会话调整记录 ({len(session_adjustments)}项):\n{adj_summary}"
+            )
+        
+        # 如果有新的待确认建议，弹出对话框
+        if not suggestions:
+            return
+        
+        # 日志记录
+        self.paper_trading_tab.status_panel.append_event(
+            f"📊 会话结束: 总拒绝={stats.get('total_rejections', 0)}, "
+            f"总评估={stats.get('total_evaluations', 0)}, "
+            f"有 {len(suggestions)} 项阈值调整建议"
+        )
+        
+        # 传递给 RejectionLogCard 并自动弹出确认对话框
+        self.adaptive_learning_tab.rejection_log_card.set_suggestions(suggestions)
+        self.adaptive_learning_tab.rejection_log_card._on_suggest_clicked()
     
     def _on_trade_delete_requested(self, order):
         """删除交易记录"""
@@ -2792,6 +3600,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # 更新统计
             stats = self._live_engine.get_stats()
             self.paper_trading_tab.status_panel.update_stats(stats)
+            
+            # 更新推理引擎显示（如果有推理结果）
+            if hasattr(state, 'reasoning_result') and state.reasoning_result:
+                self.paper_trading_tab.update_reasoning_layers(state.reasoning_result)
             self.paper_trading_tab.control_panel.update_account_stats(stats)
             
             # 更新模板统计
@@ -2844,10 +3656,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 kdj_ready=getattr(state, "kdj_ready", False),
                 bayesian_win_rate=bayesian_wr,
                 kelly_position_pct=getattr(state, "kelly_position_pct", 0.0),
+                position_score=getattr(state, "position_score", 0.0),
+                # 【指纹3D图】多维相似度分解
+                cosine_similarity=getattr(state, "cosine_similarity", 0.0),
+                euclidean_similarity=getattr(state, "euclidean_similarity", 0.0),
+                dtw_similarity=getattr(state, "dtw_similarity", 0.0),
+                prototype_confidence=getattr(state, "prototype_confidence", 0.0),
+                final_match_score=getattr(state, "final_match_score", 0.0),
+                cold_start_active=getattr(state, "cold_start_enabled", False),
             )
-            self.paper_trading_tab.control_panel.update_kelly_position_display(
-                getattr(state, "kelly_position_pct", 0.0)
-            )
+            # 凯利仓位显示：优先从当前持仓读取，其次从 state 读取
+            kelly_pct = 0.0
+            if self._live_engine:
+                order = self._live_engine.paper_trader.current_position
+                if order and hasattr(order, 'kelly_position_pct') and order.kelly_position_pct > 0:
+                    kelly_pct = order.kelly_position_pct
+                elif getattr(state, "kelly_position_pct", 0.0) > 0:
+                    kelly_pct = state.kelly_position_pct
+            self.paper_trading_tab.control_panel.update_kelly_position_display(kelly_pct)
             
             # 【决策说明日志】decision_reason 变化时追加到事件日志
             reason = state.decision_reason or ""
@@ -2873,7 +3699,94 @@ class MainWindow(QtWidgets.QMainWindow):
                 matched_fp,
                 matched_sim,
                 state.fingerprint_status,
+                prototype_confidence=getattr(state, "prototype_confidence", 0.0),
             )
+            
+            # ── 更新自适应学习面板 ──
+            rejection_history = getattr(state, "rejection_history", [])
+            gate_scores = getattr(state, "gate_scores", {})
+            if rejection_history or gate_scores:
+                tracker = getattr(self._live_engine, "_rejection_tracker", None)
+                expanded = []
+                if tracker:
+                    from config import PAPER_TRADING_CONFIG as _ptc_rej
+                    expanded = tracker.compute_all_concrete_adjustments(_ptc_rej)
+                self.adaptive_learning_tab.update_entry_gate(
+                    rejection_history, gate_scores, expanded
+                )
+
+            # 出场时机
+            exit_records = getattr(state, "exit_timing_history", [])
+            exit_scores = getattr(state, "exit_timing_scores", {})
+            exit_suggestions = []
+            tracker = getattr(self._live_engine, "_exit_timing_tracker", None)
+            if tracker:
+                from config import PAPER_TRADING_CONFIG as _ptc_exit
+                exit_suggestions = tracker.get_suggestions(_ptc_exit)
+            self.adaptive_learning_tab.update_exit_timing(exit_records, exit_scores, exit_suggestions)
+
+            # 止盈止损
+            tpsl_records = getattr(state, "tpsl_history", [])
+            tpsl_scores = getattr(state, "tpsl_scores", {})
+            tpsl_suggestions = []
+            tracker = getattr(self._live_engine, "_tpsl_tracker", None)
+            if tracker:
+                from config import PAPER_TRADING_CONFIG as _ptc_tpsl
+                tpsl_suggestions = tracker.get_suggestions(_ptc_tpsl)
+            self.adaptive_learning_tab.update_tpsl(tpsl_records, tpsl_scores, tpsl_suggestions)
+
+            # 近似信号
+            nm_records = getattr(state, "near_miss_history", [])
+            nm_scores = getattr(state, "near_miss_scores", {})
+            nm_suggestions = []
+            tracker = getattr(self._live_engine, "_near_miss_tracker", None)
+            if tracker:
+                from config import PAPER_TRADING_CONFIG as _ptc_nm
+                nm_suggestions = tracker.get_suggestions(_ptc_nm)
+            self.adaptive_learning_tab.update_near_miss(nm_records, nm_scores, nm_suggestions)
+
+            # 市场状态拦截（来自 RejectionTracker 的 fail_code 过滤）
+            regime_records = getattr(state, "regime_history", [])
+            regime_scores = getattr(state, "regime_scores", {})
+            self.adaptive_learning_tab.update_regime(regime_records, regime_scores, [])
+
+            # 早期出场
+            ee_records = getattr(state, "early_exit_history", [])
+            ee_scores = getattr(state, "early_exit_scores", {})
+            ee_suggestions = []
+            tracker = getattr(self._live_engine, "_early_exit_tracker", None)
+            if tracker:
+                from config import PAPER_TRADING_CONFIG as _ptc_ee
+                ee_suggestions = tracker.get_suggestions(_ptc_ee)
+            self.adaptive_learning_tab.update_early_exit(ee_records, ee_scores, ee_suggestions)
+
+            # 汇总统计
+            summary_total = (
+                len(rejection_history) + len(exit_records) + len(tpsl_records)
+                + len(nm_records) + len(regime_records) + len(ee_records)
+            )
+            def _score_acc(scores_dict):
+                total = 0
+                correct = 0
+                for s in (scores_dict or {}).values():
+                    total_val = s.get("total", None)
+                    if total_val is None:
+                        total_val = int(s.get("correct_count", 0)) + int(s.get("wrong_count", 0))
+                    total += int(total_val)
+                    if "correct" in s:
+                        correct += int(s.get("correct", 0))
+                    else:
+                        correct += int(s.get("correct_count", 0))
+                return correct, total
+            corr = 0
+            tot = 0
+            for sd in (gate_scores, exit_scores, tpsl_scores, nm_scores, regime_scores, ee_scores):
+                c, t = _score_acc(sd)
+                corr += c
+                tot += t
+            summary_acc = (corr / tot) if tot > 0 else 0.0
+            adjustments_applied = getattr(state, "adaptive_adjustments_applied", 0)
+            self.adaptive_learning_tab.update_summary(summary_total, summary_acc, adjustments_applied)
 
             # 若开仓回调未触发，兜底补记开仓记录
             if order is not None:
@@ -2935,6 +3848,135 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._live_running:
             return
         self._refresh_live_chart()
+        
+        # 冷启动面板定时刷新（节流：每5秒刷新一次）
+        import time
+        now = time.time()
+        if not hasattr(self, "_last_cold_start_refresh"):
+            self._last_cold_start_refresh = 0
+        if now - self._last_cold_start_refresh >= 5.0:
+            self._last_cold_start_refresh = now
+            self._refresh_cold_start_panel()
+    
+    def _refresh_adaptive_dashboard(self):
+        """刷新自适应控制器仪表板"""
+        if not self._adaptive_controller:
+            return
+        
+        try:
+            # 获取仪表板数据
+            dashboard_data = self._adaptive_controller.get_dashboard_data()
+            
+            # 更新UI
+            self.adaptive_learning_tab.update_adaptive_dashboard(dashboard_data)
+        except Exception as e:
+            print(f"[MainWindow] 刷新自适应仪表板失败: {e}")
+    
+    def _poll_deepseek_reviews(self):
+        """轮询DeepSeek复盘结果并更新时间线UI"""
+        if not self._live_engine or not hasattr(self._live_engine, '_deepseek_reviewer'):
+            return
+        
+        reviewer = self._live_engine._deepseek_reviewer
+        if not reviewer or not reviewer.enabled:
+            return
+        
+        try:
+            # 获取最近完成的复盘结果（最多20条）
+            recent_reviews = reviewer.get_all_reviews(limit=20)
+            
+            # 更新时间线中对应交易的DeepSeek复盘
+            for review in recent_reviews:
+                trade_ctx = review.get('trade_context', {})
+                order_id = trade_ctx.get('order_id')
+                
+                if order_id:
+                    # 检查这个review是否已经被应用到UI
+                    if not self.adaptive_learning_tab.get_deepseek_review(order_id):
+                        # 保存到adaptive_learning_tab的字典
+                        self.adaptive_learning_tab.add_deepseek_review(order_id, review)
+                        
+                        # 更新时间线UI
+                        if hasattr(self.adaptive_learning_tab, 'trade_timeline'):
+                            self.adaptive_learning_tab.trade_timeline.update_deepseek_review(order_id, review)
+        except Exception as e:
+            print(f"[MainWindow] 轮询DeepSeek复盘结果失败: {e}")
+    
+    def _refresh_adaptive_timeline(self):
+        """刷新自适应学习时间线（检查新的复盘结果）- 别名方法"""
+        self._poll_deepseek_reviews()
+    
+    def _trigger_deepseek_review(self, order):
+        """触发异步DeepSeek AI复盘分析"""
+        if not self._deepseek_reviewer or not self._deepseek_reviewer.enabled:
+            return
+        
+        try:
+            # 构建交易上下文
+            from core.deepseek_reviewer import TradeContext as DeepSeekTradeContext
+            
+            # 获取反事实分析结果（如果已完成）
+            counterfactual_result = None
+            if hasattr(self._live_engine, '_adaptive_controller') and self._live_engine._adaptive_controller:
+                # 尝试从最近的诊断历史中获取反事实分析
+                from core.adaptive_controller import TradeContext as AdaptiveTradeContext
+                
+                # 构建完整上下文用于反事实分析
+                if hasattr(order, 'entry_snapshot') and hasattr(order, 'exit_snapshot'):
+                    # 构建价格历史（简化版）
+                    price_history = []
+                    if hasattr(order, 'indicator_snapshots_during_hold'):
+                        for i, snapshot in enumerate(order.indicator_snapshots_during_hold):
+                            if hasattr(snapshot, 'bar_idx') and hasattr(snapshot, 'price'):
+                                price_history.append((snapshot.bar_idx, snapshot.price))
+                    
+                    # 构建AdaptiveTradeContext
+                    adaptive_context = AdaptiveTradeContext(
+                        order=order,
+                        entry_snapshot=order.entry_snapshot,
+                        exit_snapshot=order.exit_snapshot,
+                        price_history=price_history,
+                        indicator_snapshots=getattr(order, 'indicator_snapshots_during_hold', []),
+                        profit_pct=order.profit_pct,
+                        hold_bars=order.hold_bars,
+                        close_reason=order.close_reason
+                    )
+                    
+                    # 执行反事实分析
+                    counterfactual = self._adaptive_controller.counterfactual_analysis(adaptive_context)
+                    counterfactual_result = {
+                        'scenario': counterfactual.scenario,
+                        'entry_improvement_pct': counterfactual.entry_improvement_pct,
+                        'exit_improvement_pct': counterfactual.exit_improvement_pct,
+                        'sl_tp_improvement_pct': counterfactual.sl_tp_improvement_pct,
+                        'total_improvement_pct': counterfactual.total_improvement_pct,
+                        'better_entry_bar': counterfactual.better_entry_bar,
+                        'optimal_sl_atr': counterfactual.optimal_sl_atr,
+                    }
+            
+            # 获取原型统计（如果有）
+            prototype_stats = None
+            if hasattr(order, 'template_fingerprint') and order.template_fingerprint:
+                # 尝试从引擎获取原型统计
+                if self._live_engine and hasattr(self._live_engine, 'get_template_stats'):
+                    prototype_stats = self._live_engine.get_template_stats(order.template_fingerprint)
+            
+            # 构建DeepSeek交易上下文
+            trade_context = DeepSeekTradeContext.from_order(
+                order,
+                counterfactual_result=counterfactual_result,
+                prototype_stats=prototype_stats,
+                feature_patterns=None  # TODO: 从FeaturePatternDB获取
+            )
+            
+            # 添加到异步复盘队列
+            self._deepseek_reviewer.add_trade_for_review(trade_context)
+            
+            print(f"[MainWindow] 已添加交易 {order.order_id} 到DeepSeek复盘队列")
+        except Exception as e:
+            print(f"[MainWindow] 触发DeepSeek复盘失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _refresh_live_chart(self):
         """统一刷新实时图表"""
@@ -3038,6 +4080,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 st.exit_reason = "严重偏离：建议收紧止损或主动减仓。"
             except Exception:
                 pass
+
+    def _append_kdj_macd_prediction_suffix(self, label: str, df) -> str:
+        """
+        为未来走势预测标签追加 KDJ/MACD 情境与秒级分析说明，使预测更严谨可解释。
+        """
+        if df is None or len(df) == 0:
+            return label + " | 按最新K线实时更新"
+        row = df.iloc[-1]
+        suf = []
+        j_val = row.get("j")
+        if j_val is not None and not (isinstance(j_val, (int, float)) and getattr(np, "isnan", lambda x: False)(float(j_val))):
+            try:
+                j_f = float(j_val)
+                if not np.isnan(j_f):
+                    kdj_dir = "多" if j_f > 50 else "空"
+                    suf.append(f"KDJ J={j_f:.0f}({kdj_dir})")
+            except (TypeError, ValueError):
+                pass
+        hist = row.get("macd_hist")
+        if hist is not None:
+            try:
+                h_f = float(hist)
+                if not np.isnan(h_f):
+                    macd_dir = "柱正" if h_f > 0 else "柱负"
+                    suf.append(f"MACD {macd_dir}")
+            except (TypeError, ValueError):
+                pass
+        if suf:
+            label = f"{label} | {' '.join(suf)}"
+        return label + " | 实时更新(秒级分析)"
 
     def _reconstruct_future_prices_from_features(self, feature_rows: np.ndarray, df, steps: int = 5) -> np.ndarray:
         """
@@ -3146,6 +4218,26 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._last_overlay_signature = overlay_sig
         
+        # 构建多维相似度分解字典（从引擎状态提取）
+        similarity_breakdown = None
+        if state:
+            cos_sim = getattr(state, "cosine_similarity", 0.0)
+            euc_sim = getattr(state, "euclidean_similarity", 0.0)
+            dtw_sim = getattr(state, "dtw_similarity", 0.0)
+            confidence = getattr(state, "prototype_confidence", 0.0)
+            final_score = getattr(state, "final_match_score", 0.0)
+            
+            # 只有当有多维数据时才构建 breakdown
+            if cos_sim > 0 or euc_sim > 0 or dtw_sim > 0:
+                similarity_breakdown = {
+                    "combined_score": matched_sim or 0.0,
+                    "cosine_similarity": cos_sim,
+                    "euclidean_similarity": euc_sim,
+                    "dtw_similarity": dtw_sim,
+                    "confidence": confidence,
+                    "final_score": final_score if final_score > 0 else (matched_sim or 0.0),
+                }
+        
         # 优先绘制概率扇形图（原型模式）
         if proto is not None:
             member_stats = getattr(proto, "member_trade_stats", [])
@@ -3156,7 +4248,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 direction = proto.direction
                 regime_short = proto.regime[:2] if proto.regime else ""
                 label = f"{direction} {regime_short}_{proto.prototype_id}"
-                
+                label = self._append_kdj_macd_prediction_suffix(label, df)
                 current_price = float(df["close"].iloc[-1])
                 leverage = getattr(self._live_engine, "fixed_leverage", 10.0)
                 start_idx = len(df) - 1
@@ -3169,6 +4261,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     label=label,
                     leverage=leverage,
                     max_bars=5,
+                    similarity_breakdown=similarity_breakdown,
                 )
                 return
         
@@ -3197,9 +4290,11 @@ class MainWindow(QtWidgets.QMainWindow):
         upper = np.concatenate([[current_price], projected_future + band_future], axis=0)
         start_idx = len(df) - 1
         label = f"{template.direction} {template.fingerprint()[:8]}"
+        label = self._append_kdj_macd_prediction_suffix(label, df)
         chart.set_fingerprint_trajectory(
             prices, start_idx, matched_sim or 0.0, label,
-            lower=lower, upper=upper
+            lower=lower, upper=upper,
+            similarity_breakdown=similarity_breakdown
         )
     
     @staticmethod
@@ -3371,6 +4466,15 @@ class MainWindow(QtWidgets.QMainWindow):
             # 添加到交易记录表格
             self.paper_trading_tab.trade_log.add_trade(order)
             
+            # ── 添加到时间线UI ──
+            if hasattr(self, 'adaptive_learning_tab'):
+                try:
+                    # DeepSeek复盘结果稍后会通过定时器轮询获取并更新
+                    # 此处先添加交易到时间线，复盘结果会异步更新
+                    self.adaptive_learning_tab.add_trade_to_timeline(order, deepseek_review=None)
+                except Exception as e:
+                    print(f"[MainWindow] 添加交易到时间线失败: {e}")
+            
             # 记录事件（使用细化后的平仓原因）
             reason_display = close_reason_str or (order.close_reason.value if order.close_reason else "未知")
             profit_color = "盈利" if order.profit_pct >= 0 else "亏损"
@@ -3381,6 +4485,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"原因={reason_display} | 持仓={order.hold_bars}根K线"
             )
             self.paper_trading_tab.status_panel.append_event(event_msg)
+            
+            # NEW: 添加交易到时间线
+            self.adaptive_learning_tab.add_trade_to_timeline(order, deepseek_review=None)
+            
+            # NEW: 触发异步DeepSeek AI复盘
+            self._trigger_deepseek_review(order)
+            
+            # NEW: 立即刷新自适应仪表板
+            self._refresh_adaptive_dashboard()
             
             print(f"[MainWindow] 实时交易平仓: {event_msg}")
         except Exception as e:
@@ -3416,6 +4529,366 @@ class MainWindow(QtWidgets.QMainWindow):
         """处理错误（主线程）"""
         self.statusBar().showMessage(f"错误: {error_msg}")
         self.paper_trading_tab.status_panel.append_event(f"错误: {error_msg}")
+    
+    def _build_adaptive_trade_context(self, order) -> Optional[AdaptiveTradeContext]:
+        """
+        为自适应控制器构建交易上下文
+        
+        Args:
+            order: PaperOrder 对象
+        
+        Returns:
+            AdaptiveTradeContext 或 None
+        """
+        try:
+            # 获取决策快照
+            entry_snapshot = getattr(order, 'entry_snapshot', None)
+            exit_snapshot = getattr(order, 'exit_snapshot', None)
+            
+            if not entry_snapshot:
+                print(f"[MainWindow] 订单 {order.order_id} 缺少入场快照，跳过自适应分析")
+                return None
+            
+            # 获取持仓期间的指标快照
+            indicator_snapshots = getattr(order, 'indicator_snapshots', [])
+            
+            # 获取价格历史（从引擎的价格缓存中提取）
+            price_history = []
+            if self._live_engine and hasattr(self._live_engine, '_price_history'):
+                # 提取该订单持仓期间的价格
+                entry_bar = order.entry_bar_idx
+                exit_bar = order.exit_bar_idx or order.entry_bar_idx
+                for bar_idx in range(entry_bar, exit_bar + 1):
+                    if bar_idx in self._live_engine._price_history:
+                        price = self._live_engine._price_history[bar_idx]
+                        price_history.append((bar_idx, price))
+            
+            # 构建上下文
+            context = AdaptiveTradeContext(
+                order=order,
+                entry_snapshot=entry_snapshot,
+                exit_snapshot=exit_snapshot,
+                price_history=price_history,
+                indicator_snapshots=indicator_snapshots,
+                profit_pct=order.profit_pct,
+                hold_bars=order.hold_bars,
+                close_reason=order.close_reason,
+            )
+            
+            return context
+        
+        except Exception as e:
+            print(f"[MainWindow] 构建自适应交易上下文失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _build_deepseek_trade_context(self, order) -> Optional[DeepSeekTradeContext]:
+        """
+        为DeepSeek构建交易上下文
+        
+        Args:
+            order: PaperOrder 对象
+        
+        Returns:
+            DeepSeekTradeContext 或 None
+        """
+        try:
+            # 获取快照
+            entry_snapshot = getattr(order, 'entry_snapshot', None)
+            exit_snapshot = getattr(order, 'exit_snapshot', None)
+            
+            if not entry_snapshot:
+                return None
+            
+            # 转换为字典
+            entry_snapshot_dict = {}
+            if hasattr(entry_snapshot, 'to_dict'):
+                entry_snapshot_dict = entry_snapshot.to_dict()
+            elif isinstance(entry_snapshot, dict):
+                entry_snapshot_dict = entry_snapshot
+            
+            exit_snapshot_dict = {}
+            if exit_snapshot:
+                if hasattr(exit_snapshot, 'to_dict'):
+                    exit_snapshot_dict = exit_snapshot.to_dict()
+                elif isinstance(exit_snapshot, dict):
+                    exit_snapshot_dict = exit_snapshot
+            
+            # 获取原型统计（如果有）
+            prototype_stats = None
+            if hasattr(order, 'template_fingerprint') and order.template_fingerprint:
+                # 从引擎获取该原型的历史表现
+                if self._live_engine and hasattr(self._live_engine, 'get_template_stats'):
+                    try:
+                        prototype_stats = self._live_engine.get_template_stats(order.template_fingerprint)
+                    except:
+                        pass
+            
+            # 获取反事实分析结果（从adaptive_controller）
+            counterfactual_result = None
+            if self._adaptive_controller and hasattr(self._adaptive_controller, 'diagnosis_history'):
+                # 查找最近的诊断记录
+                for diag_entry in reversed(list(self._adaptive_controller.diagnosis_history)):
+                    if diag_entry.get('order_id') == order.order_id:
+                        # 找到了，提取反事实结果（如果有保存）
+                        break
+            
+            # 构建上下文
+            context = DeepSeekTradeContext.from_order(
+                order,
+                counterfactual_result=counterfactual_result,
+                prototype_stats=prototype_stats,
+                feature_patterns=None,  # 可以从 feature_db 提取
+            )
+            
+            return context
+        
+        except Exception as e:
+            print(f"[MainWindow] 构建DeepSeek交易上下文失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _refresh_adaptive_dashboard(self):
+        """刷新自适应控制器仪表板"""
+        try:
+            if self._adaptive_controller:
+                dashboard_data = self._adaptive_controller.get_dashboard_data()
+                self.adaptive_learning_tab.update_adaptive_dashboard(dashboard_data)
+        except Exception as e:
+            print(f"[MainWindow] 刷新自适应仪表板失败: {e}")
+    
+    def _expand_adjustment_suggestions(self, raw_suggestions: list) -> list:
+        """
+        将 RejectionTracker.suggest_all_adjustments() 的输出
+        展开为 UI 对话框所需的逐参数条目格式。
+        
+        已弃用：推荐直接使用 RejectionTracker.compute_all_concrete_adjustments()，
+        该方法集中了步长计算、安全边界夹紧等逻辑。
+        此方法保留作为回退兼容。
+        """
+        from config import PAPER_TRADING_CONFIG
+        # 委托给 tracker 的集中化方法
+        tracker = getattr(self._live_engine, "_rejection_tracker", None) if self._live_engine else None
+        if tracker:
+            return tracker.compute_all_concrete_adjustments(PAPER_TRADING_CONFIG)
+        
+        # 回退：引擎不存在时使用原始逻辑
+        expanded = []
+        for sug in (raw_suggestions or []):
+            action = sug.get("action", "")
+            action_text = "放宽" if action == "loosen" else "收紧"
+            params = sug.get("adjustable_params", {})
+            for param_key, param_def in params.items():
+                current_val = PAPER_TRADING_CONFIG.get(param_key)
+                if current_val is None:
+                    continue
+                step = param_def.get("loosen_step" if action == "loosen" else "tighten_step", 0)
+                new_val = current_val + step
+                new_val = max(param_def.get("min", new_val), min(param_def.get("max", new_val), new_val))
+                if new_val == current_val:
+                    continue
+                expanded.append({
+                    "fail_code": sug.get("fail_code", ""),
+                    "param_key": param_key,
+                    "action": action,
+                    "action_text": action_text,
+                    "label": param_key.replace("_", " ").title(),
+                    "current_value": current_val,
+                    "suggested_value": new_val,
+                    "accuracy": sug.get("accuracy", 0),
+                    "reason": sug.get("reason", ""),
+                })
+        return expanded
+    
+    def _on_rejection_adjustment_confirmed(self, param_key: str, new_value: float):
+        """
+        用户在 RejectionLogCard 确认对话框中确认应用某个阈值调整。
+        通过引擎的拒绝跟踪器应用（带审计日志和安全边界夹紧）。
+        """
+        if self._live_engine:
+            # 通过引擎接口应用（带审计日志）
+            result = self._live_engine.apply_threshold_adjustment(
+                param_key=param_key,
+                new_value=new_value,
+                reason="用户手动确认应用",
+            )
+            if result:
+                old_val = result.get("old_value", "?")
+                new_val = result.get("new_value", new_value)
+                msg = f"门控阈值调整: {param_key} {old_val} → {new_val} (已审计)"
+            else:
+                msg = f"门控阈值调整跳过: {param_key} (已在目标值或参数不存在)"
+        else:
+            # 引擎不存在时直接修改配置（无审计）
+            from config import PAPER_TRADING_CONFIG
+            old_value = PAPER_TRADING_CONFIG.get(param_key)
+            if old_value is None:
+                return
+            PAPER_TRADING_CONFIG[param_key] = new_value
+            msg = f"门控阈值调整: {param_key} {old_value} → {new_value} (无审计)"
+        
+        print(f"[MainWindow] {msg}")
+        self.paper_trading_tab.status_panel.append_event(msg)
+        self.statusBar().showMessage(msg, 5000)
+
+    def _apply_adaptive_adjustment(self, source: str, param_key: str, new_value: float, label: str):
+        if self._live_engine and hasattr(self._live_engine, "apply_adaptive_adjustment"):
+            result = self._live_engine.apply_adaptive_adjustment(
+                source=source,
+                param_key=param_key,
+                new_value=new_value,
+                reason="用户手动确认应用",
+            )
+            if result:
+                old_val = result.get("old_value", "?")
+                new_val = result.get("new_value", new_value)
+                msg = f"{label} 调整: {param_key} {old_val} → {new_val} (已审计)"
+            else:
+                msg = f"{label} 调整跳过: {param_key} (已在目标值或参数不存在)"
+        else:
+            msg = f"{label} 调整未应用: 引擎未运行"
+        print(f"[MainWindow] {msg}")
+        self.paper_trading_tab.status_panel.append_event(msg)
+        self.statusBar().showMessage(msg, 5000)
+
+    def _on_exit_timing_adjustment_confirmed(self, param_key: str, new_value: float):
+        self._apply_adaptive_adjustment("exit_timing", param_key, new_value, "出场时机")
+
+    def _on_tpsl_adjustment_confirmed(self, param_key: str, new_value: float):
+        self._apply_adaptive_adjustment("tpsl", param_key, new_value, "止盈止损")
+
+    def _on_near_miss_adjustment_confirmed(self, param_key: str, new_value: float):
+        self._apply_adaptive_adjustment("near_miss", param_key, new_value, "近似信号")
+
+    def _on_regime_adjustment_confirmed(self, param_key: str, new_value: float):
+        self._apply_adaptive_adjustment("regime", param_key, new_value, "市场状态")
+
+    def _on_early_exit_adjustment_confirmed(self, param_key: str, new_value: float):
+        self._apply_adaptive_adjustment("early_exit", param_key, new_value, "早期出场")
+    
+    # ─── 冷启动系统 ─────────────────────────────────
+    
+    def _on_cold_start_toggled(self, enabled: bool):
+        """处理冷启动模式开关切换"""
+        if not self._live_engine:
+            # 引擎未运行时，持久化到文件，确保下次启动时正确加载 50% 阈值
+            from core.cold_start_manager import ColdStartManager
+            ColdStartManager.persist_enabled_state(enabled)
+            self.statusBar().showMessage(
+                f"冷启动模式{'已启用' if enabled else '已关闭'}（已保存，下次启动时生效）",
+                3000
+            )
+            return
+        
+        # 调用引擎设置冷启动状态
+        self._live_engine.set_cold_start_enabled(enabled)
+        
+        # 刷新UI显示
+        self._refresh_cold_start_panel()
+        
+        self.statusBar().showMessage(
+            f"冷启动模式{'已启用' if enabled else '已关闭'}",
+            3000
+        )
+    
+    def _refresh_cold_start_panel(self):
+        """刷新冷启动面板状态"""
+        if not self._live_engine:
+            return
+        
+        try:
+            # 获取冷启动状态
+            cold_state = self._live_engine.get_cold_start_state()
+            
+            # 更新开关状态（不触发信号）
+            self.adaptive_learning_tab.set_cold_start_enabled(
+                cold_state.get("enabled", False)
+            )
+            
+            # 更新门槛值
+            thresholds = cold_state.get("thresholds", {})
+            normal_thresholds = cold_state.get("normal_thresholds", {})
+            self.adaptive_learning_tab.update_cold_start_thresholds(
+                fusion=thresholds.get("fusion", 0.65),
+                cosine=thresholds.get("cosine", 0.70),
+                euclidean=thresholds.get("euclidean", 0.35),
+                dtw=thresholds.get("dtw", 0.30),
+                normal_thresholds=normal_thresholds,
+            )
+            
+            # 更新频率监控
+            freq = cold_state.get("frequency", {})
+            last_trade_ts = freq.get("last_trade_time")
+            last_trade_time = None
+            if last_trade_ts is not None:
+                # 从 minutes_since_last_trade 推算 datetime
+                minutes_since = freq.get("minutes_since_last_trade")
+                if minutes_since is not None:
+                    from datetime import datetime, timedelta
+                    last_trade_time = datetime.now() - timedelta(minutes=minutes_since)
+            
+            trades_today = freq.get("trades_today", 0)
+            trades_per_hour = freq.get("trades_per_hour", 0.0)
+            
+            # 映射状态
+            status_map = {
+                "正常": "normal",
+                "偏低": "low",
+                "频率过低": "warning",
+                "关闭": "normal",
+            }
+            raw_status = freq.get("status", "正常")
+            mapped_status = status_map.get(raw_status, "normal")
+            
+            self.adaptive_learning_tab.update_cold_start_frequency(
+                last_trade_time=last_trade_time,
+                today_trades=trades_today,
+                trades_per_hour=trades_per_hour,
+                status=mapped_status,
+            )
+            
+            # 检测自动放宽通知（比较 auto_relax_count 变化）
+            auto_relax_count = freq.get("auto_relax_count", 0)
+            if not hasattr(self, "_last_auto_relax_count"):
+                self._last_auto_relax_count = 0
+            
+            if auto_relax_count > self._last_auto_relax_count:
+                # 发生了新的自动放宽，显示通知
+                self._last_auto_relax_count = auto_relax_count
+                self.adaptive_learning_tab.show_cold_start_auto_relax(
+                    f"交易频率过低，门槛已自动放宽5% (第{auto_relax_count}次)"
+                )
+            
+        except Exception as e:
+            print(f"[MainWindow] 刷新冷启动面板失败: {e}")
+    
+    def _init_cold_start_panel_from_engine(self):
+        """从引擎状态初始化冷启动面板"""
+        if not self._live_engine:
+            return
+        
+        try:
+            cold_state = self._live_engine.get_cold_start_state()
+            
+            # 设置开关状态（不触发信号）
+            self.adaptive_learning_tab.set_cold_start_enabled(
+                cold_state.get("enabled", False)
+            )
+            
+            # 初始化 auto_relax_count 跟踪器（避免启动时误触发通知）
+            freq = cold_state.get("frequency", {})
+            self._last_auto_relax_count = freq.get("auto_relax_count", 0)
+            
+            # 隐藏之前可能遗留的通知
+            self.adaptive_learning_tab.hide_cold_start_auto_relax()
+            
+            # 初始刷新一次
+            self._refresh_cold_start_panel()
+            
+        except Exception as e:
+            print(f"[MainWindow] 初始化冷启动面板失败: {e}")
     
     def _on_save_profitable_templates(self):
         """保存盈利模板"""

@@ -1097,7 +1097,8 @@ class BinanceTestnetTrader:
                          entry_similarity: float = 0.0,
                          entry_reason: str = "",
                          timeout_bars: int = 5,
-                         position_size_pct: Optional[float] = None) -> Optional[str]:
+                         position_size_pct: Optional[float] = None,
+                         entry_trajectory=None) -> Optional[str]:
         """
         放置限价开仓单 (LIMIT + GTC)
         在 trigger_price 挂限价单，等待价格触及成交（争取 Maker 0.02%）
@@ -1105,6 +1106,7 @@ class BinanceTestnetTrader:
         
         Args:
             position_size_pct: 仓位比例（None=使用默认配置，凯利公式动态调整时传入）
+            entry_trajectory: 【指纹3D图】入场轨迹矩阵，仅 PaperTrader 使用，本实现忽略
         """
         self._sync_from_exchange(force=True)
         if self.current_position is not None:

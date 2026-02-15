@@ -13,7 +13,7 @@ R3000 虚拟订单管理模块
 import json
 import os
 import time
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Tuple
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -80,6 +80,16 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                     close_reason = CloseReason(t["close_reason"])
                 except ValueError:
                     pass
+            
+            # 【指纹3D图】加载轨迹矩阵数据
+            entry_trajectory = None
+            traj_data = t.get("entry_trajectory")
+            if traj_data is not None:
+                try:
+                    entry_trajectory = np.array(traj_data, dtype=np.float32)
+                except (ValueError, TypeError):
+                    entry_trajectory = None
+            
             order = PaperOrder(
                 order_id=t.get("order_id", ""),
                 symbol=t.get("symbol", ""),
@@ -108,6 +118,16 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 entry_atr=float(t.get("entry_atr", 0)),
                 is_flip_trade=bool(t.get("is_flip_trade", False)),
                 flip_reason=t.get("flip_reason", ""),
+                entry_trajectory=entry_trajectory,  # 【指纹3D图】轨迹矩阵
+                # === 自适应学习字段 ===
+                similarity_history=t.get("similarity_history", []),
+                reasoning_history=t.get("reasoning_history", []),
+                regime_at_entry=t.get("regime_at_entry", "未知"),
+                entry_snapshot=t.get("entry_snapshot"),
+                exit_snapshot=t.get("exit_snapshot"),
+                indicator_snapshots_during_hold=t.get("indicator_snapshots_during_hold", []),
+                # 凯利动态仓位
+                kelly_position_pct=float(t.get("kelly_position_pct", 0)),
             )
             loaded.append(order)
         return loaded
@@ -193,12 +213,29 @@ class PaperOrder:
     is_flip_trade: bool = False       # 是否由价格位置翻转触发
     flip_reason: str = ""             # 翻转原因（"底部翻转做多"/"顶部翻转做空"）
     
+    # 【指纹3D图】入场时的轨迹矩阵数据（用于增量训练）
+    entry_trajectory: Optional[np.ndarray] = None  # 入场时的 (60, 32) 轨迹矩阵
+    
+    # 【自适应学习】决策快照和推理历史
+    entry_snapshot: Optional['DecisionSnapshot'] = None  # 入场决策快照
+    exit_snapshot: Optional['DecisionSnapshot'] = None   # 出场决策快照
+    indicator_snapshots: List[Dict] = field(default_factory=list)  # 持仓期间的指标快照
+    similarity_history: List[Tuple[int, float]] = field(default_factory=list)  # [(bar_idx, similarity), ...]
+    reasoning_history: List['ReasoningResult'] = field(default_factory=list)  # 推理结果历史
+    regime_at_entry: str = "未知"  # 入场时的市场状态
+    
     # 限价单相关
     pending_limit_order: bool = False      # 是否有待成交限价单
     limit_order_price: Optional[float] = None  # 限价单价格
     limit_order_start_bar: Optional[int] = None  # 限价单挂单开始K线
     limit_order_max_wait: int = 5          # 最多等待5根K线
     limit_order_quantity: Optional[float] = None  # 限价单数量（支持部分平仓）
+    
+    # 持仓期间的指标快照（用于反事实分析）
+    indicator_snapshots_during_hold: List[dict] = field(default_factory=list)  # [DecisionSnapshot.to_dict(), ...]
+    
+    # 凯利动态仓位（用于自适应学习）
+    kelly_position_pct: float = 0.0  # 凯利公式计算的仓位比例（0-1）
     
     def update_pnl(self, current_price: float, leverage: float = 10):
         """更新未实现盈亏 + 追踪峰值"""
@@ -243,6 +280,11 @@ class PaperOrder:
     
     def to_dict(self) -> dict:
         """转为字典（用于存储/显示）"""
+        # 【指纹3D图】将轨迹矩阵转换为可JSON序列化的格式
+        trajectory_data = None
+        if self.entry_trajectory is not None and isinstance(self.entry_trajectory, np.ndarray):
+            trajectory_data = self.entry_trajectory.tolist()
+        
         return {
             "order_id": self.order_id,
             "symbol": self.symbol,
@@ -274,6 +316,17 @@ class PaperOrder:
             "entry_atr": self.entry_atr,
             "is_flip_trade": self.is_flip_trade,
             "flip_reason": self.flip_reason,
+            # 【指纹3D图】轨迹矩阵数据
+            "entry_trajectory": trajectory_data,
+            # === 自适应学习字段 ===
+            "similarity_history": self.similarity_history,
+            "reasoning_history": self.reasoning_history,
+            "regime_at_entry": self.regime_at_entry,
+            "entry_snapshot": self.entry_snapshot,
+            "exit_snapshot": self.exit_snapshot,
+            "indicator_snapshots_during_hold": self.indicator_snapshots_during_hold,
+            # 凯利动态仓位
+            "kelly_position_pct": self.kelly_position_pct,
         }
 
 
@@ -469,9 +522,13 @@ class PaperTrader:
                       stop_loss: Optional[float] = None,
                       template_fingerprint: Optional[str] = None,
                       entry_similarity: float = 0.0,
-                      entry_reason: str = "") -> Optional[PaperOrder]:
+                      entry_reason: str = "",
+                      entry_trajectory: Optional[np.ndarray] = None) -> Optional[PaperOrder]:
         """
         开仓 (市价/直接成交)
+        
+        Args:
+            entry_trajectory: 【指纹3D图】入场时的轨迹矩阵 (60, 32)，用于增量训练
         """
         if self.current_position is not None:
             print("[PaperTrader] 已有持仓，无法开仓")
@@ -491,7 +548,8 @@ class PaperTrader:
         return self._create_filled_order(
             side=side, price=actual_price, qty=quantity, margin=margin,
             bar_idx=bar_idx, tp=take_profit, sl=stop_loss,
-            fp=template_fingerprint, sim=entry_similarity, reason=entry_reason
+            fp=template_fingerprint, sim=entry_similarity, reason=entry_reason,
+            trajectory=entry_trajectory
         )
 
     def place_stop_order(self,
@@ -503,9 +561,15 @@ class PaperTrader:
                         template_fingerprint: Optional[str] = None,
                         entry_similarity: float = 0.0,
                         entry_reason: str = "",
-                        timeout_bars: int = 5) -> str:
+                        timeout_bars: int = 5,
+                        entry_trajectory: Optional[np.ndarray] = None,
+                        position_size_pct: Optional[float] = None) -> str:
         """
         放置条件触发单 (Stop Order)
+        
+        Args:
+            entry_trajectory: 【指纹3D图】入场时的轨迹矩阵 (60, 32)，用于增量训练
+            position_size_pct: 凯利动态仓位比例（None=使用默认固定仓位）
         """
         self._order_counter += 1
         order_id = f"STOP_{self._order_counter:06d}"
@@ -520,11 +584,14 @@ class PaperTrader:
             "sl": stop_loss,
             "fp": template_fingerprint,
             "sim": entry_similarity,
-            "reason": entry_reason
+            "reason": entry_reason,
+            "trajectory": entry_trajectory,  # 【指纹3D图】轨迹矩阵
+            "position_size_pct": position_size_pct,  # 凯利动态仓位
         }
         
         self.pending_stop_orders.append(stop_order)
-        print(f"[PaperTrader] 放置止损触发单: {side.value} @ 触发价 {trigger_price:.2f} (有效至 Bar {bar_idx + timeout_bars})")
+        pct_str = f", 仓位={position_size_pct:.1%}" if position_size_pct else ""
+        print(f"[PaperTrader] 放置止损触发单: {side.value} @ 触发价 {trigger_price:.2f} (有效至 Bar {bar_idx + timeout_bars}{pct_str})")
         return order_id
 
     def cancel_stop_order(self, order_id: str):
@@ -532,8 +599,15 @@ class PaperTrader:
         self.pending_stop_orders = [o for o in self.pending_stop_orders if o["order_id"] != order_id]
         print(f"[PaperTrader] 已撤销触发单: {order_id}")
 
-    def _create_filled_order(self, side, price, qty, margin, bar_idx, tp, sl, fp, sim, reason) -> PaperOrder:
-        """辅助方法：创建已成交订单对象"""
+    def _create_filled_order(self, side, price, qty, margin, bar_idx, tp, sl, fp, sim, reason,
+                              trajectory: Optional[np.ndarray] = None,
+                              kelly_position_pct: float = 0.0) -> PaperOrder:
+        """辅助方法：创建已成交订单对象
+        
+        Args:
+            trajectory: 【指纹3D图】入场时的轨迹矩阵 (60, 32)，用于增量训练
+            kelly_position_pct: 凯利动态仓位比例（用于自适应学习）
+        """
         self._order_counter += 1
         order = PaperOrder(
             order_id=f"SIM_{self._order_counter:06d}",
@@ -551,6 +625,8 @@ class PaperTrader:
             entry_similarity=sim,
             entry_reason=reason,
             peak_price=price,  # 初始峰值 = 入场价
+            entry_trajectory=trajectory,  # 【指纹3D图】轨迹矩阵
+            kelly_position_pct=kelly_position_pct,  # 凯利动态仓位
         )
         self.current_position = order
         self.current_bar_idx = bar_idx
@@ -760,8 +836,10 @@ class PaperTrader:
                 return
             # 执行开仓
             o = activated_orders[0]
-            # 计算数量
-            margin = self.balance * self.position_size_pct
+            # 计算数量（优先使用凯利动态仓位，否则用默认固定仓位）
+            kelly_pct = o.get("position_size_pct")
+            actual_pct = kelly_pct if kelly_pct is not None else self.position_size_pct
+            margin = self.balance * actual_pct
             notional = margin * self.leverage
             quantity = notional / o["trigger_price"]
             
@@ -772,7 +850,9 @@ class PaperTrader:
             self._create_filled_order(
                 side=o["side"], price=o["trigger_price"], qty=quantity, margin=margin,
                 bar_idx=effective_bar_idx, tp=o["tp"], sl=o["sl"],
-                fp=o["fp"], sim=o["sim"], reason=o["reason"]
+                fp=o["fp"], sim=o["sim"], reason=o["reason"],
+                trajectory=o.get("trajectory"),  # 【指纹3D图】传递轨迹矩阵
+                kelly_position_pct=kelly_pct or 0.0  # 凯利仓位（用于学习）
             )
     
     def update_tracking_status(self, similarity: float,

@@ -560,10 +560,23 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
     # 原型相关信号
     generate_prototypes_requested = QtCore.pyqtSignal(int, int)  # (n_long, n_short)
     load_prototypes_requested = QtCore.pyqtSignal()
+    # WF 权重进化信号
+    wf_evolution_requested = QtCore.pyqtSignal(dict)     # 开始进化 (config dict)
+    wf_evolution_stop_requested = QtCore.pyqtSignal()    # 停止进化
+    wf_evolution_save_requested = QtCore.pyqtSignal()    # 保存进化权重
+    wf_evolution_apply_requested = QtCore.pyqtSignal()   # 应用进化权重到实盘
+
+    # 特征组定义（与 wf_evolution.py 保持一致）
+    FEATURE_GROUPS = [
+        "RSI", "MACD", "Volatility", "Momentum",
+        "Volume", "Trend", "Structure", "ADX",
+    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._batch_last_progress = 0
+        self._evo_last_progress = 0
+        self._evo_has_result = False  # 是否有进化结果可保存/应用
         self._init_ui()
 
     def _init_ui(self):
@@ -813,6 +826,8 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         template_layout.addWidget(eval_note)
 
         layout.addWidget(template_group)
+        # 右上角「Walk-Forward 已验证模板」整块不再展示，改为在聚合指纹图（原型库）中显示进化相关
+        template_group.setVisible(False)
 
         # ══════════════════════════════════════════════════════════
         # ── 原型库（聚类后的交易模式） ──
@@ -893,9 +908,13 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         self.proto_source_label.setStyleSheet("color: #aaa; font-size: 11px;")
         self.proto_avg_winrate_label = QtWidgets.QLabel("平均胜率: --")
         self.proto_avg_winrate_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.proto_avg_confidence_label = QtWidgets.QLabel("平均置信度: --")
+        self.proto_avg_confidence_label.setStyleSheet("color: #aaa; font-size: 11px;")
         proto_detail_layout.addWidget(self.proto_source_label)
         proto_detail_layout.addStretch()
         proto_detail_layout.addWidget(self.proto_avg_winrate_label)
+        proto_detail_layout.addSpacing(10)
+        proto_detail_layout.addWidget(self.proto_avg_confidence_label)
         proto_stats_inner.addLayout(proto_detail_layout)
 
         # WF评级分布行
@@ -921,6 +940,26 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         
         wf_dist_layout.addStretch()
         proto_stats_inner.addLayout(wf_dist_layout)
+
+        # ── 权重进化状态（当前聚合指纹图是否绑定进化参数） ──
+        evo_bind_layout = QtWidgets.QHBoxLayout()
+        evo_bind_layout.setContentsMargins(0, 6, 0, 0)
+        evo_tag = QtWidgets.QLabel("权重进化:")
+        evo_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.proto_evo_status_label = QtWidgets.QLabel("未进化")
+        self.proto_evo_status_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.proto_evo_long_label = QtWidgets.QLabel("")
+        self.proto_evo_long_label.setStyleSheet("color: #089981; font-size: 11px;")
+        self.proto_evo_short_label = QtWidgets.QLabel("")
+        self.proto_evo_short_label.setStyleSheet("color: #f23645; font-size: 11px;")
+        evo_bind_layout.addWidget(evo_tag)
+        evo_bind_layout.addWidget(self.proto_evo_status_label)
+        evo_bind_layout.addSpacing(12)
+        evo_bind_layout.addWidget(self.proto_evo_long_label)
+        evo_bind_layout.addSpacing(8)
+        evo_bind_layout.addWidget(self.proto_evo_short_label)
+        evo_bind_layout.addStretch()
+        proto_stats_inner.addLayout(evo_bind_layout)
 
         proto_layout.addWidget(proto_stats_frame)
 
@@ -1022,10 +1061,10 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         layout.addWidget(prototype_group)
 
         # ══════════════════════════════════════════════════════════
-        # ── 批量 Walk-Forward 验证 ──
+        # ── WF 权重进化 (CMA-ES) ──
         # ══════════════════════════════════════════════════════════
-        batch_group = QtWidgets.QGroupBox("批量 Walk-Forward 验证")
-        batch_group.setStyleSheet(f"""
+        evo_group = QtWidgets.QGroupBox("WF 权重进化 (CMA-ES)")
+        evo_group.setStyleSheet(f"""
             QGroupBox {{
                 border: 2px solid #cc8800;
                 border-radius: 6px;
@@ -1036,39 +1075,55 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
                 font-size: {UI_CONFIG.get('FONT_SIZE_LARGE', 14)}px;
             }}
         """)
-        batch_layout = QtWidgets.QVBoxLayout(batch_group)
+        evo_layout = QtWidgets.QVBoxLayout(evo_group)
 
-        # 参数设置行
-        batch_params_layout = QtWidgets.QHBoxLayout()
+        # ── 参数设置行1: 数据量 + 试验数 ──
+        evo_params_row1 = QtWidgets.QHBoxLayout()
+        evo_params_row1.addWidget(QtWidgets.QLabel("数据量:"))
+        self.evo_sample_spin = QtWidgets.QSpinBox()
+        self.evo_sample_spin.setRange(50000, 1500000)
+        self.evo_sample_spin.setValue(300000)
+        self.evo_sample_spin.setSingleStep(50000)
+        self.evo_sample_spin.setFixedWidth(100)
+        self.evo_sample_spin.setToolTip("参与进化的总K线数（建议300K，覆盖约6个月）")
+        evo_params_row1.addWidget(self.evo_sample_spin)
 
-        batch_params_layout.addWidget(QtWidgets.QLabel("轮数:"))
-        self.batch_rounds_spin = QtWidgets.QSpinBox()
-        self.batch_rounds_spin.setRange(1, 100)
-        from config import WALK_FORWARD_CONFIG
-        default_rounds = WALK_FORWARD_CONFIG.get("BATCH_DEFAULT_ROUNDS", 20)
-        self.batch_rounds_spin.setValue(default_rounds)
-        self.batch_rounds_spin.setFixedWidth(60)
-        self.batch_rounds_spin.setToolTip("验证轮数（每轮采样不同数据段，建议≥20轮）")
-        batch_params_layout.addWidget(self.batch_rounds_spin)
+        evo_params_row1.addWidget(QtWidgets.QLabel("试验数:"))
+        self.evo_trials_spin = QtWidgets.QSpinBox()
+        self.evo_trials_spin.setRange(20, 200)
+        self.evo_trials_spin.setValue(60)
+        self.evo_trials_spin.setFixedWidth(60)
+        self.evo_trials_spin.setToolTip("CMA-ES优化试验次数（建议60，10D空间约6次/维）")
+        evo_params_row1.addWidget(self.evo_trials_spin)
+        evo_params_row1.addStretch()
+        evo_layout.addLayout(evo_params_row1)
 
-        batch_params_layout.addWidget(QtWidgets.QLabel("采样:"))
-        self.batch_sample_spin = QtWidgets.QSpinBox()
-        self.batch_sample_spin.setRange(10000, 200000)
-        self.batch_sample_spin.setValue(50000)
-        self.batch_sample_spin.setSingleStep(10000)
-        self.batch_sample_spin.setFixedWidth(80)
-        self.batch_sample_spin.setToolTip("每轮采样K线数")
-        self.batch_sample_spin.setSuffix("K线")
-        batch_params_layout.addWidget(self.batch_sample_spin)
+        # ── 参数设置行2: 内折数 + Holdout ──
+        evo_params_row2 = QtWidgets.QHBoxLayout()
+        evo_params_row2.addWidget(QtWidgets.QLabel("内折数:"))
+        self.evo_folds_spin = QtWidgets.QSpinBox()
+        self.evo_folds_spin.setRange(2, 5)
+        self.evo_folds_spin.setValue(3)
+        self.evo_folds_spin.setFixedWidth(50)
+        self.evo_folds_spin.setToolTip("内部Walk-Forward折数（3折平衡速度与鲁棒性）")
+        evo_params_row2.addWidget(self.evo_folds_spin)
 
-        batch_params_layout.addStretch()
-        batch_layout.addLayout(batch_params_layout)
+        evo_params_row2.addWidget(QtWidgets.QLabel("留出比例:"))
+        self.evo_holdout_spin = QtWidgets.QSpinBox()
+        self.evo_holdout_spin.setRange(10, 50)
+        self.evo_holdout_spin.setValue(30)
+        self.evo_holdout_spin.setSuffix("%")
+        self.evo_holdout_spin.setFixedWidth(65)
+        self.evo_holdout_spin.setToolTip("留出集比例（30%用于最终验证，不参与进化）")
+        evo_params_row2.addWidget(self.evo_holdout_spin)
+        evo_params_row2.addStretch()
+        evo_layout.addLayout(evo_params_row2)
 
-        # 启动/停止按钮行
-        batch_btn_layout = QtWidgets.QHBoxLayout()
+        # ── 启动/停止按钮 ──
+        evo_btn_layout = QtWidgets.QHBoxLayout()
 
-        self.batch_wf_btn = QtWidgets.QPushButton("一键批量验证")
-        self.batch_wf_btn.setStyleSheet(f"""
+        self.evo_start_btn = QtWidgets.QPushButton("开始进化")
+        self.evo_start_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: #cc8800;
                 color: white;
@@ -1086,12 +1141,12 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
                 color: #888;
             }}
         """)
-        self.batch_wf_btn.setEnabled(False)
-        self.batch_wf_btn.clicked.connect(self.batch_wf_requested.emit)
-        batch_btn_layout.addWidget(self.batch_wf_btn)
+        self.evo_start_btn.setEnabled(False)
+        self.evo_start_btn.clicked.connect(self._on_evolution_start_clicked)
+        evo_btn_layout.addWidget(self.evo_start_btn)
 
-        self.batch_stop_btn = QtWidgets.QPushButton("停止")
-        self.batch_stop_btn.setStyleSheet("""
+        self.evo_stop_btn = QtWidgets.QPushButton("停止")
+        self.evo_stop_btn.setStyleSheet("""
             QPushButton {
                 background-color: #aa3333;
                 color: white;
@@ -1107,17 +1162,17 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
                 color: #888;
             }
         """)
-        self.batch_stop_btn.setEnabled(False)
-        self.batch_stop_btn.clicked.connect(self.batch_wf_stop_requested.emit)
-        batch_btn_layout.addWidget(self.batch_stop_btn)
+        self.evo_stop_btn.setEnabled(False)
+        self.evo_stop_btn.clicked.connect(self.wf_evolution_stop_requested.emit)
+        evo_btn_layout.addWidget(self.evo_stop_btn)
 
-        batch_layout.addLayout(batch_btn_layout)
+        evo_layout.addLayout(evo_btn_layout)
 
-        # 进度条
-        self.batch_progress_bar = QtWidgets.QProgressBar()
-        self.batch_progress_bar.setVisible(False)
-        self.batch_progress_bar.setTextVisible(True)
-        self.batch_progress_bar.setStyleSheet(f"""
+        # ── 进度条 ──
+        self.evo_progress_bar = QtWidgets.QProgressBar()
+        self.evo_progress_bar.setVisible(False)
+        self.evo_progress_bar.setTextVisible(True)
+        self.evo_progress_bar.setStyleSheet(f"""
             QProgressBar {{
                 border: 1px solid #444;
                 border-radius: 3px;
@@ -1129,11 +1184,11 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
                 background-color: #cc8800;
             }}
         """)
-        batch_layout.addWidget(self.batch_progress_bar)
+        evo_layout.addWidget(self.evo_progress_bar)
 
-        # 实时计数器 — 醒目大字
-        batch_counter_frame = QtWidgets.QFrame()
-        batch_counter_frame.setStyleSheet(f"""
+        # ── 进度详情面板 ──
+        evo_progress_frame = QtWidgets.QFrame()
+        evo_progress_frame.setStyleSheet(f"""
             QFrame {{
                 background-color: #2a2a1a;
                 border: 1px solid #5a5a2a;
@@ -1141,93 +1196,366 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
                 padding: 6px;
             }}
         """)
-        batch_counter_inner = QtWidgets.QVBoxLayout(batch_counter_frame)
-        batch_counter_inner.setContentsMargins(8, 4, 8, 4)
+        evo_progress_inner = QtWidgets.QVBoxLayout(evo_progress_frame)
+        evo_progress_inner.setContentsMargins(8, 4, 8, 4)
 
-        # 轮次 + ETA
-        batch_status_layout = QtWidgets.QHBoxLayout()
-        self.batch_round_label = QtWidgets.QLabel("待启动")
-        self.batch_round_label.setStyleSheet(f"color: #cc8800; font-size: 12px;")
-        self.batch_eta_label = QtWidgets.QLabel("")
-        self.batch_eta_label.setStyleSheet("color: #888; font-size: 11px;")
-        batch_status_layout.addWidget(self.batch_round_label)
-        batch_status_layout.addStretch()
-        batch_status_layout.addWidget(self.batch_eta_label)
-        batch_counter_inner.addLayout(batch_status_layout)
+        # Trial + ETA
+        evo_status_layout = QtWidgets.QHBoxLayout()
+        self.evo_trial_label = QtWidgets.QLabel("待启动")
+        self.evo_trial_label.setStyleSheet("color: #cc8800; font-size: 12px;")
+        self.evo_eta_label = QtWidgets.QLabel("")
+        self.evo_eta_label.setStyleSheet("color: #888; font-size: 11px;")
+        evo_status_layout.addWidget(self.evo_trial_label)
+        evo_status_layout.addStretch()
+        evo_status_layout.addWidget(self.evo_eta_label)
+        evo_progress_inner.addLayout(evo_status_layout)
 
-        # 累计匹配 + 涉及原型
-        batch_match_layout = QtWidgets.QHBoxLayout()
-        match_tag = QtWidgets.QLabel("累计匹配:")
-        match_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_match_count_label = QtWidgets.QLabel("0")
-        self.batch_match_count_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 13px;")
-        unique_tag = QtWidgets.QLabel("涉及原型:")
-        unique_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_unique_label = QtWidgets.QLabel("0")
-        self.batch_unique_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 13px;")
-        batch_match_layout.addWidget(match_tag)
-        batch_match_layout.addWidget(self.batch_match_count_label)
-        batch_match_layout.addSpacing(10)
-        batch_match_layout.addWidget(unique_tag)
-        batch_match_layout.addWidget(self.batch_unique_label)
-        batch_match_layout.addStretch()
-        batch_counter_inner.addLayout(batch_match_layout)
+        # 最优适应度 + 当前折
+        evo_fitness_layout = QtWidgets.QHBoxLayout()
+        best_tag = QtWidgets.QLabel("最优适应度:")
+        best_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_best_fitness_label = QtWidgets.QLabel("--")
+        self.evo_best_fitness_label.setStyleSheet("color: #cc8800; font-weight: bold; font-size: 14px;")
+        fold_tag = QtWidgets.QLabel("当前折:")
+        fold_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_fold_label = QtWidgets.QLabel("--")
+        self.evo_fold_label.setStyleSheet("color: #ccc; font-size: 12px;")
+        evo_fitness_layout.addWidget(best_tag)
+        evo_fitness_layout.addWidget(self.evo_best_fitness_label)
+        evo_fitness_layout.addSpacing(15)
+        evo_fitness_layout.addWidget(fold_tag)
+        evo_fitness_layout.addWidget(self.evo_fold_label)
+        evo_fitness_layout.addStretch()
+        evo_progress_inner.addLayout(evo_fitness_layout)
 
-        # 4个评级分类计数
-        batch_rating_layout = QtWidgets.QHBoxLayout()
-        
-        qualified_tag = QtWidgets.QLabel("合格:")
-        qualified_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_qualified_label = QtWidgets.QLabel("0")
-        self.batch_qualified_label.setStyleSheet("color: #089981; font-weight: bold; font-size: 14px;")
-        
-        pending_tag = QtWidgets.QLabel("待观察:")
-        pending_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_pending_label = QtWidgets.QLabel("0")
-        self.batch_pending_label.setStyleSheet("color: #ffaa00; font-weight: bold; font-size: 14px;")
-        
-        eliminated_tag = QtWidgets.QLabel("淘汰:")
-        eliminated_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_eliminated_label = QtWidgets.QLabel("0")
-        self.batch_eliminated_label.setStyleSheet("color: #f23645; font-weight: bold; font-size: 14px;")
+        evo_layout.addWidget(evo_progress_frame)
 
-        batch_rating_layout.addWidget(qualified_tag)
-        batch_rating_layout.addWidget(self.batch_qualified_label)
-        batch_rating_layout.addSpacing(10)
-        batch_rating_layout.addWidget(pending_tag)
-        batch_rating_layout.addWidget(self.batch_pending_label)
-        batch_rating_layout.addSpacing(10)
-        batch_rating_layout.addWidget(eliminated_tag)
-        batch_rating_layout.addWidget(self.batch_eliminated_label)
-        batch_rating_layout.addStretch()
-        batch_counter_inner.addLayout(batch_rating_layout)
+        # ── 特征组权重显示（做多） ──
+        weights_title = QtWidgets.QLabel("做多 · 特征组权重")
+        weights_title.setStyleSheet(f"""
+            color: {UI_CONFIG['THEME_TEXT']};
+            font-size: 12px;
+            font-weight: bold;
+            margin-top: 6px;
+        """)
+        evo_layout.addWidget(weights_title)
 
-        # 本轮信息（Sharpe）
-        batch_round_info = QtWidgets.QHBoxLayout()
-        round_trades_tag = QtWidgets.QLabel("本轮交易:")
-        round_trades_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_round_trades_label = QtWidgets.QLabel("0")
-        self.batch_round_trades_label.setStyleSheet("color: #ccc; font-size: 12px;")
-        round_sharpe_tag = QtWidgets.QLabel("Sharpe:")
-        round_sharpe_tag.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.batch_round_sharpe_label = QtWidgets.QLabel("0.000")
-        self.batch_round_sharpe_label.setStyleSheet("color: #ccc; font-size: 12px;")
-        batch_round_info.addWidget(round_trades_tag)
-        batch_round_info.addWidget(self.batch_round_trades_label)
-        batch_round_info.addSpacing(15)
-        batch_round_info.addWidget(round_sharpe_tag)
-        batch_round_info.addWidget(self.batch_round_sharpe_label)
-        batch_round_info.addStretch()
-        batch_counter_inner.addLayout(batch_round_info)
+        if HAS_MATPLOTLIB:
+            self.evo_weights_figure = Figure(
+                figsize=(5, 2.5), dpi=100,
+                facecolor=UI_CONFIG['THEME_BACKGROUND']
+            )
+            self.evo_weights_canvas = FigureCanvas(self.evo_weights_figure)
+            self.evo_weights_canvas.setMinimumHeight(160)
+            self.evo_weights_canvas.setMaximumHeight(220)
+            evo_layout.addWidget(self.evo_weights_canvas)
+            self._evo_has_weights_chart = True
+        else:
+            self.evo_weights_table = QtWidgets.QTableWidget()
+            self.evo_weights_table.setColumnCount(2)
+            self.evo_weights_table.setHorizontalHeaderLabels(["特征组", "权重"])
+            self.evo_weights_table.horizontalHeader().setStretchLastSection(True)
+            self.evo_weights_table.setRowCount(len(self.FEATURE_GROUPS))
+            self.evo_weights_table.setMinimumHeight(160)
+            self.evo_weights_table.setMaximumHeight(220)
+            self.evo_weights_table.setStyleSheet(f"""
+                QTableWidget {{
+                    background-color: {UI_CONFIG['THEME_SURFACE']};
+                    color: {UI_CONFIG['THEME_TEXT']};
+                    gridline-color: #444;
+                    font-size: 11px;
+                }}
+                QHeaderView::section {{
+                    background-color: #333;
+                    color: {UI_CONFIG['THEME_TEXT']};
+                    padding: 3px;
+                    border: 1px solid #444;
+                }}
+            """)
+            for i, name in enumerate(self.FEATURE_GROUPS):
+                self.evo_weights_table.setItem(
+                    i, 0, QtWidgets.QTableWidgetItem(name))
+                self.evo_weights_table.setItem(
+                    i, 1, QtWidgets.QTableWidgetItem("1.00"))
+            evo_layout.addWidget(self.evo_weights_table)
+            self._evo_has_weights_chart = False
 
-        batch_layout.addWidget(batch_counter_frame)
+        # 做空权重（多空分开时显示）
+        self.evo_weights_short_title = QtWidgets.QLabel("做空 · 特征组权重")
+        self.evo_weights_short_title.setStyleSheet(f"color: {UI_CONFIG['THEME_TEXT']}; font-size: 12px; font-weight: bold; margin-top: 6px;")
+        self.evo_weights_short_title.setVisible(False)
+        evo_layout.addWidget(self.evo_weights_short_title)
+        if HAS_MATPLOTLIB:
+            self.evo_weights_short_figure = Figure(figsize=(5, 2.5), dpi=100, facecolor=UI_CONFIG['THEME_BACKGROUND'])
+            self.evo_weights_short_canvas = FigureCanvas(self.evo_weights_short_figure)
+            self.evo_weights_short_canvas.setMinimumHeight(160)
+            self.evo_weights_short_canvas.setMaximumHeight(220)
+            self.evo_weights_short_canvas.setVisible(False)
+            evo_layout.addWidget(self.evo_weights_short_canvas)
+            self._evo_has_short_weights_chart = True
+        else:
+            self.evo_weights_short_canvas = None
+            self._evo_has_short_weights_chart = False
 
-        batch_note = QtWidgets.QLabel("直接用全局模板库在多段随机数据上验证，无需重新标注")
-        batch_note.setStyleSheet("color: #666; font-size: 10px;")
-        batch_note.setWordWrap(True)
-        batch_layout.addWidget(batch_note)
+        # 阈值显示行
+        threshold_layout = QtWidgets.QHBoxLayout()
+        threshold_tag = QtWidgets.QLabel("融合阈值:")
+        threshold_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_threshold_label = QtWidgets.QLabel("--")
+        self.evo_threshold_label.setStyleSheet(
+            "color: #cc8800; font-weight: bold; font-size: 12px;")
+        cosine_tag = QtWidgets.QLabel("余弦最低:")
+        cosine_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_cosine_min_label = QtWidgets.QLabel("--")
+        self.evo_cosine_min_label.setStyleSheet(
+            "color: #cc8800; font-weight: bold; font-size: 12px;")
+        threshold_layout.addWidget(threshold_tag)
+        threshold_layout.addWidget(self.evo_threshold_label)
+        threshold_layout.addSpacing(15)
+        threshold_layout.addWidget(cosine_tag)
+        threshold_layout.addWidget(self.evo_cosine_min_label)
+        threshold_layout.addStretch()
+        evo_layout.addLayout(threshold_layout)
 
-        layout.addWidget(batch_group)
+        # 做空阈值（多空分开时显示）
+        self.evo_threshold_short_layout = QtWidgets.QHBoxLayout()
+        self.evo_threshold_short_tag = QtWidgets.QLabel("做空 融合:")
+        self.evo_threshold_short_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_threshold_short_label = QtWidgets.QLabel("--")
+        self.evo_threshold_short_label.setStyleSheet("color: #cc8800; font-size: 12px;")
+        self.evo_cosine_short_tag = QtWidgets.QLabel("余弦:")
+        self.evo_cosine_short_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_cosine_short_label = QtWidgets.QLabel("--")
+        self.evo_cosine_short_label.setStyleSheet("color: #cc8800; font-size: 12px;")
+        self.evo_threshold_short_layout.addWidget(self.evo_threshold_short_tag)
+        self.evo_threshold_short_layout.addWidget(self.evo_threshold_short_label)
+        self.evo_threshold_short_layout.addSpacing(15)
+        self.evo_threshold_short_layout.addWidget(self.evo_cosine_short_tag)
+        self.evo_threshold_short_layout.addWidget(self.evo_cosine_short_label)
+        self.evo_threshold_short_layout.addStretch()
+        evo_layout.addLayout(self.evo_threshold_short_layout)
+        self.evo_threshold_short_tag.setVisible(False)
+        self.evo_threshold_short_label.setVisible(False)
+        self.evo_cosine_short_tag.setVisible(False)
+        self.evo_cosine_short_label.setVisible(False)
+
+        # ── 做多留出验证结果 ──
+        holdout_frame = QtWidgets.QFrame()
+        holdout_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: #1a2a1a;
+                border: 1px solid #2a5a2a;
+                border-radius: 5px;
+                padding: 8px;
+            }}
+        """)
+        holdout_inner = QtWidgets.QVBoxLayout(holdout_frame)
+        holdout_inner.setContentsMargins(8, 6, 8, 6)
+
+        # 标题行 + 通过/未通过 状态
+        holdout_header = QtWidgets.QHBoxLayout()
+        holdout_title = QtWidgets.QLabel("做多 · 留出验证结果")
+        holdout_title.setStyleSheet(f"""
+            color: {UI_CONFIG['THEME_TEXT']};
+            font-size: 12px;
+            font-weight: bold;
+        """)
+        self.evo_holdout_status_label = QtWidgets.QLabel("--")
+        self.evo_holdout_status_label.setStyleSheet(
+            "color: #888; font-size: 14px; font-weight: bold;")
+        self.evo_holdout_status_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight)
+        holdout_header.addWidget(holdout_title)
+        holdout_header.addStretch()
+        holdout_header.addWidget(self.evo_holdout_status_label)
+        holdout_inner.addLayout(holdout_header)
+
+        # 指标行1: 夏普 + 胜率
+        holdout_row1 = QtWidgets.QHBoxLayout()
+        sharpe_tag = QtWidgets.QLabel("夏普:")
+        sharpe_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_holdout_sharpe_label = QtWidgets.QLabel("--")
+        self.evo_holdout_sharpe_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-size: 14px;")
+        winrate_tag = QtWidgets.QLabel("胜率:")
+        winrate_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_holdout_winrate_label = QtWidgets.QLabel("--")
+        self.evo_holdout_winrate_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-size: 14px;")
+        holdout_row1.addWidget(sharpe_tag)
+        holdout_row1.addWidget(self.evo_holdout_sharpe_label)
+        holdout_row1.addSpacing(15)
+        holdout_row1.addWidget(winrate_tag)
+        holdout_row1.addWidget(self.evo_holdout_winrate_label)
+        holdout_row1.addStretch()
+        holdout_inner.addLayout(holdout_row1)
+
+        # 指标行2: 收益 + 回撤
+        holdout_row2 = QtWidgets.QHBoxLayout()
+        profit_tag = QtWidgets.QLabel("收益:")
+        profit_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_holdout_profit_label = QtWidgets.QLabel("--")
+        self.evo_holdout_profit_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-size: 14px;")
+        dd_tag = QtWidgets.QLabel("回撤:")
+        dd_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_holdout_drawdown_label = QtWidgets.QLabel("--")
+        self.evo_holdout_drawdown_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-size: 14px;")
+        holdout_row2.addWidget(profit_tag)
+        holdout_row2.addWidget(self.evo_holdout_profit_label)
+        holdout_row2.addSpacing(15)
+        holdout_row2.addWidget(dd_tag)
+        holdout_row2.addWidget(self.evo_holdout_drawdown_label)
+        holdout_row2.addStretch()
+        holdout_inner.addLayout(holdout_row2)
+
+        # 指标行3: 笔数 + 盈亏比
+        holdout_row3 = QtWidgets.QHBoxLayout()
+        trades_tag = QtWidgets.QLabel("笔数:")
+        trades_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_holdout_trades_label = QtWidgets.QLabel("--")
+        self.evo_holdout_trades_label.setStyleSheet("color: #ccc; font-size: 12px;")
+        pf_tag = QtWidgets.QLabel("盈亏比:")
+        pf_tag.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.evo_holdout_pf_label = QtWidgets.QLabel("--")
+        self.evo_holdout_pf_label.setStyleSheet("color: #ccc; font-size: 12px;")
+        holdout_row3.addWidget(trades_tag)
+        holdout_row3.addWidget(self.evo_holdout_trades_label)
+        holdout_row3.addSpacing(15)
+        holdout_row3.addWidget(pf_tag)
+        holdout_row3.addWidget(self.evo_holdout_pf_label)
+        holdout_row3.addStretch()
+        holdout_inner.addLayout(holdout_row3)
+
+        evo_layout.addWidget(holdout_frame)
+
+        # ── 做空留出验证结果（多空分开时显示） ──
+        holdout_short_frame = QtWidgets.QFrame()
+        holdout_short_frame.setStyleSheet(f"""
+            QFrame {{ background-color: #1a2a1a; border: 1px solid #2a5a2a; border-radius: 5px; padding: 8px; }}
+        """)
+        holdout_short_inner = QtWidgets.QVBoxLayout(holdout_short_frame)
+        holdout_short_inner.setContentsMargins(8, 6, 8, 6)
+        holdout_short_header = QtWidgets.QHBoxLayout()
+        holdout_short_title = QtWidgets.QLabel("做空 · 留出验证结果")
+        holdout_short_title.setStyleSheet(f"color: {UI_CONFIG['THEME_TEXT']}; font-size: 12px; font-weight: bold;")
+        self.evo_holdout_short_status_label = QtWidgets.QLabel("--")
+        self.evo_holdout_short_status_label.setStyleSheet("color: #888; font-size: 14px; font-weight: bold;")
+        self.evo_holdout_short_status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        holdout_short_header.addWidget(holdout_short_title)
+        holdout_short_header.addStretch()
+        holdout_short_header.addWidget(self.evo_holdout_short_status_label)
+        holdout_short_inner.addLayout(holdout_short_header)
+        # 做空 夏普+胜率
+        hr1 = QtWidgets.QHBoxLayout()
+        hr1.addWidget(QtWidgets.QLabel("夏普:"))
+        self.evo_holdout_short_sharpe_label = QtWidgets.QLabel("--")
+        self.evo_holdout_short_sharpe_label.setStyleSheet("color: #ccc; font-weight: bold; font-size: 14px;")
+        hr1.addWidget(self.evo_holdout_short_sharpe_label)
+        hr1.addSpacing(15)
+        hr1.addWidget(QtWidgets.QLabel("胜率:"))
+        self.evo_holdout_short_winrate_label = QtWidgets.QLabel("--")
+        self.evo_holdout_short_winrate_label.setStyleSheet("color: #ccc; font-weight: bold; font-size: 14px;")
+        hr1.addWidget(self.evo_holdout_short_winrate_label)
+        hr1.addStretch()
+        holdout_short_inner.addLayout(hr1)
+        # 做空 收益+回撤
+        hr2 = QtWidgets.QHBoxLayout()
+        hr2.addWidget(QtWidgets.QLabel("收益:"))
+        self.evo_holdout_short_profit_label = QtWidgets.QLabel("--")
+        self.evo_holdout_short_profit_label.setStyleSheet("color: #ccc; font-weight: bold; font-size: 14px;")
+        hr2.addWidget(self.evo_holdout_short_profit_label)
+        hr2.addSpacing(15)
+        hr2.addWidget(QtWidgets.QLabel("回撤:"))
+        self.evo_holdout_short_drawdown_label = QtWidgets.QLabel("--")
+        self.evo_holdout_short_drawdown_label.setStyleSheet("color: #ccc; font-weight: bold; font-size: 14px;")
+        hr2.addWidget(self.evo_holdout_short_drawdown_label)
+        hr2.addStretch()
+        holdout_short_inner.addLayout(hr2)
+        # 做空 笔数+盈亏比
+        hr3 = QtWidgets.QHBoxLayout()
+        hr3.addWidget(QtWidgets.QLabel("笔数:"))
+        self.evo_holdout_short_trades_label = QtWidgets.QLabel("--")
+        hr3.addWidget(self.evo_holdout_short_trades_label)
+        hr3.addSpacing(15)
+        hr3.addWidget(QtWidgets.QLabel("盈亏比:"))
+        self.evo_holdout_short_pf_label = QtWidgets.QLabel("--")
+        hr3.addWidget(self.evo_holdout_short_pf_label)
+        hr3.addStretch()
+        holdout_short_inner.addLayout(hr3)
+        evo_layout.addWidget(holdout_short_frame)
+        holdout_short_frame.setVisible(False)
+        self._evo_holdout_short_frame = holdout_short_frame
+
+        # ── 保存 / 应用按钮 ──
+        evo_action_layout = QtWidgets.QHBoxLayout()
+
+        self.evo_save_btn = QtWidgets.QPushButton("保存权重")
+        self.evo_save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {UI_CONFIG['THEME_ACCENT']};
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 3px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #0088dd;
+            }}
+            QPushButton:disabled {{
+                background-color: #555;
+                color: #888;
+            }}
+        """)
+        self.evo_save_btn.setEnabled(False)
+        self.evo_save_btn.setToolTip("保存进化后的权重到文件")
+        self.evo_save_btn.clicked.connect(self.wf_evolution_save_requested.emit)
+        evo_action_layout.addWidget(self.evo_save_btn)
+
+        self.evo_apply_btn = QtWidgets.QPushButton("应用到实盘")
+        self.evo_apply_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #089981;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 3px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #0aab91;
+            }}
+            QPushButton:disabled {{
+                background-color: #555;
+                color: #888;
+            }}
+        """)
+        self.evo_apply_btn.setEnabled(False)
+        self.evo_apply_btn.setToolTip("将进化权重应用到实盘/模拟盘交易引擎")
+        self.evo_apply_btn.clicked.connect(self.wf_evolution_apply_requested.emit)
+        evo_action_layout.addWidget(self.evo_apply_btn)
+
+        evo_layout.addLayout(evo_action_layout)
+
+        # 说明
+        evo_note = QtWidgets.QLabel(
+            "CMA-ES进化搜索8组特征权重+阈值，通过多折WF验证避免过拟合")
+        evo_note.setStyleSheet("color: #666; font-size: 10px;")
+        evo_note.setWordWrap(True)
+        evo_layout.addWidget(evo_note)
+
+        layout.addWidget(evo_group)
+
+        # ── 向后兼容别名（main_window.py 仍引用旧名称）──
+        self.batch_wf_btn = self.evo_start_btn
+        self.batch_stop_btn = self.evo_stop_btn
+        self.batch_progress_bar = self.evo_progress_bar
+        self.batch_rounds_spin = self.evo_trials_spin
+        self.batch_sample_spin = self.evo_sample_spin
+        self.batch_round_label = self.evo_trial_label
+        self.batch_eta_label = self.evo_eta_label
 
         # ── 最优交易参数 ──
         self.params_group = QtWidgets.QGroupBox("优化参数")
@@ -1558,9 +1886,14 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
             self.proto_short_count.setText("0")
             self.proto_source_label.setText("来源: 0 模板")
             self.proto_avg_winrate_label.setText("平均胜率: --")
+            self.proto_avg_confidence_label.setText("平均置信度: --")
+            self._update_proto_evo_labels(None)
             self.proto_table.setRowCount(0)
             self.proto_table.setVisible(False)
             return
+
+        # 更新进化权重显示（当前聚合指纹图是否绑定进化参数）
+        self._update_proto_evo_labels(library)
 
         # 更新统计数字
         n_long = len(library.long_prototypes)
@@ -1579,6 +1912,8 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         if all_protos:
             avg_win = sum(p.win_rate for p in all_protos) / len(all_protos)
             self.proto_avg_winrate_label.setText(f"平均胜率: {avg_win:.1%}")
+            avg_conf = sum(float(getattr(p, "confidence", 0.0) or 0.0) for p in all_protos) / len(all_protos)
+            self.proto_avg_confidence_label.setText(f"平均置信度: {avg_conf:.1%}")
             
             # 统计 WF 评级
             for p in all_protos:
@@ -1599,6 +1934,7 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
             
         else:
             self.proto_avg_winrate_label.setText("平均胜率: --")
+            self.proto_avg_confidence_label.setText("平均置信度: --")
             self.proto_qualified_label.setText("合格: 0")
             self.proto_pending_label.setText("待观察: 0")
             self.proto_eliminated_label.setText("淘汰: 0")
@@ -1665,6 +2001,39 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
 
         self.proto_table.setVisible(len(display_protos) > 0)
 
+    def _update_proto_evo_labels(self, library):
+        """根据原型库的 get_evolved_params 更新「权重进化」一行显示"""
+        if library is None:
+            self.proto_evo_status_label.setText("未进化")
+            self.proto_evo_status_label.setStyleSheet("color: #888; font-size: 11px;")
+            self.proto_evo_long_label.setText("")
+            self.proto_evo_short_label.setText("")
+            return
+        try:
+            (lw, lf, lc), (sw, sf, sc) = library.get_evolved_params()
+        except Exception:
+            self.proto_evo_status_label.setText("未进化")
+            self.proto_evo_long_label.setText("")
+            self.proto_evo_short_label.setText("")
+            return
+        if lw is None and sw is None:
+            self.proto_evo_status_label.setText("未进化")
+            self.proto_evo_status_label.setStyleSheet("color: #888; font-size: 11px;")
+            self.proto_evo_long_label.setText("")
+            self.proto_evo_short_label.setText("")
+            return
+        self.proto_evo_status_label.setText("已进化")
+        self.proto_evo_status_label.setStyleSheet("color: #089981; font-weight: bold; font-size: 11px;")
+        lf_f = float(lf) if lf is not None else 0
+        lc_f = float(lc) if lc is not None else 0
+        self.proto_evo_long_label.setText(f"做多 融合:{lf_f:.2f} 余弦:{lc_f:.2f}")
+        if sw is not None and (sf is not None or sc is not None):
+            sf_f = float(sf) if sf is not None else 0
+            sc_f = float(sc) if sc is not None else 0
+            self.proto_evo_short_label.setText(f"做空 融合:{sf_f:.2f} 余弦:{sc_f:.2f}")
+        else:
+            self.proto_evo_short_label.setText("做空 同做多")
+
     def enable_generate_prototypes(self, enabled: bool):
         """启用/禁用生成原型按钮"""
         self.generate_proto_btn.setEnabled(enabled)
@@ -1675,127 +2044,378 @@ class TrajectoryMatchWidget(QtWidgets.QWidget):
         self.proto_short_count.setText("0")
         self.proto_source_label.setText("来源: 0 模板")
         self.proto_avg_winrate_label.setText("平均胜率: --")
+        self.proto_avg_confidence_label.setText("平均置信度: --")
         self.proto_qualified_label.setText("合格: 0")
         self.proto_pending_label.setText("待观察: 0")
         self.proto_eliminated_label.setText("淘汰: 0")
+        self._update_proto_evo_labels(None)
         self.proto_table.setRowCount(0)
         self.proto_table.setVisible(False)
 
-    # ── 批量 Walk-Forward 方法 ──
+    # ── WF 权重进化方法 ──
+
+    def _on_evolution_start_clicked(self):
+        """开始进化按钮点击 — 收集参数并发射信号"""
+        config = {
+            "sample_size": self.evo_sample_spin.value(),
+            "n_trials": self.evo_trials_spin.value(),
+            "inner_folds": self.evo_folds_spin.value(),
+            "holdout_ratio": self.evo_holdout_spin.value() / 100.0,
+        }
+        self.wf_evolution_requested.emit(config)
+
+    def on_evolution_started(self):
+        """进化开始时调用（UI状态切换）"""
+        self.evo_start_btn.setEnabled(False)
+        self.evo_stop_btn.setEnabled(True)
+        self.evo_sample_spin.setEnabled(False)
+        self.evo_trials_spin.setEnabled(False)
+        self.evo_folds_spin.setEnabled(False)
+        self.evo_holdout_spin.setEnabled(False)
+        self.evo_progress_bar.setVisible(True)
+        self.evo_progress_bar.setValue(0)
+        self._evo_last_progress = 0
+        self._evo_has_result = False
+        self.evo_trial_label.setText("启动中...")
+        self.evo_eta_label.setText("")
+        self.evo_best_fitness_label.setText("--")
+        self.evo_fold_label.setText("--")
+        self.evo_threshold_label.setText("--")
+        self.evo_cosine_min_label.setText("--")
+        self.evo_save_btn.setEnabled(False)
+        self.evo_apply_btn.setEnabled(False)
+        self.reset_evolution_holdout()
+
+    def on_evolution_finished(self):
+        """进化完成时调用（UI状态恢复）"""
+        self.evo_start_btn.setEnabled(True)
+        self.evo_stop_btn.setEnabled(False)
+        self.evo_sample_spin.setEnabled(True)
+        self.evo_trials_spin.setEnabled(True)
+        self.evo_folds_spin.setEnabled(True)
+        self.evo_holdout_spin.setEnabled(True)
+        self._evo_last_progress = 0
+        self.evo_progress_bar.setVisible(False)
+        self.evo_trial_label.setText("完成")
+        # 保存/应用按钮在有结果时启用
+        if self._evo_has_result:
+            self.evo_save_btn.setEnabled(True)
+            self.evo_apply_btn.setEnabled(True)
+
+    def update_evolution_progress(self, trial_idx: int, n_trials: int,
+                                  fold_idx: int = 0, n_folds: int = 3,
+                                  best_fitness: float = 0.0,
+                                  eta_seconds: float = 0.0,
+                                  phase: str = ""):
+        """
+        更新进化进度
+
+        Args:
+            trial_idx: 当前试验索引 (0-based)
+            n_trials: 总试验数
+            fold_idx: 当前fold索引 (0-based)
+            n_folds: 总fold数
+            best_fitness: 当前最优fitness值
+            eta_seconds: 预估剩余秒数
+            phase: 当前阶段 ("precompute", "evolution", "holdout")
+        """
+        self.evo_progress_bar.setVisible(True)
+
+        # 计算总进度百分比
+        if phase == "precompute":
+            pct = 2  # 预计算阶段固定2%
+        elif phase == "holdout":
+            pct = 98  # Holdout验证阶段固定98%
+        else:
+            # 进化阶段: 5% ~ 95%
+            trial_frac = trial_idx / max(1, n_trials)
+            pct = int(5 + trial_frac * 90)
+
+        pct = int(max(self._evo_last_progress, min(100, pct)))
+        self._evo_last_progress = pct
+        self.evo_progress_bar.setValue(pct)
+
+        # 进度条文本
+        if phase == "precompute":
+            self.evo_progress_bar.setFormat("预计算数据...")
+            self.evo_trial_label.setText("预计算中（聚类 + 滚动均值）")
+        elif phase == "holdout":
+            self.evo_progress_bar.setFormat("留出验证中...")
+            self.evo_trial_label.setText("留出验证中（含DTW）")
+        else:
+            # ETA
+            if eta_seconds > 60:
+                eta_str = f"剩余 {int(eta_seconds // 60)}分{int(eta_seconds % 60)}秒"
+            elif eta_seconds > 0:
+                eta_str = f"剩余 {int(eta_seconds)}秒"
+            else:
+                eta_str = "计算中..."
+            self.evo_progress_bar.setFormat(
+                f"试验 {trial_idx}/{n_trials} | 第{fold_idx+1}/{n_folds}折 ({pct}%)")
+            self.evo_trial_label.setText(
+                f"试验 {trial_idx} / {n_trials}（第 {fold_idx+1}/{n_folds} 折）")
+            self.evo_eta_label.setText(eta_str)
+
+        # 最优 Fitness
+        if best_fitness != 0.0:
+            color = UI_CONFIG['CHART_UP_COLOR'] if best_fitness > 0 else UI_CONFIG['CHART_DOWN_COLOR']
+            self.evo_best_fitness_label.setText(f"{best_fitness:.4f}")
+            self.evo_best_fitness_label.setStyleSheet(
+                f"color: {color}; font-weight: bold; font-size: 14px;")
+
+        # 当前 Fold
+        self.evo_fold_label.setText(f"{fold_idx+1} / {n_folds}")
+
+    def _draw_weights_chart(self, fig, canvas, group_weights: list):
+        """在给定 figure 上绘制一组特征组权重条形图"""
+        groups = self.FEATURE_GROUPS
+        n = min(len(groups), len(group_weights))
+        fig.clear()
+        ax = fig.add_subplot(111, facecolor=UI_CONFIG['THEME_BACKGROUND'])
+        y_pos = np.arange(n)
+        weights = [group_weights[i] for i in range(n)]
+        names = [groups[i] for i in range(n)]
+        norm_w = np.array(weights)
+        max_w = max(norm_w.max(), 3.0)
+        colors = [plt.cm.YlOrRd(w / max_w * 0.8 + 0.1) for w in norm_w]
+        bars = ax.barh(y_pos, weights, color=colors, height=0.7)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names, fontsize=9, color=UI_CONFIG['THEME_TEXT'])
+        ax.invert_yaxis()
+        ax.set_xlim(0, max_w * 1.15)
+        ax.set_xlabel('权重', color=UI_CONFIG['THEME_TEXT'], fontsize=9)
+        ax.tick_params(colors=UI_CONFIG['THEME_TEXT'], labelsize=8)
+        for bar, w in zip(bars, weights):
+            ax.text(bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
+                    f'{w:.2f}', va='center', ha='left',
+                    color=UI_CONFIG['THEME_TEXT'], fontsize=8)
+        fig.tight_layout(pad=1.0)
+        canvas.draw()
+
+    def update_evolution_weights(self, group_weights: list,
+                                 fusion_threshold: float = 0.0,
+                                 cosine_min_threshold: float = 0.0,
+                                 short_weights: list = None,
+                                 short_fusion: float = 0.0,
+                                 short_cosine: float = 0.0):
+        """
+        更新特征组权重显示。多空分开时可传 short_weights/short_fusion/short_cosine。
+        """
+        groups = self.FEATURE_GROUPS
+        n = min(len(groups), len(group_weights))
+
+        if self._evo_has_weights_chart:
+            self._draw_weights_chart(self.evo_weights_figure, self.evo_weights_canvas, group_weights)
+        else:
+            for i in range(n):
+                self.evo_weights_table.setItem(
+                    i, 1, QtWidgets.QTableWidgetItem(f"{group_weights[i]:.3f}"))
+
+        if fusion_threshold > 0:
+            self.evo_threshold_label.setText(f"{fusion_threshold:.3f}")
+        if cosine_min_threshold > 0:
+            self.evo_cosine_min_label.setText(f"{cosine_min_threshold:.3f}")
+
+        # 做空权重与阈值（多空分开时）
+        has_short = short_weights is not None and len(short_weights) >= 8
+        if has_short and getattr(self, "_evo_has_short_weights_chart", False):
+            self.evo_weights_short_title.setVisible(True)
+            self.evo_weights_short_canvas.setVisible(True)
+            self._draw_weights_chart(self.evo_weights_short_figure, self.evo_weights_short_canvas, short_weights)
+            self.evo_threshold_short_tag.setVisible(True)
+            self.evo_threshold_short_label.setVisible(True)
+            self.evo_threshold_short_label.setText(f"{short_fusion:.3f}" if short_fusion > 0 else "--")
+            self.evo_cosine_short_tag.setVisible(True)
+            self.evo_cosine_short_label.setVisible(True)
+            self.evo_cosine_short_label.setText(f"{short_cosine:.3f}" if short_cosine > 0 else "--")
+        else:
+            self.evo_weights_short_title.setVisible(False)
+            if getattr(self, "evo_weights_short_canvas", None) is not None:
+                self.evo_weights_short_canvas.setVisible(False)
+            self.evo_threshold_short_tag.setVisible(False)
+            self.evo_threshold_short_label.setVisible(False)
+            self.evo_cosine_short_tag.setVisible(False)
+            self.evo_cosine_short_label.setVisible(False)
+
+    def _fill_holdout_labels(self, results: dict, status_label, sharpe_label, winrate_label,
+                              profit_label, drawdown_label, trades_label, pf_label):
+        """填充一组 Holdout 标签"""
+        passed = results.get("passed", False)
+        status_label.setText("通过" if passed else "未通过")
+        status_label.setStyleSheet(
+            f"color: {UI_CONFIG['CHART_UP_COLOR'] if passed else UI_CONFIG['CHART_DOWN_COLOR']}; font-size: 14px; font-weight: bold;")
+        sharpe = results.get("sharpe", 0.0)
+        sharpe_color = UI_CONFIG['CHART_UP_COLOR'] if sharpe > 0 else UI_CONFIG['CHART_DOWN_COLOR']
+        sharpe_label.setText(f"{sharpe:.3f}")
+        sharpe_label.setStyleSheet(f"color: {sharpe_color}; font-weight: bold; font-size: 14px;")
+        win_rate = results.get("win_rate", 0.0)
+        wr_color = UI_CONFIG['CHART_UP_COLOR'] if win_rate >= 0.5 else UI_CONFIG['CHART_DOWN_COLOR']
+        winrate_label.setText(f"{win_rate:.1%}")
+        winrate_label.setStyleSheet(f"color: {wr_color}; font-weight: bold; font-size: 14px;")
+        profit = results.get("profit", results.get("total_profit_pct", 0.0))
+        profit_color = UI_CONFIG['CHART_UP_COLOR'] if profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
+        profit_label.setText(f"{profit:.2f}%")
+        profit_label.setStyleSheet(f"color: {profit_color}; font-weight: bold; font-size: 14px;")
+        dd = results.get("drawdown", results.get("max_drawdown_pct", 0.0))
+        dd_color = UI_CONFIG['CHART_UP_COLOR'] if abs(dd) < 5 else UI_CONFIG['CHART_DOWN_COLOR']
+        drawdown_label.setText(f"{dd:.2f}%")
+        drawdown_label.setStyleSheet(f"color: {dd_color}; font-weight: bold; font-size: 14px;")
+        trade_count = results.get("n_trades", results.get("trade_count", 0))
+        trades_label.setText(str(trade_count))
+        pf = results.get("profit_factor", 0.0)
+        pf_color = UI_CONFIG['CHART_UP_COLOR'] if pf >= 1.0 else UI_CONFIG['CHART_DOWN_COLOR']
+        pf_label.setText(f"{pf:.2f}")
+        pf_label.setStyleSheet(f"color: {pf_color}; font-size: 12px;")
+
+    def update_evolution_holdout(self, results: dict):
+        """
+        更新 Holdout 验证结果。
+        results 可为:
+          - 单 dict: 仅做多或共用，填做多区块
+          - {"long": dict, "short": dict}: 多空分开，填做多+做空两区块
+        """
+        if not results:
+            return
+
+        self._evo_has_result = True
+
+        if "long" in results and "short" in results:
+            self._fill_holdout_labels(
+                results["long"],
+                self.evo_holdout_status_label,
+                self.evo_holdout_sharpe_label,
+                self.evo_holdout_winrate_label,
+                self.evo_holdout_profit_label,
+                self.evo_holdout_drawdown_label,
+                self.evo_holdout_trades_label,
+                self.evo_holdout_pf_label,
+            )
+            self._fill_holdout_labels(
+                results["short"],
+                self.evo_holdout_short_status_label,
+                self.evo_holdout_short_sharpe_label,
+                self.evo_holdout_short_winrate_label,
+                self.evo_holdout_short_profit_label,
+                self.evo_holdout_short_drawdown_label,
+                self.evo_holdout_short_trades_label,
+                self.evo_holdout_short_pf_label,
+            )
+            self._evo_holdout_short_frame.setVisible(True)
+        else:
+            self._fill_holdout_labels(
+                results,
+                self.evo_holdout_status_label,
+                self.evo_holdout_sharpe_label,
+                self.evo_holdout_winrate_label,
+                self.evo_holdout_profit_label,
+                self.evo_holdout_drawdown_label,
+                self.evo_holdout_trades_label,
+                self.evo_holdout_pf_label,
+            )
+            self._evo_holdout_short_frame.setVisible(False)
+
+        # 启用保存/应用按钮
+        self.evo_save_btn.setEnabled(True)
+        self.evo_apply_btn.setEnabled(True)
+
+    def reset_evolution_holdout(self):
+        """重置 Holdout 验证结果显示"""
+        self.evo_holdout_status_label.setText("--")
+        self.evo_holdout_status_label.setStyleSheet(
+            "color: #888; font-size: 14px; font-weight: bold;")
+        self.evo_holdout_sharpe_label.setText("--")
+        self.evo_holdout_sharpe_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-size: 14px;")
+        self.evo_holdout_winrate_label.setText("--")
+        self.evo_holdout_winrate_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-size: 14px;")
+        self.evo_holdout_profit_label.setText("--")
+        self.evo_holdout_profit_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-size: 14px;")
+        self.evo_holdout_drawdown_label.setText("--")
+        self.evo_holdout_drawdown_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-size: 14px;")
+        self.evo_holdout_trades_label.setText("--")
+        self.evo_holdout_pf_label.setText("--")
+        if getattr(self, "_evo_holdout_short_frame", None) is not None:
+            self._evo_holdout_short_frame.setVisible(False)
+            self.evo_holdout_short_status_label.setText("--")
+            self.evo_holdout_short_sharpe_label.setText("--")
+            self.evo_holdout_short_winrate_label.setText("--")
+            self.evo_holdout_short_profit_label.setText("--")
+            self.evo_holdout_short_drawdown_label.setText("--")
+            self.evo_holdout_short_trades_label.setText("--")
+            self.evo_holdout_short_pf_label.setText("--")
+
+    def reset_evolution_ui(self):
+        """完全重置进化UI到初始状态"""
+        self._evo_last_progress = 0
+        self._evo_has_result = False
+        self.evo_progress_bar.setVisible(False)
+        self.evo_progress_bar.setValue(0)
+        self.evo_trial_label.setText("待启动")
+        self.evo_eta_label.setText("")
+        self.evo_best_fitness_label.setText("--")
+        self.evo_fold_label.setText("--")
+        self.evo_threshold_label.setText("--")
+        self.evo_cosine_min_label.setText("--")
+        self.evo_save_btn.setEnabled(False)
+        self.evo_apply_btn.setEnabled(False)
+        self.reset_evolution_holdout()
+        # 重置权重图
+        if self._evo_has_weights_chart:
+            self.evo_weights_figure.clear()
+            self.evo_weights_canvas.draw()
+        if getattr(self, "_evo_has_short_weights_chart", False):
+            self.evo_weights_short_title.setVisible(False)
+            self.evo_weights_short_canvas.setVisible(False)
+            self.evo_weights_short_figure.clear()
+            self.evo_weights_short_canvas.draw()
+        if getattr(self, "evo_threshold_short_tag", None) is not None:
+            self.evo_threshold_short_tag.setVisible(False)
+            self.evo_threshold_short_label.setVisible(False)
+            self.evo_cosine_short_tag.setVisible(False)
+            self.evo_cosine_short_label.setVisible(False)
+        if not self._evo_has_weights_chart:
+            for i, name in enumerate(self.FEATURE_GROUPS):
+                self.evo_weights_table.setItem(
+                    i, 1, QtWidgets.QTableWidgetItem("1.00"))
+
+    def enable_evolution(self, enabled: bool):
+        """启用/禁用进化开始按钮"""
+        self.evo_start_btn.setEnabled(enabled)
+
+    # ── 向后兼容方法（main_window.py 仍调用旧名称）──
 
     def update_batch_wf_progress(self, round_idx: int, n_rounds: int,
                                   cumulative_stats: dict):
-        """更新批量WF进度（每轮完成后调用）"""
-        # 检查是否是"正在运行"状态（轮次开始时发送）
+        """向后兼容: 将旧的批量WF进度映射到进化进度"""
         is_running = cumulative_stats.get("running", False)
-        global_pct = cumulative_stats.get("global_progress_pct", None)
-        
-        # 进度条
-        self.batch_progress_bar.setVisible(True)
-        
-        if is_running:
-            # 轮次运行中：支持trial级细粒度进度
-            phase = cumulative_stats.get("phase", "")
-            trial_idx = int(cumulative_stats.get("trial_idx", 0))
-            trial_total = max(1, int(cumulative_stats.get("trial_total", 1)))
-            
-            if phase == "bayes_opt":
-                if global_pct is not None:
-                    pct = int(max(self._batch_last_progress, min(100, global_pct)))
-                else:
-                    frac = min(1.0, max(0.0, trial_idx / trial_total))
-                    pct = int(((round_idx + frac) / n_rounds) * 100)
-                self.batch_progress_bar.setFormat(
-                    f"第 {round_idx + 1}/{n_rounds} 轮优化中: trial {trial_idx}/{trial_total} ({pct}%)"
-                )
-                self.batch_round_label.setText(
-                    f"第 {round_idx + 1} 轮运行中（贝叶斯优化 {trial_idx}/{trial_total}）"
-                )
-            else:
-                if global_pct is not None:
-                    pct = int(max(self._batch_last_progress, min(100, global_pct)))
-                else:
-                    pct = int(round_idx / n_rounds * 100)  # 还没完成这一轮
-                self.batch_progress_bar.setFormat(f"第 {round_idx + 1}/{n_rounds} 轮运行中... ({pct}%)")
-                self.batch_round_label.setText(f"第 {round_idx + 1} 轮运行中...")
-            
-            self._batch_last_progress = max(self._batch_last_progress, pct)
-            self.batch_progress_bar.setValue(pct)
-            self.batch_eta_label.setText("计算中...")
-        else:
-            # 轮次完成
-            if global_pct is not None:
-                pct = int(max(self._batch_last_progress, min(100, global_pct)))
-            else:
-                pct = int((round_idx + 1) / n_rounds * 100)
-            self._batch_last_progress = max(self._batch_last_progress, pct)
-            self.batch_progress_bar.setValue(pct)
-
-            # ETA
-            eta = cumulative_stats.get("eta_seconds", 0)
-            if eta > 60:
-                eta_str = f"剩余 {int(eta // 60)}分{int(eta % 60)}秒"
-            else:
-                eta_str = f"剩余 {int(eta)}秒"
-            self.batch_progress_bar.setFormat(f"Round {round_idx + 1}/{n_rounds} ({pct}%) | {eta_str}")
-
-            # 轮次
-            self.batch_round_label.setText(f"Round {round_idx + 1} / {n_rounds}")
-            self.batch_eta_label.setText(eta_str)
-
-        # 累计匹配
-        self.batch_match_count_label.setText(str(cumulative_stats.get("total_match_events", 0)))
-        self.batch_unique_label.setText(str(cumulative_stats.get("unique_matched", 0)))
-
-        # 4个评级分类计数
-        self.batch_qualified_label.setText(str(cumulative_stats.get("qualified", 0)))
-        self.batch_pending_label.setText(str(cumulative_stats.get("pending", 0)))
-        self.batch_eliminated_label.setText(str(cumulative_stats.get("eliminated", 0)))
-
-        # 本轮信息
-        round_trades = cumulative_stats.get("round_trades", 0)
+        trial_idx = int(cumulative_stats.get("trial_idx", 0))
+        trial_total = max(1, int(cumulative_stats.get("trial_total", 1)))
         round_sharpe = cumulative_stats.get("round_sharpe", 0.0)
-        self.batch_round_trades_label.setText(str(round_trades))
+        eta = cumulative_stats.get("eta_seconds", 0)
 
-        if round_sharpe >= 0:
-            self.batch_round_sharpe_label.setText(f"{round_sharpe:.3f}")
-            self.batch_round_sharpe_label.setStyleSheet(
-                f"color: {UI_CONFIG['CHART_UP_COLOR']}; font-size: 12px;")
-        else:
-            self.batch_round_sharpe_label.setText(f"{round_sharpe:.3f}")
-            self.batch_round_sharpe_label.setStyleSheet(
-                f"color: {UI_CONFIG['CHART_DOWN_COLOR']}; font-size: 12px;")
-
+        self.update_evolution_progress(
+            trial_idx=trial_idx if is_running else round_idx + 1,
+            n_trials=trial_total if is_running else n_rounds,
+            fold_idx=0, n_folds=1,
+            best_fitness=round_sharpe,
+            eta_seconds=eta,
+            phase="evolution" if is_running else "",
+        )
 
     def on_batch_wf_started(self):
-        """批量WF开始时调用"""
-        self.batch_wf_btn.setEnabled(False)
-        self.batch_stop_btn.setEnabled(True)
-        self.batch_rounds_spin.setEnabled(False)
-        self.batch_sample_spin.setEnabled(False)
-        self.batch_progress_bar.setVisible(True)
-        self.batch_progress_bar.setValue(0)
-        self._batch_last_progress = 0
-        self.batch_round_label.setText("启动中...")
-        self.batch_eta_label.setText("")
-        self.batch_match_count_label.setText("0")
-        self.batch_unique_label.setText("0")
-        self.batch_round_trades_label.setText("--")
-        self.batch_round_sharpe_label.setText("--")
+        """向后兼容: 映射到 on_evolution_started"""
+        self.on_evolution_started()
 
     def on_batch_wf_finished(self):
-        """批量WF完成时调用"""
-        self.batch_wf_btn.setEnabled(True)
-        self.batch_stop_btn.setEnabled(False)
-        self.batch_rounds_spin.setEnabled(True)
-        self.batch_sample_spin.setEnabled(True)
-        self._batch_last_progress = 0
-        self.batch_progress_bar.setVisible(False)
-        self.batch_round_label.setText("完成")
+        """向后兼容: 映射到 on_evolution_finished"""
+        self.on_evolution_finished()
 
     def enable_batch_wf(self, enabled: bool):
-        """启用/禁用批量验证按钮"""
-        self.batch_wf_btn.setEnabled(enabled)
+        """向后兼容: 映射到 enable_evolution"""
+        self.enable_evolution(enabled)
 
 
 class AnalysisPanel(QtWidgets.QWidget):
@@ -1954,24 +2574,63 @@ class AnalysisPanel(QtWidgets.QWidget):
         """重置模板评估显示"""
         self.trajectory_widget.reset_template_evaluation()
 
-    # ── 批量 Walk-Forward 方法转发 ──
+    # ── WF 权重进化方法转发 ──
+
+    def on_evolution_started(self):
+        """进化开始"""
+        self.trajectory_widget.on_evolution_started()
+
+    def on_evolution_finished(self):
+        """进化完成"""
+        self.trajectory_widget.on_evolution_finished()
+
+    def update_evolution_progress(self, trial_idx: int, n_trials: int,
+                                  fold_idx: int = 0, n_folds: int = 3,
+                                  best_fitness: float = 0.0,
+                                  eta_seconds: float = 0.0,
+                                  phase: str = ""):
+        """更新进化进度"""
+        self.trajectory_widget.update_evolution_progress(
+            trial_idx, n_trials, fold_idx, n_folds,
+            best_fitness, eta_seconds, phase)
+
+    def update_evolution_weights(self, group_weights: list,
+                                 fusion_threshold: float = 0.0,
+                                 cosine_min_threshold: float = 0.0):
+        """更新特征组权重"""
+        self.trajectory_widget.update_evolution_weights(
+            group_weights, fusion_threshold, cosine_min_threshold)
+
+    def update_evolution_holdout(self, results: dict):
+        """更新Holdout验证结果"""
+        self.trajectory_widget.update_evolution_holdout(results)
+
+    def reset_evolution_ui(self):
+        """重置进化UI"""
+        self.trajectory_widget.reset_evolution_ui()
+
+    def enable_evolution(self, enabled: bool):
+        """启用/禁用进化按钮"""
+        self.trajectory_widget.enable_evolution(enabled)
+
+    # ── 向后兼容: 批量 Walk-Forward 方法转发 ──
 
     def update_batch_wf_progress(self, round_idx: int, n_rounds: int,
                                   cumulative_stats: dict):
-        """更新批量WF进度"""
+        """更新批量WF进度（向后兼容）"""
         self.trajectory_widget.update_batch_wf_progress(
             round_idx, n_rounds, cumulative_stats)
 
     def on_batch_wf_started(self):
-        """批量WF开始"""
+        """批量WF开始（向后兼容）"""
         self.trajectory_widget.on_batch_wf_started()
 
     def on_batch_wf_finished(self):
-        """批量WF完成"""
+        """批量WF完成（向后兼容）"""
         self.trajectory_widget.on_batch_wf_finished()
 
     def enable_batch_wf(self, enabled: bool):
-        """启用/禁用批量验证按钮"""
+        """启用/禁用批量验证按钮（向后兼容）"""
         self.trajectory_widget.enable_batch_wf(enabled)
 
 

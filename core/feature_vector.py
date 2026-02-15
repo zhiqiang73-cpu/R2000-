@@ -20,7 +20,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import FEATURE_CONFIG
+from config import FEATURE_CONFIG, FEATURE_WEIGHTS_CONFIG
 
 
 # ── 子特征定义 ─────────────────────────────────────────
@@ -70,6 +70,107 @@ LAYER_C_FEATURES = [
 N_A = len(LAYER_A_FEATURES)  # 16
 N_B = len(LAYER_B_FEATURES)  # 10
 N_C = len(LAYER_C_FEATURES)  # 6
+
+
+def apply_weights(vec: np.ndarray, 
+                  layer_a_weight: float = None,
+                  layer_b_weight: float = None,
+                  layer_c_weight: float = None) -> np.ndarray:
+    """
+    对32维特征向量应用层级权重
+    
+    用于指纹3D图匹配系统：根据特征重要性分配不同权重
+    - Layer A (即时信号): MACD、RSI等核心指标 - 16维 - 默认1.5x
+    - Layer B (动量变化): 变化率、加速度 - 10维 - 默认1.2x
+    - Layer C (结构位置): 相对位置 - 6维 - 默认1.0x
+    
+    Args:
+        vec: 32维特征向量 (可以是1D或2D)
+        layer_a_weight: Layer A 权重系数，None使用配置默认值
+        layer_b_weight: Layer B 权重系数，None使用配置默认值
+        layer_c_weight: Layer C 权重系数，None使用配置默认值
+    
+    Returns:
+        加权后的特征向量（同形状）
+    """
+    # 从配置获取默认权重
+    w_a = layer_a_weight if layer_a_weight is not None else FEATURE_WEIGHTS_CONFIG.get("LAYER_A_WEIGHT", 1.5)
+    w_b = layer_b_weight if layer_b_weight is not None else FEATURE_WEIGHTS_CONFIG.get("LAYER_B_WEIGHT", 1.2)
+    w_c = layer_c_weight if layer_c_weight is not None else FEATURE_WEIGHTS_CONFIG.get("LAYER_C_WEIGHT", 1.0)
+    
+    # 构建权重向量
+    weights = np.concatenate([
+        np.full(N_A, w_a),  # Layer A: 16维
+        np.full(N_B, w_b),  # Layer B: 10维
+        np.full(N_C, w_c),  # Layer C: 6维
+    ])  # 总计32维
+    
+    # 处理1D和2D情况
+    if vec.ndim == 1:
+        if vec.size != 32:
+            return vec  # 非标准维度，原样返回
+        return vec * weights
+    elif vec.ndim == 2:
+        if vec.shape[1] != 32:
+            return vec  # 非标准维度，原样返回
+        return vec * weights[np.newaxis, :]  # 广播到每一行
+    else:
+        return vec  # 更高维度，原样返回
+
+
+def extract_trends(window: np.ndarray) -> np.ndarray:
+    """
+    从时间窗口提取趋势特征
+    
+    用于指纹3D图匹配系统：捕获每个特征在时间维度上的变化趋势
+    
+    Args:
+        window: (time, 32) 形状的时间窗口矩阵
+    
+    Returns:
+        (32,) 趋势向量，每个元素表示对应特征的线性趋势斜率
+    """
+    if window.size == 0 or window.ndim != 2:
+        return np.zeros(32)
+    
+    n_time, n_features = window.shape
+    if n_features != 32 or n_time < 2:
+        return np.zeros(32)
+    
+    # 计算每个特征的线性趋势斜率
+    # 使用简单线性回归: slope = cov(x, y) / var(x)
+    x = np.arange(n_time)
+    x_mean = x.mean()
+    x_var = ((x - x_mean) ** 2).sum()
+    
+    if x_var < 1e-9:
+        return np.zeros(n_features)
+    
+    # 批量计算所有特征的斜率
+    y_mean = window.mean(axis=0)  # (32,)
+    cov = ((x[:, np.newaxis] - x_mean) * (window - y_mean)).sum(axis=0)  # (32,)
+    slopes = cov / x_var  # (32,)
+    
+    # 归一化斜率（除以特征的标准差，使不同量纲的特征可比）
+    y_std = window.std(axis=0)
+    y_std = np.where(y_std < 1e-9, 1.0, y_std)
+    normalized_slopes = slopes / y_std
+    
+    return normalized_slopes
+
+
+def get_feature_layer_indices() -> Dict[str, Tuple[int, int]]:
+    """
+    获取各特征层在32维向量中的索引范围
+    
+    Returns:
+        {"A": (0, 16), "B": (16, 26), "C": (26, 32)}
+    """
+    return {
+        "A": (0, N_A),                    # 0-16
+        "B": (N_A, N_A + N_B),            # 16-26
+        "C": (N_A + N_B, N_A + N_B + N_C) # 26-32
+    }
 
 
 @dataclass
@@ -228,6 +329,103 @@ class FeatureVectorEngine:
         if not self._precomputed:
             return np.zeros((0, N_A + N_B + N_C))
         return self._full_matrix
+
+    # ── 特征加权 ─────────────────────────────────────
+    @staticmethod
+    def apply_weights(
+        features: np.ndarray,
+        layer_weights: Optional[Tuple[float, float, float]] = None,
+        normalize: bool = False
+    ) -> np.ndarray:
+        """
+        对32维特征向量应用层级权重
+        
+        根据特征重要性分配权重：
+          - Layer A (即时信号, 16维): 权重 1.5x - MACD、RSI等核心指标
+          - Layer B (动量变化, 10维): 权重 1.2x - 变化率、加速度
+          - Layer C (结构位置, 6维):  权重 1.0x - 相对位置
+        
+        Args:
+            features: 输入特征，支持以下形状：
+                      - (32,) 单个特征向量
+                      - (n, 32) 多个特征向量（批量）
+                      - (t, 32) 时间序列特征矩阵
+            layer_weights: 可选的自定义层权重 (w_a, w_b, w_c)，
+                          若为 None 则使用配置文件中的默认值
+            normalize: 是否对权重归一化（使加权后的特征保持原始量级）
+        
+        Returns:
+            np.ndarray: 加权后的特征，形状与输入相同
+        
+        Example:
+            >>> engine = FeatureVectorEngine()
+            >>> raw = np.random.randn(60, 32)  # 60根K线的32维特征
+            >>> weighted = engine.apply_weights(raw)
+            >>> weighted.shape
+            (60, 32)
+        """
+        # 检查是否启用特征加权
+        if not FEATURE_WEIGHTS_CONFIG.get("ENABLED", True):
+            return features.copy() if isinstance(features, np.ndarray) else features
+        
+        # 获取层权重
+        if layer_weights is not None:
+            w_a, w_b, w_c = layer_weights
+        else:
+            w_a = FEATURE_WEIGHTS_CONFIG.get("LAYER_A_WEIGHT", 1.5)
+            w_b = FEATURE_WEIGHTS_CONFIG.get("LAYER_B_WEIGHT", 1.2)
+            w_c = FEATURE_WEIGHTS_CONFIG.get("LAYER_C_WEIGHT", 1.0)
+        
+        # 构建权重向量
+        weights = np.concatenate([
+            np.full(N_A, w_a),  # Layer A: 16维
+            np.full(N_B, w_b),  # Layer B: 10维
+            np.full(N_C, w_c),  # Layer C: 6维
+        ])
+        
+        # 可选：归一化权重（使加权后量级不变）
+        if normalize:
+            # 归一化因子：使加权后的平均系数为1
+            norm_factor = (N_A + N_B + N_C) / (N_A * w_a + N_B * w_b + N_C * w_c)
+            weights = weights * norm_factor
+        
+        # 应用权重
+        features = np.asarray(features)
+        if features.ndim == 1:
+            # 单个向量 (32,)
+            if len(features) != N_A + N_B + N_C:
+                raise ValueError(f"特征维度错误：期望 {N_A + N_B + N_C}，实际 {len(features)}")
+            return features * weights
+        elif features.ndim == 2:
+            # 批量/序列 (n, 32)
+            if features.shape[1] != N_A + N_B + N_C:
+                raise ValueError(f"特征维度错误：期望 {N_A + N_B + N_C}，实际 {features.shape[1]}")
+            return features * weights  # 广播乘法
+        else:
+            raise ValueError(f"不支持的特征形状：{features.shape}")
+    
+    @staticmethod
+    def get_layer_weights() -> Dict[str, float]:
+        """获取当前配置的层权重"""
+        return {
+            "layer_a": FEATURE_WEIGHTS_CONFIG.get("LAYER_A_WEIGHT", 1.5),
+            "layer_b": FEATURE_WEIGHTS_CONFIG.get("LAYER_B_WEIGHT", 1.2),
+            "layer_c": FEATURE_WEIGHTS_CONFIG.get("LAYER_C_WEIGHT", 1.0),
+        }
+    
+    def get_weighted_matrix(self, start_idx: int, end_idx: int) -> np.ndarray:
+        """
+        获取加权后的特征矩阵
+        
+        Args:
+            start_idx: 起始索引（包含）
+            end_idx: 结束索引（不包含）
+        
+        Returns:
+            np.ndarray: 加权后的特征矩阵 shape (end_idx - start_idx, 32)
+        """
+        raw = self.get_raw_matrix(start_idx, end_idx)
+        return self.apply_weights(raw)
 
     # ── Layer A: 即时信号 ──────────────────────────────
     def _compute_layer_a(self, df: pd.DataFrame) -> np.ndarray:

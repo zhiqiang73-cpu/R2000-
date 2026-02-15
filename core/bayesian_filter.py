@@ -217,6 +217,9 @@ class BayesianTradeFilter:
         
         # 衰减时间戳
         self.last_decay_time = time.time()
+        # 持久化时间（用于 UI 记忆时间范围）
+        self._created_at: float = 0.0
+        self._last_save_time: float = 0.0
         
         # 统计
         self.total_signals_received = 0
@@ -557,9 +560,9 @@ class BayesianTradeFilter:
         # 凯利公式
         kelly_full = p - (1 - p) / b
         
-        # 如果凯利值 <= 0，说明期望收益为负，不应该交易
+        # 凯利值 <= 0 时，使用最小仓位继续学习（不拒绝交易）
         if kelly_full <= 0:
-            return 0.0, f"凯利值={kelly_full:.2f}≤0，期望收益为负，拒绝"
+            return min_position_pct, f"凯利={kelly_full:.2%}≤0，使用最小仓位{min_position_pct:.0%}继续学习"
         
         # 分数凯利（降低波动）
         kelly_scaled = kelly_full * kelly_fraction
@@ -568,8 +571,7 @@ class BayesianTradeFilter:
         position_pct = np.clip(kelly_scaled, min_position_pct, max_position_pct)
         
         reason = (
-            f"凯利={kelly_full:.2%}(p={p:.1%}, b={b:.2f}) | "
-            f"{kelly_fraction:.0%}凯利={kelly_scaled:.2%} | "
+            f"凯利={kelly_full:.2%}(胜率={p:.1%}, 盈亏比={b:.2f}) | "
             f"最终仓位={position_pct:.1%}"
         )
         
@@ -606,6 +608,10 @@ class BayesianTradeFilter:
         """持久化到 JSON"""
         try:
             os.makedirs(os.path.dirname(self.persistence_path), exist_ok=True)
+            now = time.time()
+            if self._created_at <= 0:
+                self._created_at = now
+            self._last_save_time = now
             data = {
                 "config": {
                     "prior_strength": self.prior_strength,
@@ -617,6 +623,8 @@ class BayesianTradeFilter:
                 },
                 "state": {
                     "data_version": self.DATA_VERSION,
+                    "created_at": self._created_at,
+                    "last_save_time": self._last_save_time,
                     "last_decay_time": self.last_decay_time,
                     "total_signals_received": self.total_signals_received,
                     "total_signals_accepted": self.total_signals_accepted,
@@ -647,6 +655,10 @@ class BayesianTradeFilter:
             # 加载状态
             state = data.get("state", {})
             loaded_version = state.get("data_version", 1)  # 无版本字段 = v1（旧数据）
+            self._created_at = state.get("created_at", 0.0)
+            self._last_save_time = state.get("last_save_time", 0.0)
+            if self._created_at <= 0 and self._last_save_time > 0:
+                self._created_at = self._last_save_time
             self.last_decay_time = state.get("last_decay_time", time.time())
             self.total_signals_received = state.get("total_signals_received", 0)
             self.total_signals_accepted = state.get("total_signals_accepted", 0)

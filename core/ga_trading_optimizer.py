@@ -2,11 +2,16 @@
 R3000 GA交易参数优化器
 直接优化交易参数（而非权重），适应度 = 验证集模拟交易的Sharpe Ratio
 
-GA搜索空间：
-  - cosine_threshold: 余弦粗筛阈值 [0.3, 0.9]
-  - dtw_threshold: DTW入场阈值 [0.1, 0.8]
+【指纹3D图匹配系统适配】
+- 新增 fusion_threshold 参数：多维融合分数阈值（余弦30% + 欧氏40% + DTW30%）
+- 原型匹配使用 fusion_threshold
+- 模板匹配使用 cosine_threshold + dtw_threshold 两阶段
+
+GA/贝叶斯搜索空间：
+  - fusion_threshold: 多维融合分数阈值 [0.50, 0.90]（原型匹配用）
+  - cosine_threshold: 余弦粗筛阈值 [0.3, 0.9]（模板匹配用）
+  - dtw_threshold: DTW入场阈值 [0.1, 0.8]（模板匹配用）
   - hold_divergence_limit: 持仓偏离上限 [0.3, 0.9]
-  - exit_match_threshold: 离场匹配阈值 [0.2, 0.8]
   - stop_loss_atr: 止损ATR倍数 [1.0, 5.0]
   - take_profit_atr: 止盈ATR倍数 [1.5, 8.0]
   - max_hold_bars: 最大持仓K线数 [60, 480]
@@ -25,10 +30,19 @@ from config import GA_CONFIG, TRAJECTORY_CONFIG
 
 @dataclass
 class TradingParams:
-    """交易参数（贝叶斯优化搜索空间）"""
+    """交易参数（贝叶斯优化搜索空间）
+    
+    【指纹3D图匹配系统适配】
+    - fusion_threshold: 多维融合分数阈值（余弦30% + 欧氏40% + DTW30%）
+    - cosine_threshold: 余弦粗筛阈值（模板匹配路径使用）
+    - dtw_threshold: DTW距离阈值（模板匹配路径使用）
+    
+    原型匹配时使用 fusion_threshold，模板匹配时使用 cosine + dtw 两阶段。
+    """
     # ── 入场参数（优化） ──
-    cosine_threshold: float = 0.6       # 余弦粗筛阈值 [0.3, 0.9]
-    dtw_threshold: float = 0.5          # DTW入场阈值 [0.1, 0.8]
+    fusion_threshold: float = 0.65      # 多维融合分数阈值 [0.50, 0.90]（原型匹配用）
+    cosine_threshold: float = 0.6       # 余弦粗筛阈值 [0.3, 0.9]（模板匹配用）
+    dtw_threshold: float = 0.5          # DTW入场阈值 [0.1, 0.8]（模板匹配用）
     min_templates_agree: int = 1        # 最少几个模板一致 [1, 5]
 
     # ── 离场参数（优化） ──
@@ -44,10 +58,16 @@ class TradingParams:
     hold_check_interval: int = 3        # 动态追踪检查间隔K线数
     use_dynamic_tracking: bool = False  # 是否启用动态追踪（Walk-Forward=False, 模拟盘=True）
 
+    # ── 特征权重（由 WF Evolution 注入，不参与 GA/贝叶斯搜索） ──
+    # 32 维特征权重向量，用于覆盖默认 Layer A/B/C 权重。
+    # None 表示使用默认权重，非 None 时注入到 PrototypeMatcher 的相似度计算中。
+    feature_weights: Optional[np.ndarray] = None
+
     # 参数范围（仅包含需要优化的参数）
     RANGES = {
-        "cosine_threshold": (0.3, 0.9),
-        "dtw_threshold": (0.1, 0.8),
+        "fusion_threshold": (0.50, 0.90),    # 多维融合阈值（原型匹配）
+        "cosine_threshold": (0.3, 0.9),      # 余弦阈值（模板匹配）
+        "dtw_threshold": (0.1, 0.8),         # DTW阈值（模板匹配）
         "min_templates_agree": (1, 5),
         "stop_loss_atr": (1.0, 5.0),
         "take_profit_atr": (1.5, 8.0),
@@ -58,6 +78,7 @@ class TradingParams:
     def to_array(self) -> np.ndarray:
         """转为数组（用于GA兼容）"""
         return np.array([
+            self.fusion_threshold,
             self.cosine_threshold,
             self.dtw_threshold,
             float(self.min_templates_agree),
@@ -71,19 +92,21 @@ class TradingParams:
     def from_array(cls, arr: np.ndarray) -> 'TradingParams':
         """从数组还原"""
         return cls(
-            cosine_threshold=float(arr[0]),
-            dtw_threshold=float(arr[1]),
-            min_templates_agree=max(1, int(round(arr[2]))),
-            stop_loss_atr=float(arr[3]),
-            take_profit_atr=float(arr[4]),
-            max_hold_bars=int(round(arr[5])),
-            hold_divergence_limit=float(arr[6]),
+            fusion_threshold=float(arr[0]),
+            cosine_threshold=float(arr[1]),
+            dtw_threshold=float(arr[2]),
+            min_templates_agree=max(1, int(round(arr[3]))),
+            stop_loss_atr=float(arr[4]),
+            take_profit_atr=float(arr[5]),
+            max_hold_bars=int(round(arr[6])),
+            hold_divergence_limit=float(arr[7]),
         )
 
     @classmethod
     def random(cls) -> 'TradingParams':
         """随机生成参数"""
         return cls(
+            fusion_threshold=np.random.uniform(*cls.RANGES["fusion_threshold"]),
             cosine_threshold=np.random.uniform(*cls.RANGES["cosine_threshold"]),
             dtw_threshold=np.random.uniform(*cls.RANGES["dtw_threshold"]),
             min_templates_agree=int(np.random.uniform(*cls.RANGES["min_templates_agree"])),
@@ -96,6 +119,7 @@ class TradingParams:
     def clip(self) -> 'TradingParams':
         """裁剪到有效范围"""
         return TradingParams(
+            fusion_threshold=np.clip(self.fusion_threshold, *self.RANGES["fusion_threshold"]),
             cosine_threshold=np.clip(self.cosine_threshold, *self.RANGES["cosine_threshold"]),
             dtw_threshold=np.clip(self.dtw_threshold, *self.RANGES["dtw_threshold"]),
             min_templates_agree=int(np.clip(self.min_templates_agree, *self.RANGES["min_templates_agree"])),
@@ -119,13 +143,27 @@ class GAIndividual:
 
 @dataclass
 class SimulatedTradeRecord:
-    """单笔模拟交易记录"""
+    """单笔模拟交易记录（适配指纹3D图匹配系统）
+    
+    新增字段支持多维相似度分解：
+    - similarity: 最终分数（含置信度）
+    - combined_score: 融合分数（不含置信度）
+    - cosine_similarity, euclidean_similarity, dtw_similarity: 三维分解
+    - confidence: 原型置信度
+    """
     entry_idx: int
     exit_idx: int
     side: int  # 1=LONG, -1=SHORT
     profit_pct: float
-    matched_template: object = None  # TrajectoryTemplate
+    matched_template: object = None  # TrajectoryTemplate 或 Prototype
     template_fingerprint: str = ""
+    # 【指纹3D图匹配系统 - 多维相似度分解】
+    similarity: float = 0.0           # 最终分数（含置信度）
+    combined_score: float = 0.0       # 融合分数（不含置信度）
+    cosine_similarity: float = 0.0    # 余弦相似度分量
+    euclidean_similarity: float = 0.0 # 欧氏相似度分量
+    dtw_similarity: float = 0.0       # DTW相似度分量
+    confidence: float = 0.0           # 原型置信度
 
 
 @dataclass
@@ -804,8 +842,15 @@ class BayesianTradingOptimizer:
             self._build_entry_match_cache(callback=sub_callback)
         
         def objective(trial: optuna.Trial) -> float:
-            """Optuna 目标函数 — 搜索 7 个交易参数（回测优化）"""
+            """Optuna 目标函数 — 搜索 8 个交易参数（回测优化）
+            
+            【指纹3D图匹配系统适配】
+            - 新增 fusion_threshold: 多维融合分数阈值（原型匹配使用）
+            - 保留 cosine_threshold 和 dtw_threshold（模板匹配使用）
+            """
             # 入场参数
+            fusion_threshold = trial.suggest_float(
+                "fusion_threshold", *TradingParams.RANGES["fusion_threshold"])
             cosine_threshold = trial.suggest_float(
                 "cosine_threshold", *TradingParams.RANGES["cosine_threshold"])
             dtw_threshold = trial.suggest_float(
@@ -824,6 +869,7 @@ class BayesianTradingOptimizer:
                 "hold_divergence_limit", *TradingParams.RANGES["hold_divergence_limit"])
 
             params = TradingParams(
+                fusion_threshold=fusion_threshold,
                 cosine_threshold=cosine_threshold,
                 dtw_threshold=dtw_threshold,
                 min_templates_agree=min_templates_agree,
@@ -871,6 +917,7 @@ class BayesianTradingOptimizer:
         # 添加默认参数作为初始点
         default_params = TradingParams()
         study.enqueue_trial({
+            "fusion_threshold": default_params.fusion_threshold,
             "cosine_threshold": default_params.cosine_threshold,
             "dtw_threshold": default_params.dtw_threshold,
             "min_templates_agree": default_params.min_templates_agree,
@@ -886,6 +933,7 @@ class BayesianTradingOptimizer:
         # 返回最佳结果
         best_trial = study.best_trial
         best_params = TradingParams(
+            fusion_threshold=best_trial.params["fusion_threshold"],
             cosine_threshold=best_trial.params["cosine_threshold"],
             dtw_threshold=best_trial.params["dtw_threshold"],
             min_templates_agree=best_trial.params["min_templates_agree"],
@@ -896,7 +944,8 @@ class BayesianTradingOptimizer:
             use_dynamic_tracking=False,  # 回测不用动态追踪
         )
         
-        print(f"[Bayesian] 优化完成: trials={self.n_trials}, best_sharpe={study.best_value:.4f}")
+        print(f"[Bayesian] 优化完成: trials={self.n_trials}, best_sharpe={study.best_value:.4f}, "
+              f"fusion_th={best_params.fusion_threshold:.3f}")
         
         return best_params, study.best_value
     
@@ -910,14 +959,19 @@ class BayesianTradingOptimizer:
     def _simulate_trading(self, params: TradingParams,
                           record_templates: bool = False,
                           fast_mode: bool = True,
-                          sub_callback: Optional[Callable] = None) -> SimulatedTradeResult:
+                          sub_callback: Optional[Callable] = None,
+                          direction_filter: Optional[str] = None) -> SimulatedTradeResult:
         """
         在验证集上模拟交易
-        ... (省略 docstring，保持一致)
+
+        Args:
+            direction_filter: 仅评估该方向 ("LONG" | "SHORT" | None=双向)
         """
         # ── 原型模式：使用 PrototypeMatcher ──
         if self.use_prototypes:
-            return self._simulate_trading_prototypes(params, record_templates, fast_mode, sub_callback)
+            return self._simulate_trading_prototypes(
+                params, record_templates, fast_mode, sub_callback, direction_filter
+            )
         
         from core.trajectory_matcher import TrajectoryMatcher
 
@@ -1254,33 +1308,35 @@ class BayesianTradingOptimizer:
     def _simulate_trading_prototypes(self, params: TradingParams,
                                       record_templates: bool = False,
                                       fast_mode: bool = True,
-                                      sub_callback: Optional[Callable] = None) -> SimulatedTradeResult:
+                                      sub_callback: Optional[Callable] = None,
+                                      direction_filter: Optional[str] = None) -> SimulatedTradeResult:
         """
         使用原型进行模拟交易（速度快 200 倍）
-        
-        匹配逻辑：
-          - 使用 PrototypeMatcher 对当前 K 线窗口进行原型匹配
-          - 余弦相似度 + 投票机制决定入场
-          - 简化的持仓健康度检查
-        
+
         Args:
-            params: 交易参数
-            record_templates: 是否记录原型信息
-            fast_mode: 快速模式（入场跳跃采样）
-        
-        Returns:
-            SimulatedTradeResult
+            direction_filter: 仅评估该方向 ("LONG" | "SHORT" | None=双向)
         """
         from core.template_clusterer import PrototypeMatcher
         
-        # 初始化原型匹配器
+        # 初始化原型匹配器（指纹3D图匹配系统）
         # 【修正】原型模式下，原型是聚类中心(Centroids)，彼此相距较远。
         # 强制 min_prototypes_agree 为 1，否则由于很难同时匹配多个中心而导致 0 交易。
         proto_matcher = PrototypeMatcher(
             library=self.prototype_library,
-            cosine_threshold=params.cosine_threshold,
-            min_prototypes_agree=1, 
+            cosine_threshold=params.cosine_threshold,  # 兼容旧参数（非多维模式使用）
+            min_prototypes_agree=1,
+            enable_multi_similarity=True,  # 启用多维相似度匹配
+            # WF/贝叶斯优化快速模式：关闭 DTW，避免每根K线全量DTW导致严重卡顿
+            include_dtw_in_match=not fast_mode,
         )
+        # 【关键】覆盖 fusion_threshold 为贝叶斯搜索的值（而非 config 默认值）
+        proto_matcher.fusion_threshold = params.fusion_threshold
+        
+        # 【WF Evolution】注入进化后的特征权重（如果有）
+        # feature_weights 由 WF Evolution 引擎设置到 TradingParams 中，
+        # 覆盖 MultiSimilarityCalculator 的默认 Layer A/B/C 权重。
+        if params.feature_weights is not None:
+            proto_matcher.set_feature_weights(params.feature_weights)
         
         # 【方案2】WF中加入 regime 过滤（缓存版）
         # 在同一轮优化内只构建一次，后续 trial 复用，避免长时间无进度反馈。
@@ -1294,7 +1350,8 @@ class BayesianTradingOptimizer:
         trades = []
         position = None
 
-        print(f"[GA_Sim] 开始原型回测: 数据长度={n}, 原型数量={len(self.prototype_library.get_all_prototypes())}, 阈值={params.cosine_threshold}")
+        print(f"[GA_Sim] 开始原型回测: 数据长度={n}, 原型数量={len(self.prototype_library.get_all_prototypes())}, "
+              f"fusion_th={params.fusion_threshold:.3f}, cos_th={params.cosine_threshold:.3f}")
         
         def calc_profit(entry_price, current_price, side):
             if side == 1:
@@ -1309,6 +1366,7 @@ class BayesianTradingOptimizer:
                 proto = position.get("prototype")
                 # 原型没有 fingerprint，用 prototype_id 代替
                 fp = f"proto_{proto.direction}_{proto.prototype_id}" if proto else ""
+                # 【指纹3D图匹配系统】记录多维相似度分解
                 trades.append(SimulatedTradeRecord(
                     entry_idx=position["entry_idx"],
                     exit_idx=exit_idx,
@@ -1316,6 +1374,13 @@ class BayesianTradingOptimizer:
                     profit_pct=profit_pct,
                     matched_template=proto,
                     template_fingerprint=fp,
+                    # 多维相似度分解（从入场时的匹配结果中获取）
+                    similarity=position.get("similarity", 0.0),
+                    combined_score=position.get("combined_score", 0.0),
+                    cosine_similarity=position.get("cosine_similarity", 0.0),
+                    euclidean_similarity=position.get("euclidean_similarity", 0.0),
+                    dtw_similarity=position.get("dtw_similarity", 0.0),
+                    confidence=position.get("confidence", 0.0),
                 ))
             position = None
         
@@ -1341,14 +1406,23 @@ class BayesianTradingOptimizer:
                         current_regime = None
                 
                 # 原型匹配（余弦相似度 + 投票 + regime过滤）
+                # 多空分开进化：仅评估单边时只匹配该方向
+                match_direction = direction_filter if direction_filter else None
                 match_result = proto_matcher.match_entry(
-                    current_traj, direction=None, regime=current_regime
+                    current_traj, direction=match_direction, regime=current_regime
                 )
                 
                 # 降低日志频率，避免大量IO拖慢WF
+                # 【指纹3D图匹配系统】显示多维相似度分解
                 if i % 10000 == 0:
                     sim = match_result.get("similarity", 0)
-                    print(f"  [Match_Debug] Bar {i}: Matched={match_result['matched']}, BestSim={sim:.3f}, Target={params.cosine_threshold}")
+                    cos = match_result.get("cosine_similarity", 0)
+                    euc = match_result.get("euclidean_similarity", 0)
+                    dtw = match_result.get("dtw_similarity", 0)
+                    conf = match_result.get("confidence", 0)
+                    print(f"  [Match_Debug] Bar {i}: Matched={match_result['matched']}, "
+                          f"Final={sim:.3f}, Cos={cos:.3f}, Euc={euc:.3f}, DTW={dtw:.3f}, "
+                          f"Conf={conf:.3f}, Threshold={params.fusion_threshold:.3f}")
 
                 if match_result["matched"]:
                     side = 1 if match_result["direction"] == "LONG" else -1
@@ -1365,6 +1439,13 @@ class BayesianTradingOptimizer:
                         "stop_loss": entry_price * (1 - params.stop_loss_atr * atr / entry_price) if side == 1 else entry_price * (1 + params.stop_loss_atr * atr / entry_price),
                         "take_profit": entry_price * (1 + params.take_profit_atr * atr / entry_price) if side == 1 else entry_price * (1 - params.take_profit_atr * atr / entry_price),
                         "expected_hold": int(best_proto.avg_hold_bars) if best_proto else 60,
+                        # 【指纹3D图匹配系统】保存多维相似度分解（用于交易记录）
+                        "similarity": match_result.get("similarity", 0.0),
+                        "combined_score": match_result.get("combined_score", 0.0),
+                        "cosine_similarity": match_result.get("cosine_similarity", 0.0),
+                        "euclidean_similarity": match_result.get("euclidean_similarity", 0.0),
+                        "dtw_similarity": match_result.get("dtw_similarity", 0.0),
+                        "confidence": match_result.get("confidence", 0.0),
                     }
                 
                 i += skip_bars

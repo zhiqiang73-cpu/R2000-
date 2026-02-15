@@ -15,7 +15,8 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import UI_CONFIG, VECTOR_SPACE_CONFIG, MARKET_REGIME_CONFIG
+from config import (UI_CONFIG, VECTOR_SPACE_CONFIG, MARKET_REGIME_CONFIG,
+                     SIMILARITY_CONFIG, PAPER_TRADING_CONFIG, COLD_START_CONFIG)
 from core.paper_trader import OrderStatus
 
 
@@ -27,6 +28,7 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
     stop_requested = QtCore.pyqtSignal()       # 停止请求
     test_connection_requested = QtCore.pyqtSignal()  # 测试连接
     save_api_requested = QtCore.pyqtSignal(dict)      # 保存API配置
+    clear_memory_requested = QtCore.pyqtSignal()      # 清除学习记忆
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -149,7 +151,7 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         
         layout.addWidget(api_group)
         
-        # === 账户设置与统计（合并） ===
+        # === 账户设置与统计（合并，移动到持仓页） ===
         account_group = QtWidgets.QGroupBox("账户设置与统计")
         account_layout = QtWidgets.QFormLayout(account_group)
         
@@ -215,7 +217,8 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         self.snapshot_winrate_label = QtWidgets.QLabel("-")
         account_layout.addRow("胜率:", self.snapshot_winrate_label)
         
-        layout.addWidget(account_group)
+        # 注意：账户设置区移动到右侧“持仓”页显示
+        self.account_group = account_group
         
         # === 聚合指纹图筛选 ===
         template_group = QtWidgets.QGroupBox("聚合指纹图筛选")
@@ -259,6 +262,68 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         self.stop_btn.clicked.connect(self.stop_requested.emit)
         control_layout.addWidget(self.stop_btn)
         
+        # 清除学习记忆按钮
+        self.clear_memory_btn = QtWidgets.QPushButton("🗑 清除学习记忆")
+        self.clear_memory_btn.setToolTip(
+            "清除所有自适应学习数据：\n"
+            "• 贝叶斯过滤器统计\n"
+            "• 凯利仓位学习数据\n"
+            "• TP/SL评估记录\n"
+            "• 拒绝追踪记录\n"
+            "• 冷启动状态\n\n"
+            "⚠ 交易历史记录将保留"
+        )
+        self.clear_memory_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2a2a2a;
+                color: #FF9800;
+                border: 1px solid #FF9800;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #3a3a3a;
+            }
+            QPushButton:pressed {
+                background-color: #FF9800;
+                color: #000;
+            }
+        """)
+        self.clear_memory_btn.clicked.connect(self._on_clear_memory_clicked)
+        control_layout.addWidget(self.clear_memory_btn)
+        
+        # 反向下单模式开关
+        self.reverse_signal_checkbox = QtWidgets.QCheckBox("🔄 反向下单模式")
+        self.reverse_signal_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #FF5252;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 5px 0;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #FF5252;
+                border: 1px solid #FF5252;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: #333;
+                border: 1px solid #555;
+                border-radius: 3px;
+            }
+        """)
+        self.reverse_signal_checkbox.setToolTip(
+            "测试功能：将所有LONG信号变为SHORT，SHORT变为LONG\n"
+            "用于测试信号方向是否反了\n"
+            "⚠ 仅用于诊断，不要依赖此模式长期交易"
+        )
+        self.reverse_signal_checkbox.stateChanged.connect(self._on_reverse_mode_changed)
+        control_layout.addWidget(self.reverse_signal_checkbox)
+        
         layout.addWidget(control_group)
         
         # === 运行状态 ===
@@ -281,6 +346,10 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         
         self.pos_dir_label = QtWidgets.QLabel("-")
         status_layout.addRow("持仓方向:", self.pos_dir_label)
+        
+        self.weight_mode_label = QtWidgets.QLabel("-")
+        self.weight_mode_label.setStyleSheet("color: #888;")
+        status_layout.addRow("匹配权重:", self.weight_mode_label)
         
         layout.addWidget(status_group)
         
@@ -306,6 +375,80 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
             "api_secret": self.api_secret_edit.text().strip() or "",
         }
         self.save_api_requested.emit(config)
+    
+    def _on_reverse_mode_changed(self, state):
+        """反向下单模式开关变更"""
+        enabled = (state == QtCore.Qt.CheckState.Checked.value)
+        
+        # 更新配置
+        from config import PAPER_TRADING_CONFIG
+        PAPER_TRADING_CONFIG["REVERSE_SIGNAL_MODE"] = enabled
+        
+        # 更新引擎（如果已经运行）
+        if hasattr(self, '_engine') and self._engine:
+            self._engine._reverse_signal_mode = enabled
+        
+        # UI提示
+        if enabled:
+            print(f"[UI] ⚠️ 反向模式已启用！所有信号将反向操作")
+            self.reverse_signal_checkbox.setStyleSheet("""
+                QCheckBox {
+                    color: #FF5252;
+                    font-size: 12px;
+                    font-weight: bold;
+                    padding: 5px 0;
+                    background-color: rgba(255, 82, 82, 0.15);
+                }
+                QCheckBox::indicator {
+                    width: 16px;
+                    height: 16px;
+                }
+                QCheckBox::indicator:checked {
+                    background-color: #FF5252;
+                    border: 1px solid #FF5252;
+                    border-radius: 3px;
+                }
+            """)
+        else:
+            print(f"[UI] 反向模式已关闭")
+            self.reverse_signal_checkbox.setStyleSheet("""
+                QCheckBox {
+                    color: #FF5252;
+                    font-size: 12px;
+                    font-weight: bold;
+                    padding: 5px 0;
+                }
+                QCheckBox::indicator {
+                    width: 16px;
+                    height: 16px;
+                }
+                QCheckBox::indicator:unchecked {
+                    background-color: #333;
+                    border: 1px solid #555;
+                    border-radius: 3px;
+                }
+            """)
+    
+    def _on_clear_memory_clicked(self):
+        """清除学习记忆按钮点击"""
+        # 弹出确认对话框
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "确认清除学习记忆",
+            "确定要清除所有自适应学习数据吗？\n\n"
+            "将清除：\n"
+            "• 贝叶斯过滤器统计\n"
+            "• 凯利仓位学习数据\n"
+            "• TP/SL评估记录\n"
+            "• 拒绝追踪记录\n"
+            "• 冷启动状态\n\n"
+            "交易历史记录将保留。\n\n"
+            "此操作不可撤销！",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.clear_memory_requested.emit()
     
     def set_running(self, running: bool):
         """设置运行状态"""
@@ -362,7 +505,20 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
             text = f"{text} ({detail})"
         self.template_count_label.setText(text)
 
-    def update_match_preview(self, fp: str, similarity: float, fp_status: str = ""):
+    def update_weight_mode(self, using_evolved: Optional[bool] = None):
+        """更新匹配权重显示：进化后 / 进化前（模拟交易运行时在 UI 端区分）。None=未运行显示 -"""
+        if using_evolved is None:
+            self.weight_mode_label.setText("-")
+            self.weight_mode_label.setStyleSheet("color: #888;")
+        elif using_evolved:
+            self.weight_mode_label.setText("进化后")
+            self.weight_mode_label.setStyleSheet("color: #089981; font-weight: bold;")
+        else:
+            self.weight_mode_label.setText("进化前")
+            self.weight_mode_label.setStyleSheet("color: #888;")
+
+    def update_match_preview(self, fp: str, similarity: float, fp_status: str = "", 
+                             prototype_confidence: float = 0.0):
         """更新左侧筛选区中的匹配预览（聚合指纹图）"""
         if fp:
             self.last_matched_proto_label.setText(fp if len(fp) <= 28 else (fp[:28] + "..."))
@@ -380,8 +536,20 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
                 color = "#FFD54F"
             else:
                 color = "#f23645"
+            # 显示置信度（如果有）
+            if prototype_confidence > 0:
+                conf_level = ""
+                if prototype_confidence >= 0.70:
+                    conf_level = "高"
+                elif prototype_confidence >= 0.50:
+                    conf_level = "中"
+                elif prototype_confidence >= 0.30:
+                    conf_level = "低"
+                else:
+                    conf_level = "极低"
+                sim_text = f"{sim_text} | 置信: {prototype_confidence:.0%}({conf_level})"
         if fp_status:
-            sim_text = f"{sim_text} | 状态: {fp_status}"
+            sim_text = f"{sim_text} | {fp_status}"
         self.last_match_sim_label.setText(sim_text)
         self.last_match_sim_label.setStyleSheet(f"color: {color}; font-size: 11px;")
     
@@ -480,7 +648,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self._init_ui()
     
     def _init_ui(self):
-        self.setFixedWidth(320)
+        self.setMinimumWidth(280)  # 最小宽度，可与左侧分隔条拖拽拉宽
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: {UI_CONFIG['THEME_BACKGROUND']};
@@ -522,52 +690,309 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         """)
         
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(0)
         
-        # === 实时持仓状态 ===
-        position_group = QtWidgets.QGroupBox("当前持仓")
-        position_group.setStyleSheet("""
-            QGroupBox {
-                border: 2px solid #444;
+        # ══════ 创建标签页容器 ══════
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+                margin-top: -1px;
+            }}
+            QTabBar::tab {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2d2d2d, stop:1 #252525);
+                color: #aaa;
+                padding: 10px 16px;
+                border: 1px solid #3a3a3a;
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                min-width: 65px;
+                margin-right: 2px;
+                font-weight: 500;
+                font-size: 12px;
+            }}
+            QTabBar::tab:selected {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {UI_CONFIG['THEME_ACCENT']}, stop:1 #006699);
+                color: white;
+                border-color: {UI_CONFIG['THEME_ACCENT']};
+                font-weight: bold;
+                padding-bottom: 12px;
+            }}
+            QTabBar::tab:hover:!selected {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #3a3a3a, stop:1 #2d2d2d);
+                color: #ddd;
+            }}
+            QTabBar::tab:first {{
+                margin-left: 0px;
+            }}
+        """)
+        
+        # ══════ Tab 1: 持仓（含委托单、账户设置与统计） ══════
+        self._create_position_tab()
+        
+        # ══════ Tab 2: 匹配 ══════
+        self._create_matching_tab()
+        
+        # ══════ Tab 3: 监控 ══════
+        self._create_monitoring_tab()
+        
+        # ══════ Tab 4: 日志 ══════
+        self._create_log_tab()
+        
+        layout.addWidget(self.tabs)
+    
+    def _create_position_tab(self):
+        """创建持仓标签页"""
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.setSpacing(0)
+        
+        # 使用滚动区域，容纳更多内容
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background-color: #2a2a2a;
+                width: 10px;
+            }
+            QScrollBar::handle:vertical {
+                background: #555;
+                min-height: 20px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #777;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
             }
         """)
-        position_layout = QtWidgets.QFormLayout(position_group)
         
+        content = QtWidgets.QWidget()
+        tab_layout_inner = QtWidgets.QVBoxLayout(content)
+        tab_layout_inner.setContentsMargins(14, 14, 14, 14)
+        tab_layout_inner.setSpacing(12)
+        
+        # 持仓信息表单
+        position_form = QtWidgets.QFormLayout()
+        position_form.setSpacing(10)
+        position_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        
+        # 方向标签 - 突出显示
         self.position_side_label = QtWidgets.QLabel("-")
-        self.position_side_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-        position_layout.addRow("方向:", self.position_side_label)
+        self.position_side_label.setStyleSheet("font-size: 18px; font-weight: bold;")
+        position_form.addRow("方向:", self.position_side_label)
         
+        # 数量
         self.position_qty_label = QtWidgets.QLabel("-")
-        position_layout.addRow("数量:", self.position_qty_label)
+        self.position_qty_label.setStyleSheet("color: #ccc;")
+        position_form.addRow("数量:", self.position_qty_label)
         
+        # 保证金占用
         self.position_margin_label = QtWidgets.QLabel("-")
-        position_layout.addRow("保证金占用:", self.position_margin_label)
+        self.position_margin_label.setStyleSheet("color: #9ad1ff;")
+        position_form.addRow("保证金:", self.position_margin_label)
         
+        # 入场价
         self.position_entry_label = QtWidgets.QLabel("-")
-        position_layout.addRow("入场价:", self.position_entry_label)
+        self.position_entry_label.setStyleSheet("color: #ccc;")
+        position_form.addRow("入场价:", self.position_entry_label)
         
+        # 当前价
         self.position_current_label = QtWidgets.QLabel("-")
-        position_layout.addRow("当前价:", self.position_current_label)
+        self.position_current_label.setStyleSheet("color: #FFD54F;")
+        position_form.addRow("当前价:", self.position_current_label)
+        
+        # 分隔线
+        separator1 = QtWidgets.QFrame()
+        separator1.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        separator1.setStyleSheet("background-color: #3a3a3a;")
+        tab_layout_inner.addLayout(position_form)
+        tab_layout_inner.addWidget(separator1)
+        
+        # 盈亏信息（强调显示）
+        pnl_form = QtWidgets.QFormLayout()
+        pnl_form.setSpacing(8)
+        pnl_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
         
         self.position_pnl_label = QtWidgets.QLabel("-")
-        self.position_pnl_label.setStyleSheet("font-size: 14px; font-weight: bold;")
-        position_layout.addRow("浮动盈亏:", self.position_pnl_label)
+        self.position_pnl_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        pnl_form.addRow("浮动盈亏:", self.position_pnl_label)
         
         self.position_pnl_pct_label = QtWidgets.QLabel("-")
-        position_layout.addRow("收益率:", self.position_pnl_pct_label)
+        self.position_pnl_pct_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        pnl_form.addRow("收益率:", self.position_pnl_pct_label)
         
-        # 追踪状态
+        tab_layout_inner.addLayout(pnl_form)
+        
+        # 分隔线
+        separator2 = QtWidgets.QFrame()
+        separator2.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        separator2.setStyleSheet("background-color: #3a3a3a;")
+        tab_layout_inner.addWidget(separator2)
+        
+        # 追踪状态（醒目显示）
+        tracking_form = QtWidgets.QFormLayout()
+        tracking_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        
         self.tracking_status_label = QtWidgets.QLabel("-")
-        self.tracking_status_label.setStyleSheet("font-size: 14px; font-weight: bold;")
-        position_layout.addRow("追踪状态:", self.tracking_status_label)
+        self.tracking_status_label.setStyleSheet("font-size: 15px; font-weight: bold;")
+        tracking_form.addRow("追踪状态:", self.tracking_status_label)
         
-        layout.addWidget(position_group)
+        tab_layout_inner.addLayout(tracking_form)
         
-        # === 匹配与市场状态 ===
-        market_group = QtWidgets.QGroupBox("匹配与市场状态")
-        market_layout = QtWidgets.QFormLayout(market_group)
+        # 分隔线
+        separator3 = QtWidgets.QFrame()
+        separator3.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        separator3.setStyleSheet("background-color: #3a3a3a;")
+        tab_layout_inner.addWidget(separator3)
         
+        # 账户设置与统计（从左侧控制面板移入）
+        self._account_group_container = QtWidgets.QWidget()
+        self._account_group_layout = QtWidgets.QVBoxLayout(self._account_group_container)
+        self._account_group_layout.setContentsMargins(0, 0, 0, 0)
+        self._account_group_layout.setSpacing(6)
+        tab_layout_inner.addWidget(self._account_group_container)
+        
+        # 分隔线
+        separator4 = QtWidgets.QFrame()
+        separator4.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        separator4.setStyleSheet("background-color: #3a3a3a;")
+        tab_layout_inner.addWidget(separator4)
+        
+        # 委托单监控区（合并到持仓页）
+        pending_section = self._build_pending_orders_section()
+        tab_layout_inner.addWidget(pending_section)
+        
+        tab_layout_inner.addStretch()
+        
+        scroll_area.setWidget(content)
+        tab_layout.addWidget(scroll_area)
+        
+        self.tabs.addTab(tab, "💼 持仓")
+
+    def attach_account_group(self, account_group: QtWidgets.QGroupBox):
+        """把账户设置/统计区放入持仓页"""
+        if not hasattr(self, "_account_group_layout"):
+            return
+        # 解除旧父级，重新挂载
+        account_group.setParent(self._account_group_container)
+        self._account_group_layout.addWidget(account_group)
+
+    def _build_pending_orders_section(self) -> QtWidgets.QWidget:
+        """构建委托单监控区块（复用）"""
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        
+        title = QtWidgets.QLabel("📋 委托单")
+        title.setStyleSheet("color: #e0e0e0; font-size: 12px; font-weight: bold;")
+        layout.addWidget(title)
+        
+        # 提示标签（美化）
+        self.pending_orders_hint_label = QtWidgets.QLabel("当前无挂单")
+        self.pending_orders_hint_label.setStyleSheet("""
+            color: #888;
+            font-size: 11px;
+            padding: 4px 6px;
+            background-color: #252526;
+            border: 1px solid #3a3a3a;
+            border-radius: 4px;
+        """)
+        layout.addWidget(self.pending_orders_hint_label)
+        
+        # 委托单表格（美化）
+        self.pending_orders_table = QtWidgets.QTableWidget()
+        self.pending_orders_table.setColumnCount(6)
+        self.pending_orders_table.setHorizontalHeaderLabels(["方向", "挂单价", "数量", "状态", "剩余K线", "原型"])
+        self.pending_orders_table.verticalHeader().setVisible(False)
+        self.pending_orders_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.pending_orders_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.pending_orders_table.setAlternatingRowColors(True)
+        self.pending_orders_table.setMinimumHeight(140)
+        self.pending_orders_table.horizontalHeader().setStretchLastSection(True)
+        self.pending_orders_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: #1e1e1e;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+                gridline-color: #2a2a2a;
+                color: #d0d0d0;
+                font-size: 11px;
+            }}
+            QHeaderView::section {{
+                background-color: #252526;
+                color: #bdbdbd;
+                border: none;
+                padding: 6px 8px;
+                font-weight: bold;
+                font-size: 10px;
+            }}
+            QTableWidget::item {{
+                padding: 4px 6px;
+                border-bottom: 1px solid #2a2a2a;
+            }}
+            QTableWidget::item:selected {{
+                background-color: #2d2d2d;
+            }}
+        """)
+        layout.addWidget(self.pending_orders_table)
+        
+        return container
+    
+    def _create_matching_tab(self):
+        """创建匹配状态标签页"""
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
+        
+        # 添加滚动区域（匹配标签页内容较多）
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{
+                border: none;
+                background-color: transparent;
+            }}
+            QScrollBar:vertical {{
+                border: none;
+                background-color: #2a2a2a;
+                width: 10px;
+                border-radius: 5px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: #555;
+                border-radius: 5px;
+                min-height: 20px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: #666;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """)
+        
+        scroll_content = QtWidgets.QWidget()
+        market_layout = QtWidgets.QFormLayout(scroll_content)
+        
+        # 复制原 market_group 的内容
         # 市场状态 + 心跳指示器
         market_regime_container = QtWidgets.QWidget()
         market_regime_h_layout = QtWidgets.QHBoxLayout(market_regime_container)
@@ -620,6 +1045,60 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.matched_similarity_label.setStyleSheet("font-weight: bold; font-size: 13px;")
         market_layout.addRow("实时配合度:", self.matched_similarity_label)
         
+        # 【指纹3D图】多维相似度分解显示
+        self.multi_sim_container = QtWidgets.QWidget()
+        multi_sim_layout = QtWidgets.QHBoxLayout(self.multi_sim_container)
+        multi_sim_layout.setContentsMargins(0, 2, 0, 2)
+        multi_sim_layout.setSpacing(4)
+        
+        # 方向相似度（余弦）
+        self.cos_sim_badge = QtWidgets.QLabel("方向: -")
+        self.cos_sim_badge.setStyleSheet(self._similarity_badge_style("#4A90D9"))
+        self.cos_sim_badge.setToolTip("方向相似度（余弦）\n衡量特征变化方向是否一致")
+        multi_sim_layout.addWidget(self.cos_sim_badge)
+        
+        # 距离相似度（欧氏）
+        self.euc_sim_badge = QtWidgets.QLabel("距离: -")
+        self.euc_sim_badge.setStyleSheet(self._similarity_badge_style("#7B68EE"))
+        self.euc_sim_badge.setToolTip("距离相似度（欧氏）\n衡量特征数值是否接近")
+        multi_sim_layout.addWidget(self.euc_sim_badge)
+        
+        # 形态相似度（DTW）
+        self.dtw_sim_badge = QtWidgets.QLabel("形态: -")
+        self.dtw_sim_badge.setStyleSheet(self._similarity_badge_style("#20B2AA"))
+        self.dtw_sim_badge.setToolTip("形态相似度（DTW）\n衡量时间序列形态是否匹配")
+        multi_sim_layout.addWidget(self.dtw_sim_badge)
+        
+        multi_sim_layout.addStretch()
+        market_layout.addRow("相似度分解:", self.multi_sim_container)
+        
+        # 原型置信度
+        self.confidence_container = QtWidgets.QWidget()
+        confidence_h_layout = QtWidgets.QHBoxLayout(self.confidence_container)
+        confidence_h_layout.setContentsMargins(0, 0, 0, 0)
+        confidence_h_layout.setSpacing(5)
+        
+        self.confidence_label = QtWidgets.QLabel("-")
+        self.confidence_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        confidence_h_layout.addWidget(self.confidence_label)
+        
+        self.confidence_level_badge = QtWidgets.QLabel("")
+        self.confidence_level_badge.setStyleSheet("""
+            QLabel {
+                color: #888;
+                background-color: rgba(136, 136, 136, 0.15);
+                border: 1px solid #888;
+                border-radius: 3px;
+                padding: 0px 4px;
+                font-size: 9px;
+            }
+        """)
+        self.confidence_level_badge.hide()
+        confidence_h_layout.addWidget(self.confidence_level_badge)
+        confidence_h_layout.addStretch()
+        
+        market_layout.addRow("原型置信度:", self.confidence_container)
+        
         self.entry_threshold_label = QtWidgets.QLabel("-")
         self.entry_threshold_label.setStyleSheet("color: #888;")
         market_layout.addRow("开仓阈值:", self.entry_threshold_label)
@@ -627,6 +1106,11 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.distance_to_entry_label = QtWidgets.QLabel("-")
         self.distance_to_entry_label.setStyleSheet("font-weight: bold;")
         market_layout.addRow("距离开仓:", self.distance_to_entry_label)
+        
+        self.position_score_label = QtWidgets.QLabel("-")
+        self.position_score_label.setStyleSheet("font-weight: bold;")
+        self.position_score_label.setToolTip("空间位置评分(-100~+100)，越高表示当前方向越有利")
+        market_layout.addRow("空间位置评分:", self.position_score_label)
         
         self.reason_label = QtWidgets.QLabel("-")
         self.reason_label.setWordWrap(True)
@@ -661,19 +1145,530 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         indicators_main_layout.addStretch()
         
         market_layout.addRow("动能门控:", indicators_main_container)
+
+        # ══════════════════════════════════════════════════════════════
+        # 开仓条件总览 / 平仓条件总览  (overview cards)
+        # ══════════════════════════════════════════════════════════════
+        self._build_entry_overview_card(market_layout)
+        self._build_exit_overview_card(market_layout)
+
+        scroll_area.setWidget(scroll_content)
+        tab_layout.addWidget(scroll_area)
         
-        layout.addWidget(market_group)
+        self.tabs.addTab(tab, "🎯 匹配")
+    
+    # ─────────────────────────────────────────────────────────
+    #  Entry / Exit overview card builders
+    # ─────────────────────────────────────────────────────────
+    def _build_entry_overview_card(self, parent_layout: QtWidgets.QFormLayout):
+        """开仓条件总览卡片 - 8行 x 5列 (条件 / 正常阈值 / 冷启动阈值 / 当前值 / 状态)"""
 
-        # === 委托单监控（新增） ===
-        pending_group = QtWidgets.QGroupBox("委托单监控")
-        pending_layout = QtWidgets.QVBoxLayout(pending_group)
-        pending_layout.setContentsMargins(6, 6, 6, 6)
-        pending_layout.setSpacing(6)
+        # -- outer frame (dark card with rounded corners and subtle border) --
+        card = QtWidgets.QFrame()
+        card.setObjectName("entryCard")
+        card.setStyleSheet("""
+            QFrame#entryCard {
+                background-color: #333;
+                border: 1px solid #555;
+                border-radius: 8px;
+            }
+        """)
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setContentsMargins(0, 0, 0, 6)
+        card_layout.setSpacing(0)
 
+        # -- header bar: green accent band + title + cold-start badge --
+        header_widget = QtWidgets.QWidget()
+        header_widget.setObjectName("entryHeader")
+        header_widget.setStyleSheet("""
+            QWidget#entryHeader {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(8, 153, 129, 0.25), stop:1 #2d2d2d);
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                border-left: 3px solid #089981;
+            }
+        """)
+        header_h = QtWidgets.QHBoxLayout(header_widget)
+        header_h.setContentsMargins(10, 6, 10, 6)
+        header_h.setSpacing(8)
+
+        title = QtWidgets.QLabel("开仓条件总览")
+        title.setStyleSheet("color: #e0e0e0; font-weight: bold; font-size: 12px; background: transparent;")
+        header_h.addWidget(title)
+        header_h.addStretch()
+
+        # Cold start mode indicator badge (prominent, with tooltip)
+        self._cold_start_badge = QtWidgets.QLabel("正常模式")
+        self._cold_start_badge.setToolTip(
+            "当前匹配模式\n"
+            "正常模式: 使用标准阈值进行匹配\n"
+            "冷启动模式: 放宽阈值以增加初始交易频率"
+        )
+        self._cold_start_badge.setStyleSheet(self._cold_start_badge_style(False))
+        header_h.addWidget(self._cold_start_badge)
+        card_layout.addWidget(header_widget)
+
+        # -- separator --
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background-color: #555; border: none;")
+        card_layout.addWidget(sep)
+
+        # -- grid container --
+        grid_widget = QtWidgets.QWidget()
+        grid_widget.setStyleSheet("background: transparent;")
+        grid = QtWidgets.QGridLayout(grid_widget)
+        grid.setSpacing(0)
+        grid.setContentsMargins(6, 0, 6, 2)
+
+        # column headers with dark background
+        col_headers = ["条件", "正常阈值", "冷启动阈值", "当前值", "状态"]
+        self._entry_col_header_lbls: Dict[int, QtWidgets.QLabel] = {}
+        for ci, text in enumerate(col_headers):
+            lbl = QtWidgets.QLabel(text)
+            lbl.setStyleSheet(
+                "color: #999; font-size: 9px; font-weight: bold; "
+                "background-color: #3a3a3a; padding: 4px 3px; "
+                "border-bottom: 1px solid #555;"
+            )
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(lbl, 0, ci)
+            self._entry_col_header_lbls[ci] = lbl
+
+        # -- read thresholds from config --
+        cos_normal = SIMILARITY_CONFIG.get("COSINE_MIN_THRESHOLD", 0.70)
+        fusion_normal = SIMILARITY_CONFIG.get("FUSION_THRESHOLD", 0.65)
+        euc_normal = 0.35   # approximate normal threshold
+        dtw_normal = 0.30   # approximate normal threshold
+
+        cos_cold = COLD_START_CONFIG.get("THRESHOLDS", {}).get("cosine", 0.50)
+        fusion_cold = COLD_START_CONFIG.get("THRESHOLDS", {}).get("fusion", 0.30)
+        euc_cold = COLD_START_CONFIG.get("THRESHOLDS", {}).get("euclidean", 0.25)
+        dtw_cold = COLD_START_CONFIG.get("THRESHOLDS", {}).get("dtw", 0.10)
+
+        macd_slope = PAPER_TRADING_CONFIG.get("MACD_SLOPE_MIN", 0.003)
+        bayes_min = PAPER_TRADING_CONFIG.get("BAYESIAN_MIN_WIN_RATE", 0.40)
+        pos_long = PAPER_TRADING_CONFIG.get("POS_THRESHOLD_LONG", -30)
+
+        # Row definitions: (name, normal_text, cold_text, key)
+        entry_rows = [
+            ("余弦相似度",  f"{cos_normal:.0%}",     f"{cos_cold:.0%}",     "cosine"),
+            ("融合评分",    f"{fusion_normal:.0%}",   f"{fusion_cold:.0%}",  "fusion"),
+            ("欧氏距离",    f"{euc_normal:.0%}",      f"{euc_cold:.0%}",     "euclidean"),
+            ("DTW形态",     f"{dtw_normal:.0%}",      f"{dtw_cold:.0%}",     "dtw"),
+            ("MACD趋势",   f"斜率≥{macd_slope}",     "跳过",                "macd"),
+            ("KDJ指标",     "J≥D 或 K≥D",            "同上",                "kdj"),
+            ("贝叶斯胜率",  f"≥{bayes_min:.0%}",      "同上",                "bayesian"),
+            ("位置评分(多)", f"≥{pos_long}",           "同上",                "position"),
+        ]
+
+        self._entry_overview_labels: Dict[str, Dict[str, QtWidgets.QLabel]] = {}
+
+        for ri, (name, normal_txt, cold_txt, key) in enumerate(entry_rows, start=1):
+            row_labels: Dict[str, QtWidgets.QLabel] = {}
+            # alternating row background
+            row_bg = "rgba(58, 58, 58, 0.5)" if ri % 2 == 0 else "transparent"
+
+            # col 0 - condition name
+            name_lbl = QtWidgets.QLabel(name)
+            name_lbl.setStyleSheet(
+                f"color: #ddd; font-size: 10px; padding: 3px 4px; background: {row_bg};"
+            )
+            grid.addWidget(name_lbl, ri, 0)
+
+            # col 1 - normal threshold
+            normal_lbl = QtWidgets.QLabel(normal_txt)
+            normal_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            normal_lbl.setStyleSheet(
+                f"color: #aaa; font-size: 10px; padding: 3px 4px; background: {row_bg};"
+            )
+            grid.addWidget(normal_lbl, ri, 1)
+            row_labels["normal"] = normal_lbl
+
+            # col 2 - cold start threshold
+            cold_lbl = QtWidgets.QLabel(cold_txt)
+            cold_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            cold_lbl.setStyleSheet(
+                f"color: #aaa; font-size: 10px; padding: 3px 4px; background: {row_bg};"
+            )
+            grid.addWidget(cold_lbl, ri, 2)
+            row_labels["cold"] = cold_lbl
+
+            # col 3 - realtime value (dynamic)
+            rt_lbl = QtWidgets.QLabel("--")
+            rt_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            rt_lbl.setStyleSheet(
+                f"color: #666; font-size: 10px; padding: 3px 4px; background: {row_bg};"
+            )
+            grid.addWidget(rt_lbl, ri, 3)
+            row_labels["realtime"] = rt_lbl
+
+            # col 4 - status badge (dynamic)
+            status_lbl = QtWidgets.QLabel("--")
+            status_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            status_lbl.setStyleSheet(
+                f"color: #666; font-size: 10px; padding: 3px 4px; background: {row_bg};"
+            )
+            grid.addWidget(status_lbl, ri, 4)
+            row_labels["status"] = status_lbl
+
+            # store row background for realtime updates
+            row_labels["_row_bg"] = row_bg  # type: ignore[assignment]
+            self._entry_overview_labels[key] = row_labels
+
+        # column stretch
+        grid.setColumnStretch(0, 3)  # name
+        grid.setColumnStretch(1, 2)  # normal
+        grid.setColumnStretch(2, 2)  # cold
+        grid.setColumnStretch(3, 2)  # realtime
+        grid.setColumnStretch(4, 1)  # status
+
+        card_layout.addWidget(grid_widget)
+        parent_layout.addRow(card)
+
+    # ─── Status badge helper methods ────────────────────────
+    @staticmethod
+    def _cold_start_badge_style(active: bool) -> str:
+        """Generate stylesheet for the cold start mode indicator badge."""
+        if active:
+            return (
+                "QLabel {"
+                "  color: #FF9800;"
+                "  background-color: rgba(255, 152, 0, 0.18);"
+                "  border: 1px solid #FF9800;"
+                "  border-radius: 4px;"
+                "  padding: 2px 10px;"
+                "  font-size: 10px;"
+                "  font-weight: bold;"
+                "}"
+            )
+        return (
+            "QLabel {"
+            "  color: #4FC3F7;"
+            "  background-color: rgba(79, 195, 247, 0.15);"
+            "  border: 1px solid #4FC3F7;"
+            "  border-radius: 4px;"
+            "  padding: 2px 10px;"
+            "  font-size: 10px;"
+            "  font-weight: bold;"
+            "}"
+        )
+
+    @staticmethod
+    def _status_badge_pass() -> str:
+        """Status badge stylesheet: PASS (green)."""
+        return (
+            "color: #089981; font-size: 11px; font-weight: bold; "
+            "padding: 2px 4px; background: rgba(8,153,129,0.12); "
+            "border-radius: 3px;"
+        )
+
+    @staticmethod
+    def _status_badge_fail() -> str:
+        """Status badge stylesheet: FAIL (red)."""
+        return (
+            "color: #f23645; font-size: 11px; font-weight: bold; "
+            "padding: 2px 4px; background: rgba(242,54,69,0.12); "
+            "border-radius: 3px;"
+        )
+
+    @staticmethod
+    def _status_badge_near() -> str:
+        """Status badge stylesheet: NEAR threshold (yellow)."""
+        return (
+            "color: #FFD54F; font-size: 11px; font-weight: bold; "
+            "padding: 2px 4px; background: rgba(255,213,79,0.12); "
+            "border-radius: 3px;"
+        )
+
+    @staticmethod
+    def _status_badge_none() -> str:
+        """Status badge stylesheet: no data (gray)."""
+        return (
+            "color: #666; font-size: 10px; "
+            "padding: 2px 4px; background: transparent;"
+        )
+
+    def _build_exit_overview_card(self, parent_layout: QtWidgets.QFormLayout):
+        """平仓条件总览卡片 - 条件 + 阈值描述"""
+
+        card = QtWidgets.QFrame()
+        card.setObjectName("exitCard")
+        card.setStyleSheet("""
+            QFrame#exitCard {
+                background-color: #333;
+                border: 1px solid #555;
+                border-radius: 8px;
+            }
+        """)
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setContentsMargins(0, 0, 0, 6)
+        card_layout.setSpacing(0)
+
+        # -- header bar: red accent band + title --
+        exit_header = QtWidgets.QWidget()
+        exit_header.setObjectName("exitHeader")
+        exit_header.setStyleSheet("""
+            QWidget#exitHeader {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(242, 54, 69, 0.25), stop:1 #2d2d2d);
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                border-left: 3px solid #f23645;
+            }
+        """)
+        exit_header_h = QtWidgets.QHBoxLayout(exit_header)
+        exit_header_h.setContentsMargins(10, 6, 10, 6)
+        title = QtWidgets.QLabel("平仓条件总览")
+        title.setStyleSheet("color: #e0e0e0; font-weight: bold; font-size: 12px; background: transparent;")
+        exit_header_h.addWidget(title)
+        exit_header_h.addStretch()
+        card_layout.addWidget(exit_header)
+
+        # -- separator --
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background-color: #555; border: none;")
+        card_layout.addWidget(sep)
+
+        # -- grid container --
+        grid_widget = QtWidgets.QWidget()
+        grid_widget.setStyleSheet("background: transparent;")
+        grid = QtWidgets.QGridLayout(grid_widget)
+        grid.setSpacing(0)
+        grid.setContentsMargins(6, 0, 6, 2)
+
+        # column headers
+        for ci, text in enumerate(["条件", "阈值"]):
+            lbl = QtWidgets.QLabel(text)
+            lbl.setStyleSheet(
+                "color: #999; font-size: 9px; font-weight: bold; "
+                "background-color: #3a3a3a; padding: 4px 4px; "
+                "border-bottom: 1px solid #555;"
+            )
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter if ci else QtCore.Qt.AlignmentFlag.AlignLeft)
+            grid.addWidget(lbl, 0, ci)
+
+        # -- read thresholds from config --
+        safe_th = PAPER_TRADING_CONFIG.get("HOLD_SAFE_THRESHOLD", 0.7)
+        alert_th = PAPER_TRADING_CONFIG.get("HOLD_ALERT_THRESHOLD", 0.5)
+        derail_th = PAPER_TRADING_CONFIG.get("HOLD_DERAIL_THRESHOLD", 0.3)
+        ts1 = PAPER_TRADING_CONFIG.get("TRAILING_STAGE1_PCT", 1.0)
+        ts2 = PAPER_TRADING_CONFIG.get("TRAILING_STAGE2_PCT", 2.0)
+        ts3 = PAPER_TRADING_CONFIG.get("TRAILING_STAGE3_PCT", 3.5)
+        lock2 = PAPER_TRADING_CONFIG.get("TRAILING_LOCK_PCT_STAGE2", 0.50)
+        lock3 = PAPER_TRADING_CONFIG.get("TRAILING_LOCK_PCT_STAGE3", 0.70)
+        mom_min = PAPER_TRADING_CONFIG.get("MOMENTUM_MIN_PROFIT_PCT", 1.5)
+        mom_decay = PAPER_TRADING_CONFIG.get("MOMENTUM_DECAY_THRESHOLD", 0.5)
+        max_hold = PAPER_TRADING_CONFIG.get("MAX_HOLD_BARS", 240)
+
+        exit_rows = [
+            ("安全持仓",      f"相似度 ≥ {safe_th:.0%}"),
+            ("警戒",          f"相似度 {alert_th:.0%}~{safe_th:.0%}"),
+            ("脱轨平仓",      f"相似度 < {derail_th:.0%}"),
+            ("追踪止盈 Lv1",  f"盈利 ≥ {ts1:.1f}% → 保本"),
+            ("追踪止盈 Lv2",  f"盈利 ≥ {ts2:.1f}% → 锁定{lock2:.0%}"),
+            ("追踪止盈 Lv3",  f"盈利 ≥ {ts3:.1f}% → 锁定{lock3:.0%}"),
+            ("动能衰竭",      f"盈利 ≥ {mom_min:.1f}% 且 K线缩量{mom_decay:.0%}"),
+            ("最大持仓",      f"{max_hold}根K线"),
+        ]
+
+        for ri, (name, desc) in enumerate(exit_rows, start=1):
+            row_bg = "rgba(58, 58, 58, 0.5)" if ri % 2 == 0 else "transparent"
+            name_lbl = QtWidgets.QLabel(name)
+            name_lbl.setStyleSheet(
+                f"color: #ddd; font-size: 10px; padding: 3px 4px; background: {row_bg};"
+            )
+            grid.addWidget(name_lbl, ri, 0)
+
+            desc_lbl = QtWidgets.QLabel(desc)
+            desc_lbl.setStyleSheet(
+                f"color: #aaa; font-size: 10px; padding: 3px 4px; background: {row_bg};"
+            )
+            grid.addWidget(desc_lbl, ri, 1)
+
+        grid.setColumnStretch(0, 2)
+        grid.setColumnStretch(1, 5)
+
+        card_layout.addWidget(grid_widget)
+        parent_layout.addRow(card)
+
+    # ─────────────────────────────────────────────────────────
+    #  Entry overview real-time updater
+    # ─────────────────────────────────────────────────────────
+    def _update_entry_overview(self, *,
+                               cosine: float = 0.0,
+                               fusion: float = 0.0,
+                               euclidean: float = 0.0,
+                               dtw: float = 0.0,
+                               macd_ready: bool = False,
+                               kdj_ready: bool = False,
+                               bayesian_win_rate: float = 0.0,
+                               position_score: float = 0.0,
+                               cold_start_active: bool = False):
+        """Refresh entry overview card with live values and pass/fail badges on each tick."""
+
+        if not hasattr(self, "_entry_overview_labels"):
+            return
+
+        # ── Cold start mode indicator badge ──
+        self._cold_start_badge.setText("冷启动模式" if cold_start_active else "正常模式")
+        self._cold_start_badge.setStyleSheet(self._cold_start_badge_style(cold_start_active))
+
+        # ── Highlight the active threshold column ──
+        # Active column: glow background; inactive column: dimmed
+        for key, row_lbls in self._entry_overview_labels.items():
+            normal_lbl = row_lbls["normal"]
+            cold_lbl = row_lbls["cold"]
+            if cold_start_active:
+                normal_lbl.setStyleSheet(
+                    "color: #555; font-size: 10px; padding: 3px 4px; background: transparent;"
+                )
+                cold_lbl.setStyleSheet(
+                    "color: #FFA726; font-size: 10px; padding: 3px 4px; font-weight: bold; "
+                    "background: rgba(255, 152, 0, 0.10); border-radius: 2px;"
+                )
+            else:
+                normal_lbl.setStyleSheet(
+                    "color: #4FC3F7; font-size: 10px; padding: 3px 4px; font-weight: bold; "
+                    "background: rgba(79, 195, 247, 0.10); border-radius: 2px;"
+                )
+                cold_lbl.setStyleSheet(
+                    "color: #555; font-size: 10px; padding: 3px 4px; background: transparent;"
+                )
+
+        # Highlight column headers (col 1 = normal, col 2 = cold)
+        if hasattr(self, "_entry_col_header_lbls"):
+            base_hdr = "font-size: 9px; font-weight: bold; padding: 4px 3px; border-bottom: 1px solid #555;"
+            if cold_start_active:
+                self._entry_col_header_lbls.get(1, QtWidgets.QLabel()).setStyleSheet(
+                    f"color: #777; {base_hdr} background-color: #3a3a3a;"
+                )
+                self._entry_col_header_lbls.get(2, QtWidgets.QLabel()).setStyleSheet(
+                    f"color: #FFA726; {base_hdr} background-color: rgba(255,152,0,0.12);"
+                )
+            else:
+                self._entry_col_header_lbls.get(1, QtWidgets.QLabel()).setStyleSheet(
+                    f"color: #4FC3F7; {base_hdr} background-color: rgba(79,195,247,0.12);"
+                )
+                self._entry_col_header_lbls.get(2, QtWidgets.QLabel()).setStyleSheet(
+                    f"color: #777; {base_hdr} background-color: #3a3a3a;"
+                )
+
+        # ── Determine active thresholds for pass/fail evaluation ──
+        cos_normal = SIMILARITY_CONFIG.get("COSINE_MIN_THRESHOLD", 0.70)
+        fusion_normal = SIMILARITY_CONFIG.get("FUSION_THRESHOLD", 0.65)
+        euc_normal, dtw_normal = 0.35, 0.30
+        cold_th = COLD_START_CONFIG.get("THRESHOLDS", {})
+        cos_cold = cold_th.get("cosine", 0.50)
+        fusion_cold = cold_th.get("fusion", 0.30)
+        euc_cold = cold_th.get("euclidean", 0.25)
+        dtw_cold = cold_th.get("dtw", 0.10)
+
+        if cold_start_active:
+            th_cos, th_fus, th_euc, th_dtw = cos_cold, fusion_cold, euc_cold, dtw_cold
+        else:
+            th_cos, th_fus, th_euc, th_dtw = cos_normal, fusion_normal, euc_normal, dtw_normal
+
+        bayes_min = PAPER_TRADING_CONFIG.get("BAYESIAN_MIN_WIN_RATE", 0.40)
+        pos_long = PAPER_TRADING_CONFIG.get("POS_THRESHOLD_LONG", -30)
+        macd_bypass = COLD_START_CONFIG.get("MACD_BYPASS", True) and cold_start_active
+
+        # ── Helper: update a single row's realtime value + status badge ──
+        def _set_row(key: str, value_text: str, passed: bool, near: bool = False,
+                     no_data: bool = False):
+            row = self._entry_overview_labels.get(key)
+            if not row:
+                return
+            rt_lbl = row["realtime"]
+            st_lbl = row["status"]
+
+            if no_data:
+                rt_lbl.setText("--")
+                rt_lbl.setStyleSheet(self._status_badge_none())
+                st_lbl.setText("--")
+                st_lbl.setStyleSheet(self._status_badge_none())
+            elif passed:
+                rt_lbl.setText(value_text)
+                rt_lbl.setStyleSheet(
+                    "color: #089981; font-size: 10px; padding: 3px 4px; "
+                    "font-weight: bold; background: transparent;"
+                )
+                st_lbl.setText("✓")
+                st_lbl.setStyleSheet(self._status_badge_pass())
+            elif near:
+                rt_lbl.setText(value_text)
+                rt_lbl.setStyleSheet(
+                    "color: #FFD54F; font-size: 10px; padding: 3px 4px; "
+                    "font-weight: bold; background: transparent;"
+                )
+                st_lbl.setText("≈")
+                st_lbl.setStyleSheet(self._status_badge_near())
+            else:
+                rt_lbl.setText(value_text)
+                rt_lbl.setStyleSheet(
+                    "color: #f23645; font-size: 10px; padding: 3px 4px; "
+                    "font-weight: bold; background: transparent;"
+                )
+                st_lbl.setText("✗")
+                st_lbl.setStyleSheet(self._status_badge_fail())
+
+        # ── Update each entry condition row ──
+        # Similarity metrics (show percentage, check vs active threshold)
+        for metric_key, val, threshold in [
+            ("cosine", cosine, th_cos),
+            ("fusion", fusion, th_fus),
+            ("euclidean", euclidean, th_euc),
+            ("dtw", dtw, th_dtw),
+        ]:
+            has_data = val > 0.001
+            passed = val >= threshold
+            near_th = not passed and val >= threshold - 0.10
+            _set_row(metric_key, f"{val:.0%}", passed, near_th, no_data=not has_data)
+
+        # MACD trend gate
+        if macd_bypass:
+            _set_row("macd", "跳过", True)
+        else:
+            _set_row("macd", "就绪" if macd_ready else "未就绪", macd_ready)
+
+        # KDJ gate
+        _set_row("kdj", "就绪" if kdj_ready else "未就绪", kdj_ready)
+
+        # Bayesian win rate
+        has_bayes = bayesian_win_rate > 0.001
+        bayes_pass = bayesian_win_rate >= bayes_min
+        bayes_near = not bayes_pass and bayesian_win_rate >= bayes_min - 0.05
+        _set_row("bayesian", f"{bayesian_win_rate:.0%}", bayes_pass, bayes_near,
+                 no_data=not has_bayes)
+
+        # Position score
+        has_pos = position_score != 0.0
+        pos_pass = position_score >= pos_long
+        pos_near = not pos_pass and position_score >= pos_long - 10
+        _set_row("position", f"{position_score:+.0f}", pos_pass, pos_near,
+                 no_data=not has_pos)
+
+    def _create_pending_tab(self):
+        """创建委托单监控标签页"""
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(12, 12, 12, 12)
+        tab_layout.setSpacing(10)
+        
+        # 提示标签（美化）
         self.pending_orders_hint_label = QtWidgets.QLabel("当前无挂单")
-        self.pending_orders_hint_label.setStyleSheet("color: #888; font-size: 11px;")
-        pending_layout.addWidget(self.pending_orders_hint_label)
+        self.pending_orders_hint_label.setStyleSheet("""
+            color: #888;
+            font-size: 11px;
+            padding: 4px;
+        """)
+        tab_layout.addWidget(self.pending_orders_hint_label)
 
+        # 委托单表格（美化）
         self.pending_orders_table = QtWidgets.QTableWidget()
         self.pending_orders_table.setColumnCount(6)
         self.pending_orders_table.setHorizontalHeaderLabels(["方向", "挂单价", "数量", "状态", "剩余K线", "原型"])
@@ -681,101 +1676,460 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.pending_orders_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.pending_orders_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.pending_orders_table.setAlternatingRowColors(True)
-        self.pending_orders_table.setMinimumHeight(92)
+        self.pending_orders_table.setMinimumHeight(120)
         self.pending_orders_table.horizontalHeader().setStretchLastSection(True)
         self.pending_orders_table.setStyleSheet(f"""
             QTableWidget {{
                 background-color: {UI_CONFIG['THEME_SURFACE']};
                 color: {UI_CONFIG['THEME_TEXT']};
-                gridline-color: #444;
+                gridline-color: #3a3a3a;
                 font-size: 11px;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
             }}
             QHeaderView::section {{
-                background-color: #333;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2d2d2d, stop:1 #252525);
                 color: {UI_CONFIG['THEME_TEXT']};
-                border: 1px solid #444;
-                padding: 4px;
+                border: none;
+                border-right: 1px solid #3a3a3a;
+                border-bottom: 1px solid #3a3a3a;
+                padding: 6px 4px;
+                font-weight: bold;
+                font-size: 10px;
+            }}
+            QTableWidget::item {{
+                padding: 5px;
+                border-bottom: 1px solid #3a3a3a;
             }}
             QTableWidget::item:alternate {{
-                background-color: #2a2a2a;
+                background-color: #272727;
             }}
         """)
-        pending_layout.addWidget(self.pending_orders_table)
-        layout.addWidget(pending_group)
+        tab_layout.addWidget(self.pending_orders_table)
+        tab_layout.addStretch()
+        
+        self.tabs.addTab(tab, "📋 委托单")
+    
+    def _create_monitoring_tab(self):
+        """创建持仓监控标签页 - 5层逻辑链展示"""
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(12, 12, 12, 12)
+        tab_layout.setSpacing(8)
+        
+        # 标题
+        title_label = QtWidgets.QLabel("📊 智能推理引擎")
+        title_label.setStyleSheet("color: #007acc; font-weight: bold; font-size: 14px;")
+        tab_layout.addWidget(title_label)
 
-        # === 持仓监控与说明 (NEW) ===
-        monitor_group = QtWidgets.QGroupBox("持仓监控与说明")
-        monitor_layout = QtWidgets.QVBoxLayout(monitor_group)
+        # 持仓监控概览
+        monitoring_card = QtWidgets.QWidget()
+        monitoring_card.setStyleSheet("""
+            QWidget {
+                background-color: #252526;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+            }
+        """)
+        monitoring_layout = QtWidgets.QFormLayout(monitoring_card)
+        monitoring_layout.setContentsMargins(10, 8, 10, 8)
+        monitoring_layout.setSpacing(6)
+        monitoring_layout.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
 
-        # 添加心跳指示器到标题行
-        monitor_title_container = QtWidgets.QWidget()
-        monitor_title_layout = QtWidgets.QHBoxLayout(monitor_title_container)
-        monitor_title_layout.setContentsMargins(0, 0, 0, 0)
-        monitor_title_layout.setSpacing(5)
-        
-        monitor_title_layout.addWidget(QtWidgets.QLabel("【持仓理由】"))
-        self._heartbeat_indicators["holding"] = self._create_heartbeat_indicator()
-        monitor_title_layout.addWidget(self._heartbeat_indicators["holding"])
-        monitor_title_layout.addStretch()
-        
-        monitor_layout.addWidget(monitor_title_container)
-        
-        # 1. 为何继续持仓
-        self.hold_reason_label = QtWidgets.QLabel("未持仓")
+        self.hold_reason_label = QtWidgets.QLabel("-")
         self.hold_reason_label.setWordWrap(True)
-        self.hold_reason_label.setStyleSheet("color: #ccc; padding: 2px;")
-        monitor_layout.addWidget(self.hold_reason_label)
+        self.hold_reason_label.setStyleSheet("color: #ccc;")
+        monitoring_layout.addRow("持仓说明:", self.hold_reason_label)
 
-        # 2. 持仓警觉度 (Danger Bar)
-        monitor_layout.addWidget(QtWidgets.QLabel("【持仓警觉度】(100%触碰平仓线)"))
         self.danger_bar = QtWidgets.QProgressBar()
         self.danger_bar.setRange(0, 100)
         self.danger_bar.setValue(0)
         self.danger_bar.setTextVisible(True)
         self.danger_bar.setFormat("%p%")
-        self.danger_bar.setFixedHeight(12)
+        self.danger_bar.setFixedHeight(8)
         self.danger_bar.setStyleSheet("""
             QProgressBar {
-                border: 1px solid #444;
-                border-radius: 3px;
-                text-align: center;
-                background-color: #333;
-                color: white;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                background-color: #1e1e1e;
             }
             QProgressBar::chunk {
-                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
-                                                stop:0 #089981, stop:0.5 #FFD54F, stop:1 #f23645);
+                background-color: #f39c12;
+                border-radius: 3px;
             }
         """)
-        monitor_layout.addWidget(self.danger_bar)
+        monitoring_layout.addRow("风险等级:", self.danger_bar)
 
-        # 3. 平仓状态监控
-        monitor_layout.addWidget(QtWidgets.QLabel("【平仓预判】"))
         self.exit_monitor_label = QtWidgets.QLabel("-")
         self.exit_monitor_label.setWordWrap(True)
-        self.exit_monitor_label.setStyleSheet("color: #ef9a9a; padding: 2px;")
-        monitor_layout.addWidget(self.exit_monitor_label)
+        self.exit_monitor_label.setStyleSheet("color: #bbb;")
+        monitoring_layout.addRow("离场监控:", self.exit_monitor_label)
 
-        layout.addWidget(monitor_group)
+        tab_layout.addWidget(monitoring_card)
         
-        # === 右下事件日志 ===
-        event_group = QtWidgets.QGroupBox("实时日志")
-        event_layout = QtWidgets.QVBoxLayout(event_group)
-        self.event_log = QtWidgets.QPlainTextEdit()
-        self.event_log.setReadOnly(True)
-        self.event_log.setMaximumHeight(160)
-        self.event_log.setStyleSheet(f"""
-            QPlainTextEdit {{
-                background-color: {UI_CONFIG['THEME_SURFACE']};
-                border: 1px solid #444;
-                color: {UI_CONFIG['THEME_TEXT']};
-                font-size: 11px;
+        # 滚动区域（容纳5层卡片）
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+        """)
+        
+        scroll_content = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(10)
+        
+        # 5层推理卡片
+        self._reasoning_layer_widgets = {}
+        layer_configs = [
+            ("market_stance", "🌍", "市场态势", "#4CAF50"),
+            ("pattern_tracking", "🎯", "模式追踪", "#2196F3"),
+            ("momentum_analysis", "📈", "动量分析", "#FF9800"),
+            ("pnl_assessment", "💰", "盈亏评估", "#9C27B0"),
+            ("safety_check", "🛡️", "安全检查", "#F44336"),
+        ]
+        
+        for layer_id, icon, name, color in layer_configs:
+            layer_card = self._create_reasoning_layer_card(layer_id, icon, name, color)
+            self._reasoning_layer_widgets[layer_id] = layer_card
+            scroll_layout.addWidget(layer_card['container'])
+        
+        scroll_layout.addStretch()
+        scroll_area.setWidget(scroll_content)
+        tab_layout.addWidget(scroll_area)
+        
+        # 综合决策卡片
+        verdict_card = self._create_verdict_card()
+        self._verdict_widgets = verdict_card
+        tab_layout.addWidget(verdict_card['container'])
+        
+        # 自适应参考区域（可折叠）
+        adaptive_section = self._create_adaptive_reference_section()
+        self._adaptive_ref_widgets = adaptive_section
+        tab_layout.addWidget(adaptive_section['container'])
+        
+        self.tabs.addTab(tab, "🧠 推理")
+    
+    def _create_reasoning_layer_card(self, layer_id, icon, name, theme_color):
+        """创建单个推理层卡片"""
+        container = QtWidgets.QWidget()
+        container.setStyleSheet(f"""
+            QWidget {{
+                background-color: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
             }}
         """)
-        event_layout.addWidget(self.event_log)
-        layout.addWidget(event_group)
         
-        layout.addStretch()
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+        
+        # 顶部：图标 + 层名
+        header_layout = QtWidgets.QHBoxLayout()
+        header_layout.setSpacing(8)
+        
+        icon_label = QtWidgets.QLabel(icon)
+        icon_label.setStyleSheet("font-size: 18px;")
+        header_layout.addWidget(icon_label)
+        
+        name_label = QtWidgets.QLabel(name)
+        name_label.setStyleSheet(f"color: {theme_color}; font-weight: bold; font-size: 12px;")
+        header_layout.addWidget(name_label)
+        
+        status_badge = QtWidgets.QLabel("待评估")
+        status_badge.setStyleSheet("""
+            background-color: #555;
+            color: #ccc;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+        """)
+        header_layout.addWidget(status_badge)
+        
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+        
+        # 中部：进度条 + 摘要
+        progress_bar = QtWidgets.QProgressBar()
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(50)
+        progress_bar.setTextVisible(False)
+        progress_bar.setFixedHeight(6)
+        progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+            }}
+            QProgressBar::chunk {{
+                background-color: {theme_color};
+                border-radius: 3px;
+            }}
+        """)
+        layout.addWidget(progress_bar)
+        
+        summary_label = QtWidgets.QLabel("-")
+        summary_label.setWordWrap(True)
+        summary_label.setStyleSheet("color: #ccc; font-size: 11px;")
+        layout.addWidget(summary_label)
+        
+        # 底部：可展开的详情
+        detail_label = QtWidgets.QLabel("")
+        detail_label.setWordWrap(True)
+        detail_label.setStyleSheet("color: #888; font-size: 10px; margin-top: 4px;")
+        detail_label.setVisible(False)
+        layout.addWidget(detail_label)
+        
+        return {
+            'container': container,
+            'status_badge': status_badge,
+            'progress_bar': progress_bar,
+            'summary_label': summary_label,
+            'detail_label': detail_label,
+            'theme_color': theme_color,
+        }
+    
+    def _create_verdict_card(self):
+        """创建综合决策卡片"""
+        container = QtWidgets.QWidget()
+        container.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #1a237e, stop:1 #283593);
+                border: 2px solid #3f51b5;
+                border-radius: 8px;
+            }
+        """)
+        
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        
+        # 决策标题
+        title_label = QtWidgets.QLabel("📋 综合决策")
+        title_label.setStyleSheet("color: #90caf9; font-weight: bold; font-size: 13px;")
+        layout.addWidget(title_label)
+        
+        # 决策建议
+        verdict_label = QtWidgets.QLabel("等待持仓信号...")
+        verdict_label.setWordWrap(True)
+        verdict_label.setStyleSheet("""
+            color: #fff;
+            font-size: 12px;
+            font-weight: bold;
+            padding: 8px;
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+        """)
+        layout.addWidget(verdict_label)
+        
+        # 推荐操作
+        action_label = QtWidgets.QLabel("")
+        action_label.setWordWrap(True)
+        action_label.setStyleSheet("color: #b3e5fc; font-size: 11px;")
+        layout.addWidget(action_label)
+        
+        return {
+            'container': container,
+            'verdict_label': verdict_label,
+            'action_label': action_label,
+        }
+    
+    def _create_adaptive_reference_section(self):
+        """创建自适应参考区域"""
+        container = QtWidgets.QWidget()
+        container.setStyleSheet("""
+            QWidget {
+                background-color: #252526;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+            }
+        """)
+        
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+        
+        # 可折叠标题
+        header_layout = QtWidgets.QHBoxLayout()
+        
+        expand_btn = QtWidgets.QPushButton("▶")
+        expand_btn.setFixedSize(20, 20)
+        expand_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: none;
+                color: #888;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                color: #007acc;
+            }
+        """)
+        expand_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        header_layout.addWidget(expand_btn)
+        
+        title_label = QtWidgets.QLabel("📚 自适应学习参考")
+        title_label.setStyleSheet("color: #888; font-size: 11px; font-weight: bold;")
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        
+        layout.addLayout(header_layout)
+        
+        # 内容区域（默认隐藏）
+        content_widget = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(20, 0, 0, 0)
+        content_layout.setSpacing(6)
+        
+        # 原型历史表现
+        proto_stats_label = QtWidgets.QLabel("原型历史: -")
+        proto_stats_label.setStyleSheet("color: #aaa; font-size: 10px;")
+        content_layout.addWidget(proto_stats_label)
+        
+        # 最近调整记录
+        adjustments_label = QtWidgets.QLabel("最近调整: 无")
+        adjustments_label.setWordWrap(True)
+        adjustments_label.setStyleSheet("color: #aaa; font-size: 10px;")
+        content_layout.addWidget(adjustments_label)
+        
+        content_widget.setVisible(False)
+        layout.addWidget(content_widget)
+        
+        # 折叠/展开逻辑
+        def toggle_expand():
+            is_visible = content_widget.isVisible()
+            content_widget.setVisible(not is_visible)
+            expand_btn.setText("▼" if not is_visible else "▶")
+        
+        expand_btn.clicked.connect(toggle_expand)
+        
+        return {
+            'container': container,
+            'content_widget': content_widget,
+            'proto_stats_label': proto_stats_label,
+            'adjustments_label': adjustments_label,
+        }
+    
+    def update_reasoning_layers(self, reasoning_result=None):
+        """更新5层推理显示（根据TradeReasoning结果）"""
+        if reasoning_result is None or not hasattr(self, '_reasoning_layer_widgets'):
+            return
+        
+        # 模拟5层数据更新（实际应从reasoning_result读取）
+        layers_data = {
+            'market_stance': {
+                'status': '有利',
+                'progress': 75,
+                'summary': '市场处于强势多头，趋势明确',
+                'detail': 'EMA短期上扬，ADX > 25显示趋势力量强劲',
+            },
+            'pattern_tracking': {
+                'status': '对齐',
+                'progress': 85,
+                'summary': '当前形态与原型高度匹配（相似度85%）',
+                'detail': '过去3根K线相似度保持在80%以上，形态稳定',
+            },
+            'momentum_analysis': {
+                'status': '加强中',
+                'progress': 70,
+                'summary': 'MACD柱状图扩张，KDJ J线上行',
+                'detail': 'MACD斜率+2.3/bar，KDJ J从65升至72',
+            },
+            'pnl_assessment': {
+                'status': '良好',
+                'progress': 80,
+                'summary': '当前利润+2.3%，距峰值回撤10%',
+                'detail': '风险回报比 (TP-curr)/(curr-SL) = 2.1，利润/K线 = 0.05%',
+            },
+            'safety_check': {
+                'status': '安全',
+                'progress': 90,
+                'summary': '距止损2.5 ATR，保证金使用50%',
+                'detail': 'ATR稳定，未见扩张迹象',
+            },
+        }
+        
+        for layer_id, data in layers_data.items():
+            if layer_id in self._reasoning_layer_widgets:
+                widgets = self._reasoning_layer_widgets[layer_id]
+                
+                # 更新状态徽章
+                status = data['status']
+                if status in ['有利', '对齐', '加强中', '良好', '安全']:
+                    badge_color = '#4CAF50'
+                elif status in ['中性', '漂移', '维持', '可接受', '注意']:
+                    badge_color = '#FF9800'
+                else:
+                    badge_color = '#F44336'
+                
+                widgets['status_badge'].setText(status)
+                widgets['status_badge'].setStyleSheet(f"""
+                    background-color: {badge_color};
+                    color: white;
+                    padding: 2px 8px;
+                    border-radius: 10px;
+                    font-size: 10px;
+                    font-weight: bold;
+                """)
+                
+                # 更新进度条
+                widgets['progress_bar'].setValue(data['progress'])
+                
+                # 更新摘要
+                widgets['summary_label'].setText(data['summary'])
+                
+                # 更新详情
+                widgets['detail_label'].setText(data['detail'])
+        
+        # 更新综合决策
+        if hasattr(self, '_verdict_widgets'):
+            self._verdict_widgets['verdict_label'].setText(
+                "持续持仓 (Hold Firm) - 形态稳定，动能强劲"
+            )
+            self._verdict_widgets['action_label'].setText(
+                "建议: 保持当前仓位，密切关注动量衰减信号"
+            )
+        
+        # 更新自适应参考
+        if hasattr(self, '_adaptive_ref_widgets'):
+            self._adaptive_ref_widgets['proto_stats_label'].setText(
+                "原型历史: Proto_LONG_05 | 匹配12次 | 胜率67% | 平均+1.8%"
+            )
+            self._adaptive_ref_widgets['adjustments_label'].setText(
+                "最近调整: STOP_LOSS_ATR +0.2 (1小时前) | 理由: 反事实分析显示更宽止损可避免过早止损"
+            )
+
+    def _create_log_tab(self):
+        """创建实时日志标签页"""
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
+        
+        # 实时日志（使用等宽字体，美化边框）
+        self.event_log = QtWidgets.QPlainTextEdit()
+        self.event_log.setReadOnly(True)
+        self.event_log.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: #1e1e1e;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+                color: #e0e0e0;
+                font-family: 'Consolas', 'Courier New', 'Monospace';
+                font-size: 11px;
+                padding: 6px;
+                selection-background-color: #4a4a4a;
+            }}
+        """)
+        tab_layout.addWidget(self.event_log)
+        
+        self.tabs.addTab(tab, "📝 日志")
+    
     
     def update_position(self, order):
         """更新持仓显示"""
@@ -847,7 +2201,15 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                                 macd_ready: bool = False,
                                 kdj_ready: bool = False,
                                 bayesian_win_rate: float = 0.0,
-                                kelly_position_pct: float = 0.0):
+                                kelly_position_pct: float = 0.0,
+                                position_score: float = 0.0,
+                                # 【指纹3D图】多维相似度分解
+                                cosine_similarity: float = 0.0,
+                                euclidean_similarity: float = 0.0,
+                                dtw_similarity: float = 0.0,
+                                prototype_confidence: float = 0.0,
+                                final_match_score: float = 0.0,
+                                cold_start_active: bool = False):
         """更新匹配状态和因果说明"""
         # 触发心跳
         self._trigger_heartbeat("market")
@@ -946,6 +2308,71 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.entry_threshold_label.setText(f"{entry_threshold:.0%}")
             self.entry_threshold_label.setStyleSheet("color: #888;")
         
+        # 【指纹3D图】更新多维相似度分解显示（未达标时也显示当前值，便于观察）
+        cos_v = max(0.0, float(cosine_similarity or 0.0))
+        euc_v = max(0.0, float(euclidean_similarity or 0.0))
+        dtw_v = max(0.0, float(dtw_similarity or 0.0))
+        conf_v = max(0.0, float(prototype_confidence or 0.0))
+
+        self.cos_sim_badge.setText(f"方向: {cos_v:.0%}")
+        self.cos_sim_badge.setStyleSheet(self._similarity_badge_style(self._get_similarity_color(cos_v)))
+        self.euc_sim_badge.setText(f"距离: {euc_v:.0%}")
+        self.euc_sim_badge.setStyleSheet(self._similarity_badge_style(self._get_similarity_color(euc_v)))
+        self.dtw_sim_badge.setText(f"形态: {dtw_v:.0%}")
+        self.dtw_sim_badge.setStyleSheet(self._similarity_badge_style(self._get_similarity_color(dtw_v)))
+
+        # 原型置信度
+        if conf_v > 0:
+            conf_color = self._get_confidence_color(conf_v)
+            conf_level = self._get_confidence_level(conf_v)
+            self.confidence_label.setText(f"{conf_v:.1%}")
+            self.confidence_label.setStyleSheet(f"color: {conf_color}; font-weight: bold; font-size: 12px;")
+            self.confidence_level_badge.setText(conf_level)
+
+            # 置信度等级徽章着色
+            if conf_level == "高":
+                badge_style = """
+                    QLabel {
+                        color: #00E676;
+                        background-color: rgba(0, 230, 118, 0.15);
+                        border: 1px solid #00E676;
+                        border-radius: 3px;
+                        padding: 0px 4px;
+                        font-size: 9px;
+                        font-weight: bold;
+                    }
+                """
+            elif conf_level == "中":
+                badge_style = """
+                    QLabel {
+                        color: #FFD700;
+                        background-color: rgba(255, 215, 0, 0.15);
+                        border: 1px solid #FFD700;
+                        border-radius: 3px;
+                        padding: 0px 4px;
+                        font-size: 9px;
+                        font-weight: bold;
+                    }
+                """
+            else:
+                badge_style = """
+                    QLabel {
+                        color: #f23645;
+                        background-color: rgba(242, 54, 69, 0.15);
+                        border: 1px solid #f23645;
+                        border-radius: 3px;
+                        padding: 0px 4px;
+                        font-size: 9px;
+                        font-weight: bold;
+                    }
+                """
+            self.confidence_level_badge.setStyleSheet(badge_style)
+            self.confidence_level_badge.show()
+        else:
+            self.confidence_label.setText("0.0%")
+            self.confidence_label.setStyleSheet("color: #888; font-weight: bold; font-size: 12px;")
+            self.confidence_level_badge.hide()
+        
         # 更新贝叶斯胜率
         if bayesian_win_rate > 0:
             self.bayesian_win_rate_label.setText(f"{bayesian_win_rate:.1%}")
@@ -961,7 +2388,33 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.bayesian_win_rate_label.setText("-")
             self.bayesian_win_rate_label.setStyleSheet("color: #888; font-weight: bold; font-size: 13px;")
         
+        # 空间位置评分显示
+        self.position_score_label.setText(f"{position_score:+.0f}" if position_score != 0 else "-")
+        if position_score > 40:
+            self.position_score_label.setStyleSheet("color: #00E676; font-weight: bold;")
+        elif position_score > 0:
+            self.position_score_label.setStyleSheet("color: #66BB6A; font-weight: bold;")
+        elif position_score < -20:
+            self.position_score_label.setStyleSheet("color: #f23645; font-weight: bold;")
+        elif position_score < 0:
+            self.position_score_label.setStyleSheet("color: #EF9A9A; font-weight: bold;")
+        else:
+            self.position_score_label.setStyleSheet("color: #888; font-weight: bold;")
+        
         self.reason_label.setText(reason or "-")
+
+        # ── 开仓条件总览卡片实时刷新 ──
+        self._update_entry_overview(
+            cosine=float(cosine_similarity or 0.0),
+            fusion=float(matched_similarity or 0.0),
+            euclidean=float(euclidean_similarity or 0.0),
+            dtw=float(dtw_similarity or 0.0),
+            macd_ready=macd_ready,
+            kdj_ready=kdj_ready,
+            bayesian_win_rate=float(bayesian_win_rate or 0.0),
+            position_score=float(position_score or 0.0),
+            cold_start_active=cold_start_active,
+        )
 
     def update_pending_orders(self, pending_orders: List[dict]):
         """更新委托单监控表（挂单中）"""
@@ -1024,6 +2477,64 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                 min-width: 45px;
             }}
         """
+    
+    def _similarity_badge_style(self, color: str) -> str:
+        """生成相似度徽章样式"""
+        rgb_str = self._hex_to_rgb_str(color)
+        return f"""
+            QLabel {{
+                background-color: rgba({rgb_str}, 0.15);
+                color: {color};
+                border: 1px solid {color};
+                border-radius: 3px;
+                padding: 1px 4px;
+                font-size: 10px;
+                font-weight: bold;
+            }}
+        """
+    
+    @staticmethod
+    def _hex_to_rgb_str(hex_color: str) -> str:
+        """将 #RRGGBB 转换为 'R, G, B' 字符串（用于 rgba()）"""
+        h = hex_color.lstrip('#')
+        if len(h) != 6:
+            return "136, 136, 136"
+        return f"{int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}"
+    
+    def _get_similarity_color(self, value: float) -> str:
+        """根据相似度值获取颜色"""
+        if value >= 0.80:
+            return "#00E676"  # 亮绿
+        elif value >= 0.70:
+            return "#089981"  # 绿
+        elif value >= 0.60:
+            return "#FFD54F"  # 黄
+        elif value >= 0.50:
+            return "#FF9800"  # 橙
+        else:
+            return "#f23645"  # 红
+    
+    def _get_confidence_color(self, confidence: float) -> str:
+        """根据置信度获取颜色"""
+        if confidence >= 0.70:
+            return "#00E676"  # 亮绿 - 高置信度
+        elif confidence >= 0.50:
+            return "#FFD700"  # 金色 - 中置信度
+        elif confidence >= 0.30:
+            return "#FF9800"  # 橙色 - 低置信度
+        else:
+            return "#f23645"  # 红色 - 极低置信度
+    
+    def _get_confidence_level(self, confidence: float) -> str:
+        """获取置信度等级描述"""
+        if confidence >= 0.70:
+            return "高"
+        elif confidence >= 0.50:
+            return "中"
+        elif confidence >= 0.30:
+            return "低"
+        else:
+            return "极低"
     
     def _create_heartbeat_indicator(self) -> QtWidgets.QLabel:
         """创建心跳指示器（圆点）"""
@@ -1552,6 +3063,630 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         self._update_empty_state()
 
 
+class RejectionLogCard(QtWidgets.QWidget):
+    """
+    拒绝记录卡片面板 —— 显示被门控拦截的交易信号及其事后评估。
+
+    展示内容：
+    - 最近 20 条拒绝记录（滚动列表），每条包含时间、方向、门控代码（色标徽章）、价格、详情
+    - 评估完成后显示绿色✓（正确拒绝）或红色✗（错误拒绝）+ 价格结果
+    - 底部汇总：每个门控的准确率柱状图
+    - "建议调整" 按钮（展示门控调参建议，需手动确认）
+    """
+
+    # 门控代码 → 色标
+    FAIL_CODE_COLORS = {
+        "BLOCK_POS":       "#FF9800",   # orange
+        "BLOCK_MACD":      "#F44336",   # red
+        "BLOCK_BAYES":     "#9C27B0",   # purple
+        "BLOCK_KELLY_NEG": "#673AB7",   # deep purple
+        "FLIP_NO_MATCH":   "#FFC107",   # yellow
+        "BLOCK_REGIME_UNKNOWN": "#607D8B",  # blue gray
+        "BLOCK_REGIME_CONFLICT": "#795548", # brown
+    }
+
+    # 门控代码 → 中文标签
+    FAIL_CODE_LABELS = {
+        "BLOCK_POS":       "位置过滤",
+        "BLOCK_MACD":      "MACD门控",
+        "BLOCK_BAYES":     "贝叶斯过滤",
+        "BLOCK_KELLY_NEG": "凯利否决",
+        "FLIP_NO_MATCH":   "无匹配",
+        "BLOCK_REGIME_UNKNOWN": "市场未知",
+        "BLOCK_REGIME_CONFLICT": "方向冲突",
+    }
+
+    # 信号：请求显示门控调参建议（detail dict list）
+    suggest_adjustments_requested = QtCore.pyqtSignal()
+    # 信号：用户确认应用某个阈值调整 (param_key, new_value)
+    adjustment_confirmed = QtCore.pyqtSignal(str, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rejections: List[Dict] = []      # 最近拒绝记录
+        self._gate_scores: Dict[str, Dict] = {}  # fail_code → {correct, wrong, accuracy, ...}
+        self._suggestions: List[Dict] = []      # 当前调整建议
+        self._init_ui()
+
+    # ------------------------------------------------------------------
+    # UI 初始化
+    # ------------------------------------------------------------------
+    def _init_ui(self):
+        self.setStyleSheet(f"""
+            QWidget {{
+                background-color: {UI_CONFIG['THEME_BACKGROUND']};
+                color: {UI_CONFIG['THEME_TEXT']};
+            }}
+        """)
+
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # ── 主容器 GroupBox ──
+        group = QtWidgets.QGroupBox("拒绝记录")
+        group.setStyleSheet(f"""
+            QGroupBox {{
+                border: 1px solid #444;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+                color: {UI_CONFIG['THEME_TEXT']};
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        group_layout = QtWidgets.QVBoxLayout(group)
+        group_layout.setContentsMargins(8, 14, 8, 8)
+        group_layout.setSpacing(6)
+
+        # ── 顶部：统计摘要行 ──
+        summary_row = QtWidgets.QHBoxLayout()
+        summary_row.setSpacing(8)
+
+        self._total_label = QtWidgets.QLabel("总拒绝: 0")
+        self._total_label.setStyleSheet("color: #888; font-size: 11px;")
+        summary_row.addWidget(self._total_label)
+
+        self._evaluated_label = QtWidgets.QLabel("已评估: 0")
+        self._evaluated_label.setStyleSheet("color: #888; font-size: 11px;")
+        summary_row.addWidget(self._evaluated_label)
+
+        summary_row.addStretch()
+
+        self._suggest_btn = QtWidgets.QPushButton("建议调整")
+        self._suggest_btn.setFixedHeight(22)
+        self._suggest_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {UI_CONFIG['THEME_ACCENT']};
+                color: white;
+                border: none;
+                border-radius: 3px;
+                padding: 2px 10px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{
+                background-color: #0098ff;
+            }}
+            QPushButton:disabled {{
+                background-color: #444;
+                color: #888;
+            }}
+        """)
+        self._suggest_btn.setToolTip(
+            "根据拒绝评估结果，给出门控阈值调整建议（需手动确认）\n"
+            "需至少 20 次评估才会产生建议"
+        )
+        self._suggest_btn.setEnabled(False)
+        self._suggest_btn.clicked.connect(self._on_suggest_clicked)
+        summary_row.addWidget(self._suggest_btn)
+
+        self._suggest_status_label = QtWidgets.QLabel("")
+        self._suggest_status_label.setStyleSheet("color: #888; font-size: 10px;")
+        summary_row.addWidget(self._suggest_status_label)
+
+        group_layout.addLayout(summary_row)
+
+        # ── 中部：拒绝记录滚动列表 ──
+        self._scroll = QtWidgets.QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet(f"""
+            QScrollArea {{
+                border: none;
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+            }}
+        """)
+
+        self._list_container = QtWidgets.QWidget()
+        self._list_layout = QtWidgets.QVBoxLayout(self._list_container)
+        self._list_layout.setContentsMargins(4, 4, 4, 4)
+        self._list_layout.setSpacing(4)
+        self._list_layout.addStretch()  # 底部弹性空间
+
+        # 空状态提示
+        self._empty_label = QtWidgets.QLabel("暂无拒绝记录\n系统运行后，被门控拦截的信号将显示在此处")
+        self._empty_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setStyleSheet("color: #666; font-size: 11px; padding: 20px;")
+        self._list_layout.insertWidget(0, self._empty_label)
+
+        self._scroll.setWidget(self._list_container)
+        group_layout.addWidget(self._scroll, stretch=1)
+
+        # ── 底部：门控准确率柱状条 ──
+        self._accuracy_container = QtWidgets.QWidget()
+        accuracy_layout = QtWidgets.QVBoxLayout(self._accuracy_container)
+        accuracy_layout.setContentsMargins(0, 4, 0, 0)
+        accuracy_layout.setSpacing(3)
+
+        accuracy_title = QtWidgets.QLabel("门控准确率")
+        accuracy_title.setStyleSheet("color: #aaa; font-size: 10px; font-weight: bold;")
+        accuracy_layout.addWidget(accuracy_title)
+
+        self._accuracy_bars: Dict[str, QtWidgets.QProgressBar] = {}
+        self._accuracy_labels: Dict[str, QtWidgets.QLabel] = {}
+        for code in self.FAIL_CODE_COLORS:
+            bar_row = QtWidgets.QHBoxLayout()
+            bar_row.setSpacing(4)
+
+            label = QtWidgets.QLabel(self.FAIL_CODE_LABELS.get(code, code))
+            label.setFixedWidth(68)
+            label.setStyleSheet(f"color: {self.FAIL_CODE_COLORS[code]}; font-size: 10px;")
+            bar_row.addWidget(label)
+
+            bar = QtWidgets.QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(True)
+            bar.setFormat("%p%")
+            bar.setFixedHeight(12)
+            color = self.FAIL_CODE_COLORS[code]
+            bar.setStyleSheet(f"""
+                QProgressBar {{
+                    border: 1px solid #444;
+                    border-radius: 3px;
+                    text-align: center;
+                    background-color: #333;
+                    color: white;
+                    font-size: 9px;
+                }}
+                QProgressBar::chunk {{
+                    background-color: {color};
+                    border-radius: 2px;
+                }}
+            """)
+            bar_row.addWidget(bar, stretch=1)
+
+            count_label = QtWidgets.QLabel("0/0")
+            count_label.setFixedWidth(36)
+            count_label.setStyleSheet("color: #888; font-size: 9px;")
+            count_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            bar_row.addWidget(count_label)
+
+            accuracy_layout.addLayout(bar_row)
+            self._accuracy_bars[code] = bar
+            self._accuracy_labels[code] = count_label
+
+        self._accuracy_container.setVisible(False)  # 有数据时才显示
+        group_layout.addWidget(self._accuracy_container)
+
+        root_layout.addWidget(group)
+
+    # ------------------------------------------------------------------
+    # 公共方法 —— 供引擎/主窗口调用
+    # ------------------------------------------------------------------
+    def update_rejections(self, rejections: List[Dict]):
+        """
+        用新的拒绝记录列表刷新卡片。
+
+        每个 dict 预期字段：
+            timestamp (str)          – 可读时间 "HH:MM:SS"
+            direction (str)          – "LONG" / "SHORT"
+            fail_code (str)          – "BLOCK_POS" 等
+            price (float)            – 拒绝时价格
+            detail_summary (str)     – 关键参数摘要（如 "slope=-0.003"）
+            evaluated (bool)         – 是否已评估
+            was_correct (bool|None)  – 评估结论
+            price_move_pct (float|None) – 价格变动 %
+        """
+        self._rejections = list(rejections or [])
+        self._rebuild_rejection_list()
+
+    def update_gate_scores(self, gate_scores: Dict[str, Dict]):
+        """
+        刷新门控准确率汇总。
+
+        gate_scores: {fail_code: {correct_count, wrong_count, accuracy, ...}}
+        """
+        self._gate_scores = dict(gate_scores or {})
+        self._refresh_accuracy_bars()
+
+    def add_rejection(self, rec: Dict):
+        """追加单条拒绝记录（最多保留 20 条，FIFO）"""
+        self._rejections.append(rec)
+        if len(self._rejections) > 20:
+            self._rejections = self._rejections[-20:]
+        self._rebuild_rejection_list()
+
+    def set_suggestions(self, suggestions: List[Dict]):
+        """
+        设置当前调整建议。
+
+        由外部（引擎/主窗口）调用，传入 RejectionTracker.suggest_threshold_adjustments() 的结果。
+        每个 dict 包含: fail_code, param_key, action, action_text, label,
+                        current_value, suggested_value, accuracy, reason
+        """
+        self._suggestions = list(suggestions or [])
+        # 有建议时启用按钮（即使评估次数不到20，只要有建议就可点击）
+        if self._suggestions:
+            self._suggest_btn.setEnabled(True)
+            self._suggest_btn.setToolTip(
+                f"有 {len(self._suggestions)} 项调整建议可审核\n点击查看详情并手动确认"
+            )
+
+    def clear(self):
+        """清空所有拒绝记录和准确率"""
+        self._rejections.clear()
+        self._gate_scores.clear()
+        self._suggestions.clear()
+        self._rebuild_rejection_list()
+        self._refresh_accuracy_bars()
+
+    # ------------------------------------------------------------------
+    # 内部方法
+    # ------------------------------------------------------------------
+    def _on_suggest_clicked(self):
+        """建议调整按钮点击 → 弹出手动确认对话框"""
+        # 也触发外部信号（兼容旧流程：如果外部需要先刷新建议再打开对话框）
+        self.suggest_adjustments_requested.emit()
+
+        if not self._suggestions:
+            self._suggest_status_label.setText("暂无建议")
+            self._suggest_status_label.setStyleSheet("color: #888; font-size: 10px;")
+            QtWidgets.QMessageBox.information(
+                self,
+                "暂无调整建议",
+                "当前没有门控阈值调整建议。\n\n"
+                "可能的原因：\n"
+                "  · 评估次数不足（需至少 20 次）\n"
+                "  · 门控准确率处于正常范围（40%~80%）\n"
+                "  · 参数已在边界值",
+            )
+            return
+
+        # 弹出手动确认对话框
+        dialog = _AdjustmentConfirmDialog(self._suggestions, self)
+        result = dialog.exec()
+
+        if result == QtWidgets.QDialog.DialogCode.Accepted:
+            accepted = dialog.get_accepted_adjustments()
+            applied_count = 0
+            for adj in accepted:
+                self.adjustment_confirmed.emit(adj["param_key"], adj["suggested_value"])
+                applied_count += 1
+
+            if applied_count > 0:
+                self._suggest_status_label.setText(f"已应用 {applied_count} 项")
+                self._suggest_status_label.setStyleSheet("color: #089981; font-size: 10px;")
+            else:
+                self._suggest_status_label.setText("未选择")
+                self._suggest_status_label.setStyleSheet("color: #888; font-size: 10px;")
+        else:
+            self._suggest_status_label.setText("已取消")
+            self._suggest_status_label.setStyleSheet("color: #888; font-size: 10px;")
+
+    def _rebuild_rejection_list(self):
+        """重建拒绝记录卡片列表"""
+        # 移除旧条目（保留最后的 stretch）
+        while self._list_layout.count() > 1:
+            item = self._list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        total = len(self._rejections)
+        evaluated = sum(1 for r in self._rejections if r.get("evaluated"))
+
+        self._total_label.setText(f"总拒绝: {total}")
+        self._evaluated_label.setText(f"已评估: {evaluated}")
+
+        if total == 0:
+            # 显示空状态
+            empty = QtWidgets.QLabel("暂无拒绝记录\n系统运行后，被门控拦截的信号将显示在此处")
+            empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet("color: #666; font-size: 11px; padding: 20px;")
+            self._list_layout.insertWidget(0, empty)
+            self._suggest_btn.setEnabled(False)
+            return
+
+        # 逆序展示（最新在上方）
+        for rec in reversed(self._rejections):
+            card = self._create_rejection_card(rec)
+            self._list_layout.insertWidget(self._list_layout.count() - 1, card)
+
+        self._suggest_btn.setEnabled(evaluated >= 20 or bool(self._suggestions))
+
+    def _create_rejection_card(self, rec: Dict) -> QtWidgets.QFrame:
+        """为单条拒绝记录创建一个迷你卡片 widget"""
+        card = QtWidgets.QFrame()
+        card.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        card.setStyleSheet(f"""
+            QFrame {{
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                padding: 4px;
+            }}
+        """)
+
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setContentsMargins(6, 4, 6, 4)
+        card_layout.setSpacing(2)
+
+        # ── 第一行：时间 | 方向 | 门控徽章 | 评估结果 ──
+        row1 = QtWidgets.QHBoxLayout()
+        row1.setSpacing(6)
+
+        # 时间（优先使用可读字符串）
+        ts = rec.get("timestamp_str") or rec.get("timestamp", "-")
+        # 如果是完整日期时间字符串，只显示时分秒
+        ts_display = str(ts)
+        if len(ts_display) > 10 and " " in ts_display:
+            ts_display = ts_display.split(" ")[-1]  # "HH:MM:SS"
+        time_lbl = QtWidgets.QLabel(ts_display)
+        time_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        row1.addWidget(time_lbl)
+
+        # 方向
+        direction = rec.get("direction", "-")
+        dir_lbl = QtWidgets.QLabel(direction)
+        dir_color = "#089981" if direction == "LONG" else "#f23645"
+        dir_lbl.setStyleSheet(f"color: {dir_color}; font-weight: bold; font-size: 10px;")
+        row1.addWidget(dir_lbl)
+
+        # 门控徽章
+        fail_code = rec.get("fail_code", "")
+        badge_color = self.FAIL_CODE_COLORS.get(fail_code, "#888")
+        badge_text = self.FAIL_CODE_LABELS.get(fail_code, fail_code)
+        badge = QtWidgets.QLabel(badge_text)
+        badge.setStyleSheet(f"""
+            QLabel {{
+                background-color: rgba({self._hex_to_rgb_str(badge_color)}, 0.2);
+                color: {badge_color};
+                border: 1px solid {badge_color};
+                border-radius: 3px;
+                padding: 0px 4px;
+                font-size: 9px;
+                font-weight: bold;
+            }}
+        """)
+        badge.setToolTip(f"门控代码: {fail_code}")
+        row1.addWidget(badge)
+
+        row1.addStretch()
+
+        # 评估结果
+        if rec.get("evaluated"):
+            was_correct = rec.get("was_correct")
+            move_pct = rec.get("price_move_pct", 0.0)
+            if was_correct:
+                eval_lbl = QtWidgets.QLabel(f"✓ {move_pct:+.2f}%")
+                eval_lbl.setStyleSheet("color: #089981; font-size: 10px; font-weight: bold;")
+                eval_lbl.setToolTip("正确拒绝（避免了亏损）")
+            else:
+                eval_lbl = QtWidgets.QLabel(f"✗ {move_pct:+.2f}%")
+                eval_lbl.setStyleSheet("color: #f23645; font-size: 10px; font-weight: bold;")
+                eval_lbl.setToolTip("错误拒绝（错过了盈利机会）")
+            row1.addWidget(eval_lbl)
+
+        card_layout.addLayout(row1)
+
+        # ── 第二行：价格 + 详情摘要 ──
+        row2 = QtWidgets.QHBoxLayout()
+        row2.setSpacing(6)
+
+        price = rec.get("price_at_rejection") or rec.get("price", 0.0)
+        price_lbl = QtWidgets.QLabel(f"${price:,.2f}" if price else "-")
+        price_lbl.setStyleSheet("color: #ccc; font-size: 10px;")
+        row2.addWidget(price_lbl)
+
+        # 详情摘要：从 detail dict 提取关键信息
+        detail_dict = rec.get("detail", {})
+        detail_summary = rec.get("detail_summary", "")
+        if not detail_summary and isinstance(detail_dict, dict) and detail_dict:
+            # 自动生成摘要
+            parts = []
+            if "pos_score" in detail_dict:
+                parts.append(f"评分={detail_dict['pos_score']:.0f}")
+            if "slope" in detail_dict:
+                parts.append(f"斜率={detail_dict['slope']:+.4f}")
+            if "similarity" in detail_dict:
+                parts.append(f"匹配={detail_dict['similarity']:.1%}")
+            detail_summary = " | ".join(parts) if parts else ""
+        if detail_summary:
+            detail_lbl = QtWidgets.QLabel(str(detail_summary))
+            detail_lbl.setStyleSheet("color: #777; font-size: 9px;")
+            detail_lbl.setToolTip(str(detail_dict or detail_summary))
+            # 截断过长文本
+            if len(str(detail_summary)) > 40:
+                detail_lbl.setText(str(detail_summary)[:40] + "...")
+            row2.addWidget(detail_lbl)
+
+        row2.addStretch()
+        card_layout.addLayout(row2)
+
+        return card
+
+    def _refresh_accuracy_bars(self):
+        """刷新底部门控准确率柱状条"""
+        has_data = False
+        for code, bar in self._accuracy_bars.items():
+            score = self._gate_scores.get(code, {})
+            correct = score.get("correct_count", 0)
+            wrong = score.get("wrong_count", 0)
+            total = correct + wrong
+            if total > 0:
+                has_data = True
+                accuracy = int(score.get("accuracy", correct / total) * 100)
+                bar.setValue(accuracy)
+                self._accuracy_labels[code].setText(f"{correct}/{total}")
+            else:
+                bar.setValue(0)
+                self._accuracy_labels[code].setText("0/0")
+
+        self._accuracy_container.setVisible(has_data)
+
+    @staticmethod
+    def _hex_to_rgb_str(hex_color: str) -> str:
+        """将 #RRGGBB 转换为 'R, G, B' 字符串（用于 rgba()）"""
+        h = hex_color.lstrip('#')
+        if len(h) != 6:
+            return "136, 136, 136"
+        return f"{int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}"
+
+
+class _AdjustmentConfirmDialog(QtWidgets.QDialog):
+    """
+    阈值调整确认对话框
+
+    显示所有建议项，用户逐项勾选确认后应用。
+    调整仅影响运行时配置，不写入文件。
+    """
+
+    def __init__(self, suggestions: List[dict], parent=None):
+        super().__init__(parent)
+        self._suggestions = suggestions
+        self._checkboxes: List[QtWidgets.QCheckBox] = []
+        self._init_ui()
+
+    def _init_ui(self):
+        self.setWindowTitle("门控阈值调整建议")
+        self.setMinimumWidth(480)
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {UI_CONFIG['THEME_BACKGROUND']};
+                color: {UI_CONFIG['THEME_TEXT']};
+            }}
+            QLabel {{
+                color: {UI_CONFIG['THEME_TEXT']};
+            }}
+            QCheckBox {{
+                color: {UI_CONFIG['THEME_TEXT']};
+                spacing: 8px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+            }}
+        """)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # 警告标题
+        warning = QtWidgets.QLabel(
+            "⚠️ 以下调整基于门控拒绝后的价格走势统计。\n"
+            "请仔细审查后勾选要应用的调整项。调整仅影响当前运行时配置。"
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet(
+            "color: #FFD54F; font-size: 11px; padding: 8px; "
+            "background-color: rgba(255,213,79,0.1); "
+            "border: 1px solid #FFD54F; border-radius: 4px;"
+        )
+        layout.addWidget(warning)
+
+        # 建议列表
+        for i, sug in enumerate(self._suggestions):
+            frame = QtWidgets.QFrame()
+            frame.setStyleSheet("""
+                QFrame {
+                    background-color: #2a2a2a;
+                    border: 1px solid #3a3a3a;
+                    border-radius: 4px;
+                    padding: 4px;
+                }
+            """)
+            f_layout = QtWidgets.QVBoxLayout(frame)
+            f_layout.setContentsMargins(8, 6, 8, 6)
+            f_layout.setSpacing(4)
+
+            # 勾选框 + 参数名
+            action_color = "#FF9800" if sug.get("action") == "loosen" else "#4CAF50"
+            action_text = sug.get("action_text", sug.get("action", ""))
+            cb = QtWidgets.QCheckBox(f"{sug.get('label', sug.get('param_key', ''))}  ({action_text})")
+            cb.setStyleSheet(f"font-weight: bold; font-size: 12px; color: {action_color};")
+            f_layout.addWidget(cb)
+            self._checkboxes.append(cb)
+
+            # 详情
+            accuracy = sug.get("accuracy", 0)
+            detail = QtWidgets.QLabel(
+                f"参数: {sug.get('param_key', '')}\n"
+                f"当前值: {sug.get('current_value', '')}  →  建议值: {sug.get('suggested_value', '')}\n"
+                f"门控准确率: {accuracy:.0%}\n"
+                f"原因: {sug.get('reason', '')}"
+            )
+            detail.setStyleSheet("color: #bbb; font-size: 10px; padding-left: 24px;")
+            detail.setWordWrap(True)
+            f_layout.addWidget(detail)
+
+            layout.addWidget(frame)
+
+        # 按钮
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.addStretch()
+
+        cancel_btn = QtWidgets.QPushButton("取消")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #444;
+                color: #ccc;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 20px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #555;
+            }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        apply_btn = QtWidgets.QPushButton("应用选中的调整")
+        apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #089981;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 20px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0ab090;
+            }
+        """)
+        apply_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(apply_btn)
+
+        layout.addLayout(btn_layout)
+
+    def get_accepted_adjustments(self) -> List[dict]:
+        """获取用户勾选的调整项"""
+        result = []
+        for i, cb in enumerate(self._checkboxes):
+            if cb.isChecked():
+                result.append(self._suggestions[i])
+        return result
+
+
 class PaperTradingTab(QtWidgets.QWidget):
     """模拟交易标签页"""
     
@@ -1566,27 +3701,48 @@ class PaperTradingTab(QtWidgets.QWidget):
             }}
         """)
         
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
+        # 使用 QSplitter 让左/中/右三栏可拖拽调整宽度
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
+        splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #444;
+                width: 6px;
+                border-radius: 2px;
+            }
+            QSplitter::handle:hover {
+                background-color: #089981;
+            }
+        """)
         
         # 左侧：控制面板
         self.control_panel = PaperTradingControlPanel()
-        layout.addWidget(self.control_panel)
+        self.control_panel.setMinimumWidth(260)
+        splitter.addWidget(self.control_panel)
         
-        # 中间区域
-        center_widget = QtWidgets.QWidget()
-        center_layout = QtWidgets.QVBoxLayout(center_widget)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(5)
+        # 中间区域：使用垂直 QSplitter 让用户可调整图表和交易记录大小
+        center_vertical_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        center_vertical_splitter.setChildrenCollapsible(False)
+        center_vertical_splitter.setHandleWidth(6)
+        center_vertical_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #444;
+                height: 6px;
+                border-radius: 2px;
+            }
+            QSplitter::handle:hover {
+                background-color: #089981;
+            }
+        """)
         
         # K线图（使用现有的ChartWidget）—— 占主要空间
         from ui.chart_widget import ChartWidget
         self.chart_widget = ChartWidget()
         self.chart_widget.setMinimumHeight(350)
-        center_layout.addWidget(self.chart_widget, stretch=4)
+        center_vertical_splitter.addWidget(self.chart_widget)
         
-        # 交易记录
+        # 底部区域：交易记录（全宽）
         trade_group = QtWidgets.QGroupBox("交易记录")
         trade_group.setStyleSheet(f"""
             QGroupBox {{
@@ -1602,14 +3758,31 @@ class PaperTradingTab(QtWidgets.QWidget):
         self.trade_log = PaperTradingTradeLog()
         trade_layout.addWidget(self.trade_log)
         trade_group.setMinimumHeight(120)
+        center_vertical_splitter.addWidget(trade_group)
         
-        center_layout.addWidget(trade_group, stretch=1)
+        # 设置垂直分割器初始比例：图表 600px，交易记录 200px
+        center_vertical_splitter.setSizes([600, 200])
+        center_vertical_splitter.setMinimumWidth(300)
+        splitter.addWidget(center_vertical_splitter)
         
-        layout.addWidget(center_widget, stretch=1)
-        
-        # 右侧：状态面板
+        # 右侧：状态面板（可拖拽拉宽）
         self.status_panel = PaperTradingStatusPanel()
-        layout.addWidget(self.status_panel)
+        splitter.addWidget(self.status_panel)
+        
+        # 将账户设置与统计移动到持仓页
+        if hasattr(self.control_panel, "account_group"):
+            self.status_panel.attach_account_group(self.control_panel.account_group)
+        
+        # 初始比例约 左:中:右 = 1:4:1.2，右侧给够宽避免被挤扁
+        splitter.setSizes([280, 600, 380])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(0)
+        layout.addWidget(splitter)
     
     def load_historical_trades(self, trades: List):
         """加载历史交易记录到界面"""

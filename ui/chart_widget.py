@@ -1201,10 +1201,101 @@ class ChartWidget(QtWidgets.QWidget):
         self.candle_plot.autoRange()
         self.volume_plot.autoRange()
     
+    def _format_similarity_label(self, label: str, similarity: float, 
+                                  similarity_breakdown: dict = None,
+                                  n_members: int = None) -> tuple:
+        """
+        格式化相似度标签（支持新旧两种格式）
+        
+        新格式（多维相似度）显示：
+            - 综合分数（final_score）
+            - 各维度分解：Cos/Euc/DTW
+            - 置信度
+        
+        旧格式显示：
+            - 单一相似度百分比
+        
+        Args:
+            label: 基础标签文本
+            similarity: 综合相似度（兼容旧调用）
+            similarity_breakdown: 多维相似度分解字典
+            n_members: 成员数量（可选，用于扇形图）
+        
+        Returns:
+            (label_text, color): 格式化的标签文本和颜色
+        """
+        if similarity_breakdown and isinstance(similarity_breakdown, dict):
+            # 新格式：多维相似度分解
+            final_score = similarity_breakdown.get("final_score", 
+                          similarity_breakdown.get("combined_score", similarity))
+            cos_sim = similarity_breakdown.get("cosine_similarity", 0.0)
+            euc_sim = similarity_breakdown.get("euclidean_similarity", 0.0)
+            dtw_sim = similarity_breakdown.get("dtw_similarity", 0.0)
+            confidence = similarity_breakdown.get("confidence", 1.0)
+            
+            # 转换为百分比
+            final_pct = final_score * 100
+            cos_pct = cos_sim * 100
+            euc_pct = euc_sim * 100
+            dtw_pct = dtw_sim * 100
+            conf_pct = confidence * 100
+            
+            # 根据最终分数和置信度确定颜色
+            # 高分数+高置信度 = 绿色，低置信度 = 黄色，低分数 = 红色
+            if final_pct >= 70 and conf_pct >= 60:
+                color = "#00FF00"  # 亮绿 - 高质量匹配
+            elif final_pct >= 60 or conf_pct >= 70:
+                color = "#FFD700"  # 金黄 - 中等质量
+            else:
+                color = "#FF6347"  # 红色 - 低质量
+            
+            # 构建多行标签文本
+            # 第一行：标签 + 最终分数
+            # 第二行：各维度分解（紧凑格式）
+            if n_members is not None:
+                label_text = f"{label} {final_pct:.1f}% ({n_members}笔)\n"
+            else:
+                label_text = f"{label} {final_pct:.1f}%\n"
+            
+            # 添加维度分解（紧凑格式：C/E/D = 余弦/欧氏/DTW）
+            label_text += f"C:{cos_pct:.0f} E:{euc_pct:.0f} D:{dtw_pct:.0f} 置信:{conf_pct:.0f}%"
+            
+        else:
+            # 旧格式：单一相似度
+            sim_pct = similarity * 100
+            color = "#00FF00" if sim_pct >= 70 else ("#FFD700" if sim_pct >= 50 else "#FF6347")
+            
+            if n_members is not None:
+                label_text = f"{label} {sim_pct:.1f}% ({n_members}笔)"
+            else:
+                label_text = f"{label} {sim_pct:.1f}%"
+        
+        return label_text, color
+    
     def set_fingerprint_trajectory(self, prices: np.ndarray, start_idx: int,
                                    similarity: float, label: str,
-                                   lower: np.ndarray = None, upper: np.ndarray = None):
-        """在K线图上叠加指纹轨迹虚线（兼容旧调用）"""
+                                   lower: np.ndarray = None, upper: np.ndarray = None,
+                                   similarity_breakdown: dict = None):
+        """
+        在K线图上叠加指纹轨迹虚线
+        
+        Args:
+            prices: 预测价格序列
+            start_idx: 起始K线索引
+            similarity: 综合相似度（兼容旧调用）
+            label: 标签文字
+            lower: 下界序列
+            upper: 上界序列
+            similarity_breakdown: 多维相似度分解（新格式）
+                {
+                    "combined_score": float,      # 融合相似度 [0, 1]
+                    "cosine_similarity": float,   # 余弦相似度
+                    "euclidean_similarity": float,# 欧氏相似度
+                    "dtw_similarity": float,      # DTW 相似度
+                    "confidence": float,          # 原型置信度
+                    "final_score": float,         # 最终分数（含置信度）
+                }
+        """
         if prices is None or len(prices) == 0:
             self.clear_fingerprint_trajectory()
             return
@@ -1224,18 +1315,23 @@ class ChartWidget(QtWidgets.QWidget):
         else:
             self._overlay_future_padding = 0
         
-        sim_pct = similarity * 100
-        color = "#00FF00" if sim_pct >= 70 else ("#FFD700" if sim_pct >= 50 else "#FF6347")
-        self.fingerprint_label.setText(f"{label} {sim_pct:.1f}%")
+        # 构建标签文本（支持新旧两种格式）
+        label_text, color = self._format_similarity_label(
+            label, similarity, similarity_breakdown
+        )
+        self.fingerprint_label.setText(label_text)
         self.fingerprint_label.setColor(color)
-        
+        self.fingerprint_label.setToolTip(
+            "未来走势预测已考虑当前 KDJ、MACD 情境，按最新K线实时更新（秒级数据时逐秒分析）"
+        )
         rect = self.candle_plot.viewRect()
         self.fingerprint_label.setPos(rect.left() + 2, rect.top() + 20)
     
     def set_probability_fan(self, entry_price: float, start_idx: int,
                             member_trade_stats: list, direction: str,
                             similarity: float, label: str,
-                            leverage: float = 10.0, max_bars: int = 30):
+                            leverage: float = 10.0, max_bars: int = 30,
+                            similarity_breakdown: dict = None):
         """
         基于原型成员的真实历史数据，绘制概率扇形置信带
         
@@ -1244,10 +1340,19 @@ class ChartWidget(QtWidgets.QWidget):
             start_idx: 扇形起始的K线索引
             member_trade_stats: [(profit_pct, hold_bars), ...] 成员交易统计
             direction: "LONG" / "SHORT"
-            similarity: 匹配相似度
+            similarity: 匹配相似度（兼容旧调用）
             label: 标签文字
             leverage: 杠杆倍数
             max_bars: 扇形最大展示K线数
+            similarity_breakdown: 多维相似度分解（新格式）
+                {
+                    "combined_score": float,      # 融合相似度 [0, 1]
+                    "cosine_similarity": float,   # 余弦相似度
+                    "euclidean_similarity": float,# 欧氏相似度
+                    "dtw_similarity": float,      # DTW 相似度
+                    "confidence": float,          # 原型置信度
+                    "final_score": float,         # 最终分数（含置信度）
+                }
         """
         if not member_trade_stats or entry_price <= 0:
             self.clear_fingerprint_trajectory()
@@ -1337,14 +1442,18 @@ class ChartWidget(QtWidgets.QWidget):
         else:
             self._overlay_future_padding = 0
         
-        # 6. 标签
-        sim_pct = similarity * 100
-        color = fan_color
-        
+        # 6. 标签（支持多维相似度格式）
         n_members = len(member_trade_stats)
-        self.fingerprint_label.setText(f"{label} {sim_pct:.1f}% ({n_members}笔)")
-        self.fingerprint_label.setColor(color)
         
+        # 构建标签文本（支持新旧两种格式）
+        label_text, color = self._format_similarity_label(
+            label, similarity, similarity_breakdown, n_members=n_members
+        )
+        self.fingerprint_label.setText(label_text)
+        self.fingerprint_label.setColor(color)
+        self.fingerprint_label.setToolTip(
+            "未来走势预测已考虑当前 KDJ、MACD 情境，按最新K线实时更新（秒级数据时逐秒分析）"
+        )
         rect = self.candle_plot.viewRect()
         self.fingerprint_label.setPos(rect.left() + 2, rect.top() + 20)
         

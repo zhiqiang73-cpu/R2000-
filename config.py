@@ -3,6 +3,27 @@ R3000 量化 MVP 系统 - 全局配置文件
 上帝视角标注 + 特征提取 + 模式挖掘 + 遗传算法优化
 """
 
+import os
+
+# ==================== 环境变量加载 ====================
+# 简易 .env 加载（避免引入第三方依赖）
+_env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env_path):
+    try:
+        with open(_env_path, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _key, _val = _line.split("=", 1)
+                _key = _key.strip()
+                _val = _val.strip().strip('"').strip("'")
+                if _key and _key not in os.environ:
+                    os.environ[_key] = _val
+    except Exception:
+        # 环境变量加载失败不影响主流程
+        pass
+
 # ==================== 数据配置 ====================
 DATA_CONFIG = {
     "DATA_FILE": "btcusdt_1m.parquet",
@@ -123,6 +144,27 @@ LIVE_RISK_CONFIG = {
     "MAX_DRAWDOWN_PCT": None,   # 已禁用，不再自动锁定开仓
 }
 
+# ==================== 冷启动配置 ====================
+COLD_START_CONFIG = {
+    "ENABLED_BY_DEFAULT": False,
+    "MACD_BYPASS": True,     # 冷启动时跳过MACD趋势确认，便于启动学习；关闭冷启动后MACD门控恢复
+    "THRESHOLDS": {
+        "fusion": 0.30,      # 正常约0.40
+        "cosine": 0.50,      # 正常约0.60
+        "euclidean": 0.25,   # 正常约0.35
+        "dtw": 0.10          # 正常约0.30
+    },
+    "FREQUENCY_MONITOR": {
+        "TARGET_TRADES_PER_HOUR": 1.5,
+        "LOW_FREQUENCY_THRESHOLD_HOURS": 1.0,  # 超过1小时无交易视为频率过低
+        "AUTO_RELAX_PERCENT": 0.05             # 自动放宽5%
+    },
+    # 冷启动自动毕业
+    "COLD_START_AUTO_GRADUATE": True,
+    "COLD_START_SUCCESS_RATE_THRESHOLD": 0.80,  # 80%成功率
+    "COLD_START_MIN_TRADES_FOR_GRADUATE": 20,   # 至少20笔交易
+}
+
 # ==================== 标注回测配置（基于标记点） ====================
 LABEL_BACKTEST_CONFIG = {
     "INITIAL_CAPITAL": 5000,    # 本金 (USDT)
@@ -185,6 +227,148 @@ WALK_FORWARD_CONFIG = {
     "BATCH_DEFAULT_ROUNDS": 20,  # 批量WF默认轮数（更多轮次=更充分验证）
 }
 
+# ==================== Walk-Forward 进化优化配置 ====================
+WF_EVOLUTION_CONFIG = {
+    # ── 数据分割 ──
+    "SAMPLE_SIZE": 300000,              # 总采样K线数 (~208天, 覆盖6+月多种市况)
+    "HOLDOUT_RATIO": 0.30,              # 留出集比例 (30% = ~90K bars, ~62天)
+    "INNER_FOLDS": 3,                   # 内部WF折数 (每折~70K bars, ~49天)
+    "DATA_OFFSET": "latest",            # 数据偏移: "latest"=最新300K bars, 或整数偏移量
+    
+    # ── 多轮随机验证（防止过拟合特定时间段）──
+    "MULTI_ROUND_ENABLED": True,        # 是否启用多轮随机验证
+    "EVOLUTION_ROUNDS": 2,              # 进化轮数（2轮平衡时间与泛化，3轮更保守）
+    "DATA_SAMPLE_STRATEGY": "mixed",    # 采样策略: "latest"=固定最新, "random"=随机段, "mixed"=1轮latest+其余random
+    "TRIALS_PER_ROUND": 18,             # 【快速探索】每轮试验次数（降低以控制时间）
+    "FINAL_REFINE_ENABLED": True,       # 是否启用最终精炼阶段
+    "FINAL_REFINE_TRIALS": 25,          # 【精细优化】最优轮的额外试验次数
+    "FINAL_REFINE_ROUND": "best",       # 精炼轮选择: "best"=最优轮, "latest"=最新轮, "ensemble"=集成
+    
+    # ── 交叉验证（轮之间互相验证）──
+    "CROSS_VALIDATION_ENABLED": True,   # 是否启用跨轮交叉验证
+    "CROSS_VAL_TOP_K": 2,               # 每轮保留前K个最优权重进行交叉验证（降低至2以省时）
+    "ENSEMBLE_WEIGHTS": True,           # 是否对多轮最优权重做集成（加权平均）
+    "ENSEMBLE_METHOD": "performance",   # 集成方法: "equal"=等权, "performance"=按性能加权
+    
+    # ── 快速筛选（降低计算成本）──
+    "QUICK_PRESCREEN_ENABLED": True,    # 启用快速预筛（在小数据集上初步测试）
+    "PRESCREEN_SAMPLE_SIZE": 100000,    # 预筛数据量（1/3，快速排除明显不佳的时间段）
+    "PRESCREEN_TRIALS": 8,              # 预筛试验次数（降低以省时）
+    "PRESCREEN_CANDIDATES": 5,          # 预筛候选段数量（从5个中选最优2个）
+    "PRESCREEN_SELECT_TOP": 2,          # 从候选段中选择前N个进入正式进化（匹配EVOLUTION_ROUNDS）
+    
+    # ── 市场状态监控（可选）──
+    "REGIME_TRACKING_ENABLED": True,    # 是否记录各轮的市场状态分布
+    "REGIME_FEATURES": ["trend", "volatility", "volume"],  # 要跟踪的状态特征
+
+    # ── 特征语义分组 (8组, 将32维降至8维搜索空间) ──
+    # 每组共享一个乘数权重, 同组特征高度相关, 无需独立搜索
+    # indices 对应 feature_vector.py 中的32维特征向量索引
+    "FEATURE_GROUPS": {
+        "rsi": {
+            "label": "RSI 组",
+            "indices": [0, 1, 16, 17],      # rsi_14, rsi_6, delta_rsi_3, delta_rsi_5
+            "default_weight": 1.5,           # 默认权重 (Layer A 基准)
+        },
+        "macd": {
+            "label": "MACD 组",
+            "indices": [2, 18, 19],          # macd_hist, delta_macd_3, delta_macd_5
+            "default_weight": 1.5,
+        },
+        "volatility": {
+            "label": "波动率组",
+            "indices": [6, 7, 8, 20, 21],   # atr_ratio, boll_width, boll_position, delta_atr_rate, delta_boll_width
+            "default_weight": 1.3,
+        },
+        "momentum": {
+            "label": "动量组",
+            "indices": [3, 4, 5],            # kdj_k, kdj_j, roc
+            "default_weight": 1.5,
+        },
+        "volume": {
+            "label": "成交量组",
+            "indices": [14, 15, 24],         # volume_ratio, obv_slope, delta_volume_ratio
+            "default_weight": 1.2,
+        },
+        "trend": {
+            "label": "趋势组",
+            "indices": [9, 10, 11, 12, 22, 23],  # shadow_ratios, ema_devs, ema_slope_changes
+            "default_weight": 1.3,
+        },
+        "structure": {
+            "label": "结构组",
+            "indices": [26, 27, 28, 29, 30, 31],  # price_position, dist_high/low, amp_ratio, vs_20H/L
+            "default_weight": 1.0,
+        },
+        "adx": {
+            "label": "ADX 组",
+            "indices": [13, 25],             # adx, delta_adx
+            "default_weight": 1.2,
+        },
+    },
+
+    # ── 权重搜索范围 ──
+    "WEIGHT_MIN": 0.1,                  # 组权重下限
+    "WEIGHT_MAX": 3.0,                  # 组权重上限
+
+    # ── 阈值搜索范围 ──
+    "FUSION_THRESHOLD_RANGE": (0.40, 0.85),   # 多维融合分数阈值搜索范围
+    "COSINE_MIN_THRESHOLD_RANGE": (0.50, 0.90),  # 余弦相似度最低阈值搜索范围
+    "EUCLIDEAN_MIN_THRESHOLD_RANGE": (0.30, 0.80),  # 欧氏距离最低阈值搜索范围
+    "DTW_MIN_THRESHOLD_RANGE": (0.20, 0.70),  # DTW形态最低阈值搜索范围
+
+    # ── CMA-ES 优化器参数 ──
+    "OPTIMIZER": "cma-es",              # 优化器: "cma-es" (推荐) 或 "tpe" (备选)
+    "N_TRIALS": 60,                     # 【单轮模式】总试验次数 (CMA-ES ~6代, 足够收敛)
+                                        # 【多轮模式】被 TRIALS_PER_ROUND 和 FINAL_REFINE_TRIALS 取代
+    "CMA_SIGMA0": 0.5,                  # CMA-ES 初始步长 (搜索范围的~1/4)
+    "CMA_RESTART_STRATEGY": "ipop",     # CMA-ES 重启策略 (增量种群)
+    "TPE_FALLBACK": True,               # CMA-ES 收敛失败时是否回退到 TPE
+
+    # ── 适应度函数 ──
+    "FITNESS_METRIC": "sharpe",         # 主指标: "sharpe", "profit_factor", "calmar"
+    "L2_LAMBDA": 0.01,                  # L2 正则化系数 (惩罚偏离默认权重)
+    "MIN_TRADES_PER_FOLD": 15,          # 每折最少交易数 (少于此罚分 -10)
+    "MIN_TRADES_PENALTY": -10.0,        # 交易不足时的罚分
+    "EVAL_SKIP_BARS": 10,               # 【正式进化】模拟交易时每N根K线评估 (加速, 7000点/70K bars)
+    "EVAL_SKIP_BARS_PRESCREEN": 15,     # 【快速预筛】评估间隔更大以加速（~5000点/70K bars）
+
+    # ── 留出集验证通过标准（降低门槛后更容易合格） ──
+    "HOLDOUT_PASS_CRITERIA": {
+        "min_sharpe": 0.0,              # 最低夏普（0 = 不要求为正，避免留出段稍差就一票否决）
+        "min_win_rate": 0.35,            # 最低胜率 35%
+        "max_drawdown": 40.0,           # 最大回撤上限 40%（单位：百分比数值，如 25=25%）
+        "min_trades": 15,               # 最少交易笔数（留出段样本少时也容易达标）
+        "min_profit_factor": 0.95,      # 最低盈亏比（略低于1也可接受，避免过度苛刻）
+    },
+
+    # ── 输出/持久化 ──
+    "RESULTS_DIR": "data/wf_evolution",         # 进化结果存储目录
+    "SAVE_TOP_K": 3,                            # 保存前K个最优权重组合
+    "EVOLVED_WEIGHTS_FILE": "data/wf_evolution/evolved_weights.json",  # 最优权重文件（兼容单组）
+    "EVOLVED_WEIGHTS_FILE_LONG": "data/wf_evolution/evolved_weights_long.json",
+    "EVOLVED_WEIGHTS_FILE_SHORT": "data/wf_evolution/evolved_weights_short.json",
+    "SAVE_ROUND_RESULTS": True,                 # 是否保存每轮的详细结果
+    
+    # ── 计算时间估算 ──
+    # 【单轮模式】(MULTI_ROUND_ENABLED=False): 
+    #   60 trials × 3 folds × 3秒 ≈ 9分钟
+    # 
+    # 【多轮模式（当前配置）】: 
+    #   - 快速预筛: 5候选 × 8 trials × 3 folds × 2秒 ≈ 2.4分钟
+    #   - 正式进化: 2轮 × 18 trials × 3 folds × 3秒 ≈ 5.4分钟
+    #   - 最终精炼: 1轮 × 25 trials × 3 folds × 3秒 ≈ 3.8分钟
+    #   - 交叉验证: 2轮 × 2候选 × 3 folds × 1秒 ≈ 0.2分钟
+    #   - **总计: ~12分钟 (相比单轮增加约33%，泛化能力显著提升)**
+    # 
+    # 【保守模式】(EVOLUTION_ROUNDS=3, TRIALS_PER_ROUND=20, FINAL_REFINE_TRIALS=30):
+    #   总计 ~18分钟 (增加约100%，但过拟合风险最低)
+    # 
+    # 【极速模式】(QUICK_PRESCREEN_ENABLED=False, EVOLUTION_ROUNDS=1):
+    #   等同单轮模式 ~9分钟 (无泛化验证)
+}
+
+
 # ==================== 记忆持久化配置 ====================
 MEMORY_CONFIG = {
     "MEMORY_DIR": "data/memory",      # 记忆存储目录
@@ -210,14 +394,96 @@ PROTOTYPE_CONFIG = {
     "HOLDING_DANGER_THRESHOLD": 0.3,  # 持仓危险阈值
 }
 
+# ==================== 特征层权重配置（指纹3D图匹配） ====================
+FEATURE_WEIGHTS_CONFIG = {
+    # 三层特征权重系数（用于加权相似度计算）
+    # Layer A (即时信号): MACD、RSI等核心指标 - 16维 - 最重要
+    "LAYER_A_WEIGHT": 1.5,
+    # Layer B (动量变化): 变化率、加速度 - 10维 - 中等重要
+    "LAYER_B_WEIGHT": 1.2,
+    # Layer C (结构位置): 相对位置 - 6维 - 基础重要
+    "LAYER_C_WEIGHT": 1.0,
+    
+    # 特征维度定义（与 feature_vector.py 保持一致）
+    "N_A": 16,                # Layer A 特征数
+    "N_B": 10,                # Layer B 特征数
+    "N_C": 6,                 # Layer C 特征数
+    
+    # 是否启用特征加权
+    "ENABLED": True,
+}
+
+# ==================== 多维相似度配置（指纹3D图匹配） ====================
+SIMILARITY_CONFIG = {
+    # 多维相似度融合权重
+    # 方向相似度: 捕捉特征变化方向是否一致
+    "COSINE_WEIGHT": 0.30,
+    # 距离相似度: 捕捉特征数值是否接近
+    "EUCLIDEAN_WEIGHT": 0.40,
+    # 形态相似度: 捕捉时间序列形态是否匹配
+    "DTW_WEIGHT": 0.30,
+    
+    # 余弦相似度参数
+    "COSINE_MIN_THRESHOLD": 0.70,     # 余弦相似度最低接受阈值
+    
+    # 欧氏距离参数
+    "EUCLIDEAN_NORMALIZE": True,       # 是否归一化欧氏距离
+    "EUCLIDEAN_MAX_DISTANCE": 50.0,    # 归一化时的最大距离参考值（根据实际特征空间调整）
+    
+    # DTW 参数
+    "DTW_RADIUS": 10,                  # FastDTW 半径约束（加速计算，增大可提高精度但变慢）
+    "DTW_NORMALIZE": True,             # 是否归一化 DTW 距离
+    "DTW_MAX_DISTANCE": 8000.0,        # 归一化时的最大距离参考值（DTW累积距离很大，典型值~5000）
+    
+    # 综合分数阈值
+    "FUSION_THRESHOLD": 0.65,          # 多维融合分数阈值（低于此拒绝匹配）
+    "HIGH_CONFIDENCE_THRESHOLD": 0.80, # 高置信度阈值（高于此视为强匹配）
+    
+    # 序列特征提取参数
+    "USE_WEIGHTED_MEAN": True,         # 使用加权均值而非简单均值
+    "EXTRACT_TRENDS": True,            # 是否提取趋势特征
+    "TREND_WINDOWS": [5, 15, 30],      # 趋势提取的时间窗口
+}
+
+# ==================== 置信度系统配置 ====================
+CONFIDENCE_CONFIG = {
+    # 置信度计算权重（总和应为 1.0）
+    "WIN_RATE_WEIGHT": 0.40,           # 历史胜率权重
+    "STABILITY_WEIGHT": 0.30,          # 样本稳定性权重
+    "SAMPLE_COUNT_WEIGHT": 0.20,       # 样本量充足度权重
+    "REGIME_WEIGHT": 0.10,             # 市场状态一致性权重
+    
+    # 样本量评估参数
+    "SAMPLE_COUNT_FULL": 10,           # 达到此样本量视为充足（满分）
+    "SAMPLE_COUNT_MIN": 3,             # 最少样本量（少于此不计算置信度）
+    
+    # 稳定性评估参数
+    "STABILITY_STD_THRESHOLD": 0.15,   # 收益标准差阈值（低于此视为稳定）
+    "STABILITY_MAX_DRAWDOWN": 0.30,    # 最大回撤阈值（历史回撤超过此扣分）
+    
+    # 置信度阈值
+    "MIN_CONFIDENCE": 0.30,            # 最低置信度（低于此不使用该原型）
+    "HIGH_CONFIDENCE": 0.70,           # 高置信度阈值（可加大仓位）
+    "PERFECT_CONFIDENCE": 0.90,        # 极高置信度阈值（顶级信号）
+    
+    # 置信度对最终分数的影响
+    "CONFIDENCE_SCALE_MIN": 0.5,       # 低置信度时分数缩放下限
+    "CONFIDENCE_SCALE_MAX": 1.2,       # 高置信度时分数缩放上限
+}
+
 # ==================== 市场状态分类配置 ====================
 MARKET_REGIME_CONFIG = {
-    "DIR_STRONG_THRESHOLD": 0.008,       # 方向强趋势阈值 (0.8%)
-    "STRENGTH_STRONG_THRESHOLD": 0.006,  # 强度阈值 (振幅/均价 > 0.6%)
+    "DIR_STRONG_THRESHOLD": 0.003,       # 方向趋势阈值 (0.3%) - 更容易触发趋势
+    "STRENGTH_STRONG_THRESHOLD": 0.003,  # 强度阈值 (振幅/均价 > 0.3%) - 更容易触发强势
     "LOOKBACK_SWINGS": 4,               # 回看摆动点数量（只看最近走势）
     # 短期趋势修正（让 regime 更贴近 K 线走势）
     "SHORT_TREND_LOOKBACK": 6,          # 近 N 根 K 线方向（更聚焦当前）
-    "SHORT_TREND_THRESHOLD": 0.002,     # 0.2% 视为短期趋势明显
+    "SHORT_TREND_THRESHOLD": 0.0015,    # 0.15% 视为短期趋势明显
+    
+    # 市场状态自适应学习
+    "REGIME_ADAPTATION_ENABLED": True,   # 是否启用市场状态自适应
+    "REGIME_ACCURACY_MIN_SAMPLES": 15,   # 至少15笔才调整阈值
+    "REGIME_THRESHOLD_ADJUST_RATE": 0.05,  # 每次调整5%
 }
 
 # ==================== UI 配置 ====================
@@ -279,12 +545,13 @@ PAPER_TRADING_CONFIG = {
     
     # 止盈止损
     "STOP_LOSS_ATR": 2.0,
-    "TAKE_PROFIT_ATR": 3.0,
+    "TAKE_PROFIT_ATR": 3.5,             # TP = 3.5 x ATR（适中的止盈倍数，平衡捕获利润与避免过度持仓）
     "MAX_HOLD_BARS": 240,
     
     # ── 止损保护参数（防止正常波动被扫损）──
-    "MIN_SL_PCT": 0.005,        # 最小止损距离 0.5%（BTC≈$475），挡住1分钟正常波动
-    "ATR_SL_MULTIPLIER": 3.0,   # ATR 止损倍数（越大越宽松），原来 2.0 太紧
+    "MIN_SL_PCT": 0.0015,       # 最小止损距离 0.15%（约103点，允许正常波动但避免被轻易扫损）
+    "ATR_SL_MULTIPLIER": 2.5,   # SL = 2.5 x ATR（适中倍数，平衡风险控制与避免过度宽松）
+    "MIN_RR_RATIO": 1.4,        # 最低盈亏比：TP >= SL x 1.4
     "SL_PROTECTION_SEC": 60,    # 新仓保护期（秒），保护期内止损暂缓，原来 8 秒太短
     
     # ── 前3根K线紧急止损守卫 (Early Exit Guard) ──
@@ -296,9 +563,14 @@ PAPER_TRADING_CONFIG = {
     
     # ── 反手单 (Stop-and-Reverse) ──
     # 止损说明方向判断错误，自动反手做反方向
-    "REVERSE_ON_STOPLOSS": True,      # 是否启用止损反手
+    "REVERSE_ON_STOPLOSS": False,     # 关闭止损反手（翻转单更优：主动在有利位置翻转）
     "REVERSE_MAX_COUNT": 1,           # 最多连续反手次数（防止来回被扫）
     "REVERSE_BLOCK_SAME_DIR_SEC": 300,  # 止损后禁止同方向入场的时间（秒）
+    # ── 翻转失败兜底（可控） ──
+    "FLIP_FALLBACK_TEMPLATE_ENABLED": True,      # 震荡市翻转时，允许模板匹配兜底（即使主模式是原型）
+    "FLIP_FALLBACK_DEGRADED_ENTRY_ENABLED": True,  # 翻转无匹配时，允许高分降级入场
+    "FLIP_FALLBACK_MIN_SCORE": 35.0,             # 降级入场最低 flip_score（方向化位置评分）
+    "FLIP_FALLBACK_DEGRADED_POSITION_PCT": 0.05, # 降级入场仓位上限（5%）
     
     # 动态追踪
     "HOLD_SAFE_THRESHOLD": 0.7,
@@ -329,6 +601,35 @@ PAPER_TRADING_CONFIG = {
     "EXIT_LEARNING_DECAY_FACTOR": 0.95,   # 衰减因子（0-1）
     "EXIT_LEARNING_MIN_SAMPLES": 10,      # 最少样本数（少于此值使用默认策略）
 
+    # ── 自适应学习：出场时机追踪 ──
+    "EXIT_TIMING_TRACKER_ENABLED": True,
+    "EXIT_TIMING_EVAL_BARS": 30,
+    "EXIT_TIMING_MOVE_PCT": 0.3,
+    "EXIT_TIMING_MIN_EVALS": 20,
+    "EXIT_TIMING_STATE_FILE": "data/exit_timing_state.json",
+
+    # ── 自适应学习：止盈止损评估 ──
+    "TPSL_TRACKER_ENABLED": True,
+    "TPSL_EVAL_BARS": 30,
+    "TPSL_MOVE_PCT": 0.5,
+    "TPSL_MIN_EVALS": 20,
+    "TPSL_STATE_FILE": "data/tpsl_tracker_state.json",
+
+    # ── 自适应学习：近似信号评估 ──
+    "NEAR_MISS_TRACKER_ENABLED": True,
+    "NEAR_MISS_RATIO": 0.85,
+    "NEAR_MISS_EVAL_BARS": 30,
+    "NEAR_MISS_MOVE_PCT": 0.3,
+    "NEAR_MISS_MIN_EVALS": 20,
+    "NEAR_MISS_STATE_FILE": "data/near_miss_state.json",
+
+    # ── 自适应学习：早期出场评估 ──
+    "EARLY_EXIT_TRACKER_ENABLED": True,
+    "EARLY_EXIT_EVAL_BARS": 30,
+    "EARLY_EXIT_MOVE_PCT": 0.5,
+    "EARLY_EXIT_MIN_EVALS": 15,
+    "EARLY_EXIT_STATE_FILE": "data/early_exit_state.json",
+
     # 实时决策频率（秒）
     "REALTIME_DECISION_SEC": 0.05,
     # 是否允许在未收线K线中进行入场决策
@@ -346,22 +647,77 @@ PAPER_TRADING_CONFIG = {
     # 0.001=0.1%（原值）, 0.003=0.3%（推荐）, 0.005=0.5%（极端波动）
     "EXIT_IOC_BUFFER_PCT": 0.003,
     
-    # ── 贝叶斯交易过滤器（Thompson Sampling + 凯利公式）──
-    "BAYESIAN_ENABLED": True,              # 是否启用贝叶斯门控
+    # ── 贝叶斯数据收集（仅供凯利公式使用）──
+    "BAYESIAN_ENABLED": True,              # 启用数据收集（凯利公式需要胜率和盈亏比数据）
+    "BAYESIAN_GATE_ENABLED": False,        # 禁用贝叶斯门控（不拦截交易）
     "BAYESIAN_PRIOR_STRENGTH": 10.0,       # 先验强度（历史回测数据相当于多少笔实盘交易）
-    "BAYESIAN_MIN_WIN_RATE": 0.40,         # 最低胜率阈值（低于此值拒绝交易）
-    "BAYESIAN_THOMPSON_SAMPLING": True,    # 是否使用 Thompson Sampling（探索与利用平衡）
-    "BAYESIAN_DECAY_ENABLED": True,        # 是否启用时间衰减（适应市场变化）
+    "BAYESIAN_MIN_WIN_RATE": 0.0,          # 门控已禁用（设为0=不拦截任何交易）
+    "BAYESIAN_THOMPSON_SAMPLING": False,   # 禁用 Thompson Sampling（不做门控）
+    "BAYESIAN_DECAY_ENABLED": True,        # 启用时间衰减（适应市场变化）
     "BAYESIAN_DECAY_HOURS": 24.0,          # 衰减间隔（小时）
     "BAYESIAN_DECAY_FACTOR": 0.95,         # 衰减因子（0-1，越小遗忘越快）
     "BAYESIAN_STATE_FILE": "data/bayesian_state.json",  # 持久化文件路径
     
+    # ── 位置评分阈值（方向化）──
+    "POS_THRESHOLD_LONG": -30,         # LONG 位置评分阈值（低于此拒绝/翻转，-20太严→-30）
+    "POS_THRESHOLD_SHORT": -40,        # SHORT 位置评分阈值
+    
+    # ── MACD 趋势门控（斜率法）──
+    "MACD_TREND_WINDOW": 5,            # 线性回归窗口（K线根数）
+    "MACD_SLOPE_MIN": 0.003,           # 最小斜率绝对值（低于此视为无趋势，拒绝开仓）
+    # ── MACD 零轴放宽（解决震荡市门控过严问题）──
+    "MACD_ZERO_AXIS_FLOOR": 3.0,       # 零轴容忍度下限（防止小斜率时容忍度过小导致误拦）
+    "MACD_RANGE_BYPASS_ZERO_AXIS": True,  # 震荡市中斜率方向正确时，豁免零轴检查
+    "MACD_POS_SCORE_RESCUE": 40,       # 位置评分≥此值且斜率正确时，豁免零轴检查
+    
     # ── 凯利公式动态仓位管理 ──
     "KELLY_ENABLED": True,                 # 是否启用凯利公式动态仓位
-    "KELLY_FRACTION": 0.25,                # 凯利分数（0.25=四分之一凯利，推荐范围 0.25-0.5）
-    "KELLY_MAX_POSITION": 0.5,             # 凯利仓位上限（50% 本金）
-    "KELLY_MIN_POSITION": 0.05,            # 凯利仓位下限（5% 本金，样本不足时保守试探）
+    "KELLY_FRACTION": 1.0,                 # 凯利分数（1.0=完整凯利，直接使用公式计算值）
+    "KELLY_MAX_POSITION": 0.8,             # 凯利仓位上限（80% 本金）
+    "KELLY_MIN_POSITION": 0.05,            # 凯利仓位下限（5% 本金，样本不足/期望为负时保守试探学习）
     "KELLY_MIN_SAMPLES": 5,                # 凯利计算最少样本数（少于此值用最小仓位）
+    
+    # ── 凯利参数自适应学习 ──
+    "KELLY_ADAPTATION_ENABLED": True,      # 是否启用凯利参数自适应学习
+    "KELLY_FRACTION_RANGE": (0.8, 1.0),    # KELLY_FRACTION 自适应调整范围（保持接近完整凯利）
+    "KELLY_MAX_RANGE": (0.5, 0.9),         # KELLY_MAX 自适应调整范围
+    "KELLY_MIN_RANGE": (0.03, 0.10),       # KELLY_MIN 自适应调整范围（下限3%~10%）
+    
+    # ── 入场拒绝跟踪器（门控自适应学习）──
+    "REJECTION_TRACKER_ENABLED": True,      # 是否启用拒绝跟踪
+    "REJECTION_EVAL_BARS": 30,              # 拒绝后多少根K线进行事后评估
+    "REJECTION_PROFIT_THRESHOLD_PCT": 0.3,  # 价格移动超过此百分比视为"本可以盈利"（%）
+    "REJECTION_MAX_HISTORY": 200,           # 最大历史记录数
+    "REJECTION_STATE_FILE": "data/rejection_tracker_state.json",  # 持久化文件路径
+    
+    # ── 出场时机追踪器（出场自适应学习）──
+    "EXIT_TIMING_TRACKER_ENABLED": True,        # 是否启用出场时机追踪
+    "EXIT_TIMING_EVAL_BARS": 30,                # 出场后追踪多少根K线评估后续走势
+    "EXIT_TIMING_PREMATURE_PCT": 0.5,           # 出场后价格继续有利移动超过此%视为"过早出场"
+    "EXIT_TIMING_LATE_RETRACE_PCT": 0.5,        # 出场时从峰值回撤超过此比例视为"过晚出场"
+    "EXIT_TIMING_MAX_HISTORY": 200,             # 最大历史记录数
+    "EXIT_TIMING_MIN_EVALS": 10,                # 每种出场原因至少需要多少次评估才给建议
+    "EXIT_TIMING_STATE_FILE": "data/exit_timing_state.json",  # 持久化文件路径
+    
+    # ========== 反向下单测试 ==========
+    "REVERSE_SIGNAL_MODE": False,  # True=所有信号反向（LONG→SHORT, SHORT→LONG）
+    
+    # ── 近似信号追踪器（相似度阈值自适应学习）──
+    "NEAR_MISS_TRACKER_ENABLED": True,      # 是否启用近似信号追踪
+    "NEAR_MISS_MARGIN": 0.10,               # 近似信号捕获范围（与阈值的差距，0.10=10%）
+    "NEAR_MISS_EVAL_BARS": 30,              # 信号出现后多少根K线进行事后评估
+    "NEAR_MISS_PROFIT_THRESHOLD_PCT": 0.3,  # 价格移动超过此百分比视为"本可盈利"（%）
+    "NEAR_MISS_MAX_HISTORY": 200,           # 最大历史记录数
+    "NEAR_MISS_STATE_FILE": "data/near_miss_tracker_state.json",  # 持久化文件路径
+}
+
+# ==================== DeepSeek API 配置 ====================
+DEEPSEEK_CONFIG = {
+    "ENABLED": bool(os.getenv("DEEPSEEK_API_KEY")),  # 有密钥即启用
+    "API_KEY": os.getenv("DEEPSEEK_API_KEY", ""),    # DeepSeek API 密钥（https://platform.deepseek.com）
+    "MODEL": "deepseek-chat",            # 模型名称
+    "MAX_TOKENS": 800,                   # 最大生成token数
+    "TEMPERATURE": 0.3,                  # 温度参数（0.3=更确定性，适合分析）
 }
 
 # ==================== 日志配置 ====================
