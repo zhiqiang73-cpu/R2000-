@@ -292,6 +292,9 @@ class KellyAdapter:
         self.kelly_max: Optional[float] = None
         self.kelly_min: Optional[float] = None
         
+        # 杠杆自适应
+        self.leverage: Optional[int] = None
+        
         # 参数调整历史
         self.adjustment_history: List[Dict] = []
         
@@ -446,7 +449,7 @@ class KellyAdapter:
         
         # 当前 kelly_min 和范围
         from config import PAPER_TRADING_CONFIG
-        current_min = self.kelly_min or PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.1)
+        current_min = self.kelly_min or PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.05)
         min_range = PAPER_TRADING_CONFIG.get("KELLY_MIN_RANGE", (0.05, 0.20))
         
         # 检查仓位分布
@@ -462,6 +465,48 @@ class KellyAdapter:
             # 平均仓位远高于最小值，可以降低最小仓位（给低质量信号更多试探空间）
             suggested = max(current_min - 0.02, min_range[0])
             return suggested
+        
+        return None
+    
+    def suggest_leverage_adjustment(self, min_trades: int = 20) -> Optional[int]:
+        """
+        建议 LEVERAGE 调整
+        
+        Args:
+            min_trades: 最少交易数
+        
+        Returns:
+            建议的新杠杆值，None 表示不建议调整
+        """
+        from config import PAPER_TRADING_CONFIG
+        if not PAPER_TRADING_CONFIG.get("LEVERAGE_ADAPTIVE", False):
+            return None
+        if len(self.recent_performance) < min_trades:
+            return None
+        
+        current_leverage = self.leverage or PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 10)
+        min_leverage = PAPER_TRADING_CONFIG.get("LEVERAGE_MIN", 5)
+        max_leverage = PAPER_TRADING_CONFIG.get("LEVERAGE_MAX", 50)
+        
+        recent_profits = list(self.recent_performance)
+        avg_profit = np.mean(recent_profits)
+        win_rate = sum(1 for p in recent_profits if p > 0) / len(recent_profits)
+        
+        profit_threshold = PAPER_TRADING_CONFIG.get("LEVERAGE_PROFIT_THRESHOLD", 2.0)
+        loss_threshold = PAPER_TRADING_CONFIG.get("LEVERAGE_LOSS_THRESHOLD", -1.0)
+        drawdown_limit = PAPER_TRADING_CONFIG.get("LEVERAGE_DRAWDOWN_LIMIT", 20.0)
+        
+        if (avg_profit > profit_threshold and win_rate > 0.55 and 
+            self.drawdown_tracker < 10.0 and current_leverage < max_leverage):
+            suggested = min(current_leverage + 2, max_leverage)
+            if suggested > current_leverage:
+                return suggested
+        
+        elif (avg_profit < loss_threshold or self.drawdown_tracker > drawdown_limit or win_rate < 0.40):
+            reduction = 5 if self.drawdown_tracker > drawdown_limit else 2
+            suggested = max(current_leverage - reduction, min_leverage)
+            if suggested < current_leverage:
+                return suggested
         
         return None
     
@@ -484,6 +529,7 @@ class KellyAdapter:
             # 平滑调整
             delta_val = (suggested_fraction - self.kelly_fraction) * learning_rate
             new_fraction = self.kelly_fraction + delta_val
+            avg_profit = np.mean(list(self.recent_performance)) if self.recent_performance else 0.0
             
             delta_pct = (new_fraction - self.kelly_fraction) / self.kelly_fraction * 100 if self.kelly_fraction != 0 else 0
             adjustments.append({
@@ -527,7 +573,7 @@ class KellyAdapter:
         if suggested_min is not None:
             if self.kelly_min is None:
                 from config import PAPER_TRADING_CONFIG
-                self.kelly_min = PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.1)
+                self.kelly_min = PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.05)
             
             # 平滑调整
             delta_val = (suggested_min - self.kelly_min) * learning_rate
@@ -547,6 +593,27 @@ class KellyAdapter:
             
             self.kelly_min = new_min
         
+        # 4. 调整杠杆
+        suggested_leverage = self.suggest_leverage_adjustment()
+        if suggested_leverage is not None:
+            if self.leverage is None:
+                from config import PAPER_TRADING_CONFIG
+                self.leverage = PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 10)
+            
+            old_leverage = self.leverage
+            self.leverage = suggested_leverage
+            
+            avg_profit = np.mean(list(self.recent_performance)) if self.recent_performance else 0
+            adjustments.append({
+                "timestamp": datetime.now().isoformat(),
+                "parameter": "LEVERAGE",
+                "old_value": float(old_leverage),
+                "new_value": float(self.leverage),
+                "delta": float(self.leverage - old_leverage),
+                "delta_pct": float((self.leverage - old_leverage) / old_leverage * 100),
+                "reason": f"基于表现调整 (平均收益: {avg_profit:.2f}%, 回撤: {self.drawdown_tracker:.1f}%)",
+            })
+        
         # 记录调整历史
         if adjustments:
             self.adjustment_history.extend(adjustments)
@@ -561,7 +628,8 @@ class KellyAdapter:
         return {
             "KELLY_FRACTION": self.kelly_fraction or PAPER_TRADING_CONFIG.get("KELLY_FRACTION", 0.25),
             "KELLY_MAX": self.kelly_max or PAPER_TRADING_CONFIG.get("KELLY_MAX_POSITION", 0.8),
-            "KELLY_MIN": self.kelly_min or PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.1),
+            "KELLY_MIN": self.kelly_min or PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.05),
+            "LEVERAGE": self.leverage or PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 10),
         }
     
     def to_dict(self) -> dict:
@@ -574,6 +642,7 @@ class KellyAdapter:
             "kelly_fraction": self.kelly_fraction,
             "kelly_max": self.kelly_max,
             "kelly_min": self.kelly_min,
+            "leverage": self.leverage,
             "adjustment_history": self.adjustment_history[-20:],
             "recent_performance": list(self.recent_performance),
             "drawdown_tracker": self.drawdown_tracker,
@@ -591,6 +660,7 @@ class KellyAdapter:
         self.kelly_fraction = data.get("kelly_fraction")
         self.kelly_max = data.get("kelly_max")
         self.kelly_min = data.get("kelly_min")
+        self.leverage = data.get("leverage")
         self.adjustment_history = data.get("adjustment_history", [])
         
         recent_perf = data.get("recent_performance", [])
@@ -1204,7 +1274,7 @@ class AdaptiveController:
             result.parameter_deltas["ENTRY_CONFIRM_PCT"] = 0.0002  # 建议增加入场确认
         
         if result.exit_improvement_pct > 1.0:
-            result.parameter_deltas["TRAILING_STAGE1_PCT"] = -0.2  # 建议提前启动追踪止损
+            result.parameter_deltas["STAGED_TP_1_PCT"] = -0.5  # 建议提前分段止盈第一档
         
         if result.sl_tp_improvement_pct > 1.0:
             result.parameter_deltas["STOP_LOSS_ATR"] = 0.3  # 建议放宽止损
@@ -1427,7 +1497,7 @@ class AdaptiveController:
             suggestions["TAKE_PROFIT_ATR"] = -0.5
         
         if diagnosis.exit_premature:
-            suggestions["TRAILING_STAGE1_PCT"] = -0.2  # 提前启动追踪
+            suggestions["STAGED_TP_1_PCT"] = -0.5  # 提前分段止盈第一档
         
         return suggestions
     
@@ -1442,9 +1512,10 @@ class AdaptiveController:
             "ENTRY_CONFIRM_PCT": (VECTOR_SPACE_CONFIG, "ENTRY_CONFIRM_PCT"),
             "DIR_STRONG_THRESHOLD": (MARKET_REGIME_CONFIG, "DIR_STRONG_THRESHOLD"),
             "SHORT_TREND_THRESHOLD": (MARKET_REGIME_CONFIG, "SHORT_TREND_THRESHOLD"),
-            "TRAILING_STAGE1_PCT": (PAPER_TRADING_CONFIG, "TRAILING_STAGE1_PCT"),
-            "TRAILING_STAGE2_PCT": (PAPER_TRADING_CONFIG, "TRAILING_STAGE2_PCT"),
-            "TRAILING_STAGE3_PCT": (PAPER_TRADING_CONFIG, "TRAILING_STAGE3_PCT"),
+            "STAGED_TP_1_PCT": (PAPER_TRADING_CONFIG, "STAGED_TP_1_PCT"),
+            "STAGED_TP_2_PCT": (PAPER_TRADING_CONFIG, "STAGED_TP_2_PCT"),
+            "STAGED_SL_1_PCT": (PAPER_TRADING_CONFIG, "STAGED_SL_1_PCT"),
+            "STAGED_SL_2_PCT": (PAPER_TRADING_CONFIG, "STAGED_SL_2_PCT"),
         }
         
         if param_name in config_map:
@@ -1461,9 +1532,10 @@ class AdaptiveController:
             "ENTRY_CONFIRM_PCT": (0.0005, 0.005),
             "DIR_STRONG_THRESHOLD": (0.001, 0.01),
             "SHORT_TREND_THRESHOLD": (0.001, 0.01),
-            "TRAILING_STAGE1_PCT": (0.5, 2.0),
-            "TRAILING_STAGE2_PCT": (1.0, 3.0),
-            "TRAILING_STAGE3_PCT": (2.0, 5.0),
+            "STAGED_TP_1_PCT": (3.0, 8.0),
+            "STAGED_TP_2_PCT": (6.0, 15.0),
+            "STAGED_SL_1_PCT": (2.0, 8.0),
+            "STAGED_SL_2_PCT": (5.0, 15.0),
         }
         
         if param_name in bounds:
@@ -1757,16 +1829,16 @@ class AdaptiveController:
                         "reason": f"{sl_data['reversal_count']}笔止损后反转",
                     })
         
-        # 2. 追踪止损分析
+        # 2. 追踪止损/分段止盈分析
         ts_data = reason_stats.get("追踪止损", {})
         if ts_data.get("count", 0) >= 2:
             avg_peak_loss = ts_data.get("total_peak_loss", 0) / ts_data["count"]
             if avg_peak_loss > 30:  # 峰值流失超过30%
-                current_ts = self.get_parameter("TRAILING_STAGE1_PCT") or PAPER_TRADING_CONFIG.get("TRAILING_STAGE1_PCT", 1.0)
-                new_ts = max(current_ts - 0.2, 0.5)
+                current_ts = self.get_parameter("STAGED_TP_1_PCT") or PAPER_TRADING_CONFIG.get("STAGED_TP_1_PCT", 5.0)
+                new_ts = max(current_ts - 0.5, 3.0)
                 if abs(new_ts - current_ts) > 0.01:
                     adjustments.append({
-                        "parameter": "TRAILING_STAGE1_PCT",
+                        "parameter": "STAGED_TP_1_PCT",
                         "old_value": current_ts,
                         "new_value": new_ts,
                         "reason": f"峰值利润流失{avg_peak_loss:.0f}%",

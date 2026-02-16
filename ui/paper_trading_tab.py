@@ -807,6 +807,23 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.position_margin_label.setStyleSheet("color: #9ad1ff;")
         position_form.addRow("保证金:", self.position_margin_label)
         
+        # 杠杆（含自适应亮灯：绿=在用，灰=未用）
+        self.position_leverage_label = QtWidgets.QLabel("-")
+        self.position_leverage_label.setStyleSheet("color: #FFB74D; font-weight: bold;")
+        self.adaptive_leverage_lamp = QtWidgets.QLabel("●")
+        self.adaptive_leverage_lamp.setStyleSheet("color: #666; font-size: 12px;")
+        self.adaptive_leverage_lamp.setToolTip(
+            "亮灯=杠杆参与「凯利仓位学习」，会随表现与回撤自动调整；\n"
+            "灰=未启用自适应（无凯利适配器）。"
+        )
+        leverage_row = QtWidgets.QHBoxLayout()
+        leverage_row.setContentsMargins(0, 0, 0, 0)
+        leverage_row.setSpacing(6)
+        leverage_row.addWidget(self.position_leverage_label)
+        leverage_row.addWidget(self.adaptive_leverage_lamp)
+        leverage_row.addStretch()
+        position_form.addRow("杠杆:", leverage_row)
+        
         # 入场价
         self.position_entry_label = QtWidgets.QLabel("-")
         self.position_entry_label.setStyleSheet("color: #ccc;")
@@ -919,7 +936,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # 委托单表格（美化）
         self.pending_orders_table = QtWidgets.QTableWidget()
         self.pending_orders_table.setColumnCount(6)
-        self.pending_orders_table.setHorizontalHeaderLabels(["方向", "挂单价", "数量", "状态", "剩余K线", "原型"])
+        self.pending_orders_table.setHorizontalHeaderLabels(["方向", "挂单价", "数量", "状态", "原型", "TP/SL%"])
         self.pending_orders_table.verticalHeader().setVisible(False)
         self.pending_orders_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.pending_orders_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
@@ -1453,25 +1470,27 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             grid.addWidget(lbl, 0, ci)
 
         # -- read thresholds from config --
+        sl_atr = PAPER_TRADING_CONFIG.get("ATR_SL_MULTIPLIER", 4.0)
+        min_sl_pct = PAPER_TRADING_CONFIG.get("MIN_SL_PCT", 0.004)
         safe_th = PAPER_TRADING_CONFIG.get("HOLD_SAFE_THRESHOLD", 0.7)
         alert_th = PAPER_TRADING_CONFIG.get("HOLD_ALERT_THRESHOLD", 0.5)
         derail_th = PAPER_TRADING_CONFIG.get("HOLD_DERAIL_THRESHOLD", 0.3)
-        ts1 = PAPER_TRADING_CONFIG.get("TRAILING_STAGE1_PCT", 1.0)
-        ts2 = PAPER_TRADING_CONFIG.get("TRAILING_STAGE2_PCT", 2.0)
-        ts3 = PAPER_TRADING_CONFIG.get("TRAILING_STAGE3_PCT", 3.5)
-        lock2 = PAPER_TRADING_CONFIG.get("TRAILING_LOCK_PCT_STAGE2", 0.50)
-        lock3 = PAPER_TRADING_CONFIG.get("TRAILING_LOCK_PCT_STAGE3", 0.70)
+        tp1 = PAPER_TRADING_CONFIG.get("STAGED_TP_1_PCT", 5.0)
+        tp2 = PAPER_TRADING_CONFIG.get("STAGED_TP_2_PCT", 10.0)
+        sl1 = PAPER_TRADING_CONFIG.get("STAGED_SL_1_PCT", 5.0)
+        sl2 = PAPER_TRADING_CONFIG.get("STAGED_SL_2_PCT", 10.0)
+        r1 = PAPER_TRADING_CONFIG.get("STAGED_TP_RATIO_1", 0.30)
         mom_min = PAPER_TRADING_CONFIG.get("MOMENTUM_MIN_PROFIT_PCT", 1.5)
         mom_decay = PAPER_TRADING_CONFIG.get("MOMENTUM_DECAY_THRESHOLD", 0.5)
         max_hold = PAPER_TRADING_CONFIG.get("MAX_HOLD_BARS", 240)
 
         exit_rows = [
+            ("止损",          f"{sl_atr:.1f}×ATR 或 最低 {min_sl_pct*100:.1f}%"),
             ("安全持仓",      f"相似度 ≥ {safe_th:.0%}"),
             ("警戒",          f"相似度 {alert_th:.0%}~{safe_th:.0%}"),
             ("脱轨平仓",      f"相似度 < {derail_th:.0%}"),
-            ("追踪止盈 Lv1",  f"盈利 ≥ {ts1:.1f}% → 保本"),
-            ("追踪止盈 Lv2",  f"盈利 ≥ {ts2:.1f}% → 锁定{lock2:.0%}"),
-            ("追踪止盈 Lv3",  f"盈利 ≥ {ts3:.1f}% → 锁定{lock3:.0%}"),
+            ("分段止盈",      f"峰值 ≥ {tp1:.0f}% 减仓{r1:.0%}，≥ {tp2:.0f}% 再减{r1:.0%}"),
+            ("分段止损",      f"亏损 ≥ {sl1:.0f}% 减仓{r1:.0%}，≥ {sl2:.0f}% 再减{r1:.0%}"),
             ("动能衰竭",      f"盈利 ≥ {mom_min:.1f}% 且 K线缩量{mom_decay:.0%}"),
             ("最大持仓",      f"{max_hold}根K线"),
         ]
@@ -1671,7 +1690,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # 委托单表格（美化）
         self.pending_orders_table = QtWidgets.QTableWidget()
         self.pending_orders_table.setColumnCount(6)
-        self.pending_orders_table.setHorizontalHeaderLabels(["方向", "挂单价", "数量", "状态", "剩余K线", "原型"])
+        self.pending_orders_table.setHorizontalHeaderLabels(["方向", "挂单价", "数量", "状态", "原型", "TP/SL%"])
         self.pending_orders_table.verticalHeader().setVisible(False)
         self.pending_orders_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.pending_orders_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
@@ -1895,59 +1914,80 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         }
     
     def _create_verdict_card(self):
-        """创建综合决策卡片"""
+        """创建综合决策卡片（简朴、新闻媒体风格）"""
         container = QtWidgets.QWidget()
         container.setStyleSheet("""
             QWidget {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #1a237e, stop:1 #283593);
-                border: 2px solid #3f51b5;
-                border-radius: 8px;
+                background-color: #252525;
+                border: 1px solid #404040;
+                border-radius: 4px;
             }
         """)
         
         layout = QtWidgets.QVBoxLayout(container)
         layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
+        
+        # 新闻风格字体（宋体/报宋/Georgia）
+        news_font = "Georgia, SimSun, 宋体, serif"
         
         # 决策标题
-        title_label = QtWidgets.QLabel("📋 综合决策")
-        title_label.setStyleSheet("color: #90caf9; font-weight: bold; font-size: 13px;")
+        title_label = QtWidgets.QLabel("综合决策")
+        title_label.setStyleSheet(f"color: #b0b0b0; font-family: {news_font}; font-size: 12px; font-weight: normal;")
         layout.addWidget(title_label)
         
         # 决策建议
         verdict_label = QtWidgets.QLabel("等待持仓信号...")
         verdict_label.setWordWrap(True)
-        verdict_label.setStyleSheet("""
-            color: #fff;
+        verdict_label.setStyleSheet(f"""
+            color: #e0e0e0;
+            font-family: {news_font};
             font-size: 12px;
-            font-weight: bold;
-            padding: 8px;
-            background-color: rgba(255, 255, 255, 0.1);
-            border-radius: 4px;
+            font-weight: normal;
+            line-height: 1.5;
+            padding: 6px 0;
         """)
         layout.addWidget(verdict_label)
         
         # 推荐操作
         action_label = QtWidgets.QLabel("")
         action_label.setWordWrap(True)
-        action_label.setStyleSheet("color: #b3e5fc; font-size: 11px;")
+        action_label.setStyleSheet(f"color: #a0a0a0; font-family: {news_font}; font-size: 11px; font-weight: normal;")
         layout.addWidget(action_label)
+        
+        # DeepSeek 持仓建议（含心跳灯）
+        ds_row = QtWidgets.QHBoxLayout()
+        ds_heartbeat = QtWidgets.QLabel("○")
+        ds_heartbeat.setStyleSheet("color: #666; font-size: 10px;")
+        ds_heartbeat.setToolTip("DeepSeek 心跳\n绿=已发送/请求中\n灰=未持仓或未到间隔")
+        ds_row.addWidget(ds_heartbeat)
+        ds_label = QtWidgets.QLabel("DeepSeek")
+        ds_label.setStyleSheet(f"color: #808080; font-family: {news_font}; font-size: 11px;")
+        ds_row.addWidget(ds_label)
+        ds_row.addStretch()
+        layout.addLayout(ds_row)
+        deepseek_advice_label = QtWidgets.QLabel("")
+        deepseek_advice_label.setWordWrap(True)
+        deepseek_advice_label.setStyleSheet(f"color: #a0a0a0; font-family: {news_font}; font-size: 11px; line-height: 1.4;")
+        layout.addWidget(deepseek_advice_label)
         
         return {
             'container': container,
             'verdict_label': verdict_label,
             'action_label': action_label,
+            'ds_heartbeat': ds_heartbeat,
+            'deepseek_advice_label': deepseek_advice_label,
         }
     
     def _create_adaptive_reference_section(self):
-        """创建自适应参考区域"""
+        """创建自适应参考区域（简朴、新闻风格）"""
+        news_font = "Georgia, SimSun, 宋体, serif"
         container = QtWidgets.QWidget()
         container.setStyleSheet("""
             QWidget {
-                background-color: #252526;
-                border: 1px solid #3a3a3a;
-                border-radius: 6px;
+                background-color: #252525;
+                border: 1px solid #404040;
+                border-radius: 4px;
             }
         """)
         
@@ -1964,18 +2004,18 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             QPushButton {
                 background-color: transparent;
                 border: none;
-                color: #888;
-                font-size: 12px;
+                color: #707070;
+                font-size: 11px;
             }
             QPushButton:hover {
-                color: #007acc;
+                color: #909090;
             }
         """)
         expand_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         header_layout.addWidget(expand_btn)
         
-        title_label = QtWidgets.QLabel("📚 自适应学习参考")
-        title_label.setStyleSheet("color: #888; font-size: 11px; font-weight: bold;")
+        title_label = QtWidgets.QLabel("自适应学习参考")
+        title_label.setStyleSheet(f"color: #b0b0b0; font-family: {news_font}; font-size: 12px; font-weight: normal;")
         header_layout.addWidget(title_label)
         header_layout.addStretch()
         
@@ -1989,13 +2029,13 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         
         # 原型历史表现
         proto_stats_label = QtWidgets.QLabel("原型历史: -")
-        proto_stats_label.setStyleSheet("color: #aaa; font-size: 10px;")
+        proto_stats_label.setStyleSheet(f"color: #a0a0a0; font-family: {news_font}; font-size: 11px;")
         content_layout.addWidget(proto_stats_label)
         
         # 最近调整记录
         adjustments_label = QtWidgets.QLabel("最近调整: 无")
         adjustments_label.setWordWrap(True)
-        adjustments_label.setStyleSheet("color: #aaa; font-size: 10px;")
+        adjustments_label.setStyleSheet(f"color: #a0a0a0; font-family: {news_font}; font-size: 11px;")
         content_layout.addWidget(adjustments_label)
         
         content_widget.setVisible(False)
@@ -2016,44 +2056,34 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             'adjustments_label': adjustments_label,
         }
     
-    def update_reasoning_layers(self, reasoning_result=None):
+    def update_reasoning_layers(self, reasoning_result=None, state=None, order=None):
         """更新5层推理显示（根据TradeReasoning结果）"""
-        if reasoning_result is None or not hasattr(self, '_reasoning_layer_widgets'):
+        if not hasattr(self, '_reasoning_layer_widgets'):
             return
         
-        # 模拟5层数据更新（实际应从reasoning_result读取）
-        layers_data = {
-            'market_stance': {
-                'status': '有利',
-                'progress': 75,
-                'summary': '市场处于强势多头，趋势明确',
-                'detail': 'EMA短期上扬，ADX > 25显示趋势力量强劲',
-            },
-            'pattern_tracking': {
-                'status': '对齐',
-                'progress': 85,
-                'summary': '当前形态与原型高度匹配（相似度85%）',
-                'detail': '过去3根K线相似度保持在80%以上，形态稳定',
-            },
-            'momentum_analysis': {
-                'status': '加强中',
-                'progress': 70,
-                'summary': 'MACD柱状图扩张，KDJ J线上行',
-                'detail': 'MACD斜率+2.3/bar，KDJ J从65升至72',
-            },
-            'pnl_assessment': {
-                'status': '良好',
-                'progress': 80,
-                'summary': '当前利润+2.3%，距峰值回撤10%',
-                'detail': '风险回报比 (TP-curr)/(curr-SL) = 2.1，利润/K线 = 0.05%',
-            },
-            'safety_check': {
-                'status': '安全',
-                'progress': 90,
-                'summary': '距止损2.5 ATR，保证金使用50%',
-                'detail': 'ATR稳定，未见扩张迹象',
-            },
-        }
+        # 映射层ID与索引
+        layer_ids = ['market_stance', 'pattern_tracking', 'momentum_analysis', 'pnl_assessment', 'safety_check']
+        
+        # 从 reasoning_result 读取真实数据
+        if reasoning_result is not None and hasattr(reasoning_result, 'layers') and len(reasoning_result.layers) >= 5:
+            layers = reasoning_result.layers
+            status_map = {'favorable': '有利', 'neutral': '中性', 'adverse': '不利'}
+            progress_map = {'favorable': 80, 'neutral': 55, 'adverse': 30}
+            layers_data = {}
+            for i, layer_id in enumerate(layer_ids):
+                if i < len(layers):
+                    layer = layers[i]
+                    layers_data[layer_id] = {
+                        'status': status_map.get(layer.status, layer.status),
+                        'progress': progress_map.get(layer.status, 50),
+                        'summary': layer.summary,
+                        'detail': layer.detail,
+                    }
+                else:
+                    layers_data[layer_id] = {'status': '-', 'progress': 50, 'summary': '-', 'detail': ''}
+        else:
+            # 无持仓时显示占位
+            layers_data = {lid: {'status': '待评估', 'progress': 50, 'summary': '-', 'detail': ''} for lid in layer_ids}
         
         for layer_id, data in layers_data.items():
             if layer_id in self._reasoning_layer_widgets:
@@ -2087,24 +2117,82 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                 # 更新详情
                 widgets['detail_label'].setText(data['detail'])
         
-        # 更新综合决策
+        # 更新综合决策（使用 reasoning_result + state 持仓建议）
         if hasattr(self, '_verdict_widgets'):
-            self._verdict_widgets['verdict_label'].setText(
-                "持续持仓 (Hold Firm) - 形态稳定，动能强劲"
-            )
-            self._verdict_widgets['action_label'].setText(
-                "建议: 保持当前仓位，密切关注动量衰减信号"
-            )
+            verdict_text = "等待持仓信号..."
+            action_text = ""
+            if reasoning_result is not None and hasattr(reasoning_result, 'verdict'):
+                verdict_map = {
+                    'hold_firm': '坚定持仓',
+                    'tighten_watch': '收紧观察',
+                    'prepare_exit': '准备平仓',
+                    'exit_now': '立即平仓',
+                }
+                verdict_text = verdict_map.get(reasoning_result.verdict, reasoning_result.verdict)
+                if hasattr(reasoning_result, 'narrative') and reasoning_result.narrative:
+                    verdict_text = f"{verdict_text} | {reasoning_result.narrative}"
+            # 叠加持仓止盈建议
+            if state is not None and getattr(state, 'holding_exit_suggestion', ''):
+                exit_sug = state.holding_exit_suggestion
+                action_text = f"止盈建议: {exit_sug}"
+                if getattr(state, 'position_suggestion', ''):
+                    action_text += f" | 仓位: {state.position_suggestion}"
+                if getattr(state, 'tpsl_action', ''):
+                    tpsl_map = {'hold': '保持TP/SL', 'recalc': '重算TP/SL', 'tighten_sl_only': '仅收紧SL'}
+                    action_text += f" | TP/SL: {tpsl_map.get(state.tpsl_action, state.tpsl_action)}"
+            if action_text:
+                self._verdict_widgets['action_label'].setText(action_text)
+            self._verdict_widgets['verdict_label'].setText(verdict_text)
         
-        # 更新自适应参考
-        if hasattr(self, '_adaptive_ref_widgets'):
-            self._adaptive_ref_widgets['proto_stats_label'].setText(
-                "原型历史: Proto_LONG_05 | 匹配12次 | 胜率67% | 平均+1.8%"
+        # 更新 DeepSeek 持仓建议与心跳灯
+        if hasattr(self, '_verdict_widgets') and 'ds_heartbeat' in self._verdict_widgets:
+            hb = bool(getattr(state, 'deepseek_heartbeat', False)) if state else False
+            self._verdict_widgets['ds_heartbeat'].setText("●" if hb else "○")
+            self._verdict_widgets['ds_heartbeat'].setStyleSheet(
+                "color: #00E676; font-size: 10px;" if hb else "color: #666; font-size: 10px;"
             )
-            self._adaptive_ref_widgets['adjustments_label'].setText(
-                "最近调整: STOP_LOSS_ATR +0.2 (1小时前) | 理由: 反事实分析显示更宽止损可避免过早止损"
-            )
-
+        if hasattr(self, '_verdict_widgets') and 'deepseek_advice_label' in self._verdict_widgets:
+            adv = (getattr(state, 'deepseek_holding_advice', '') or '') if state else ''
+            jdg = (getattr(state, 'deepseek_judgement', '') or '') if state else ''
+            parts = []
+            if adv:
+                parts.append(adv[:300] + "..." if len(adv) > 300 else adv)
+            if jdg:
+                parts.append(f"[评判] {jdg[:150]}..." if len(jdg) > 150 else f"[评判] {jdg}")
+            self._verdict_widgets['deepseek_advice_label'].setText("\n".join(parts) if parts else "")
+        
+        # 更新自适应参考（从 state 拉取持仓相关数据）
+        self._update_adaptive_reference(state, order)
+    
+    def _update_adaptive_reference(self, state=None, order=None):
+        """更新自适应学习参考（出场时机/TP-SL/原型/仓位建议）"""
+        if not hasattr(self, '_adaptive_ref_widgets'):
+            return
+        proto_text = "原型历史: -"
+        adjustments_text = "最近调整: 无"
+        if order is not None and getattr(order, 'template_fingerprint', ''):
+            fp = order.template_fingerprint
+            sim = getattr(order, 'entry_similarity', 0) or getattr(order, 'current_similarity', 0)
+            proto_text = f"原型: {fp} | 相似度: {sim:.1%}"
+        if state is not None:
+            parts = []
+            if getattr(state, 'exit_timing_scores', {}):
+                for k, v in list(state.exit_timing_scores.items())[:2]:
+                    if isinstance(v, dict) and v.get('suggestion'):
+                        parts.append(f"出场时机({k}): {v.get('suggestion', '')}")
+            if getattr(state, 'tpsl_scores', {}):
+                for k, v in list(state.tpsl_scores.items())[:2]:
+                    if isinstance(v, dict) and v.get('suggestion'):
+                        parts.append(f"TP-SL({k}): {v.get('suggestion', '')}")
+            if parts:
+                adjustments_text = " | ".join(parts)
+            if getattr(state, 'position_suggestion', ''):
+                adjustments_text += f" | 仓位建议: {state.position_suggestion}"
+            if getattr(state, 'holding_regime_change', ''):
+                adjustments_text += f" | 市场状态: {state.holding_regime_change}"
+        self._adaptive_ref_widgets['proto_stats_label'].setText(proto_text)
+        self._adaptive_ref_widgets['adjustments_label'].setText(adjustments_text)
+    
     def _create_log_tab(self):
         """创建实时日志标签页"""
         tab = QtWidgets.QWidget()
@@ -2138,6 +2226,9 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.position_side_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #888;")
             self.position_qty_label.setText("-")
             self.position_margin_label.setText("-")
+            self.position_leverage_label.setText("-")
+            self.position_leverage_label.setStyleSheet("color: #888;")
+            self.update_adaptive_leverage_lamp(False)
             self.position_entry_label.setText("-")
             self.position_current_label.setText("-")
             self.position_pnl_label.setText("-")
@@ -2155,6 +2246,19 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             # 数量
             self.position_qty_label.setText(f"{order.quantity:.6f}")
             self.position_margin_label.setText(f"{order.margin_used:,.2f} USDT")
+            
+            # 杠杆（从订单或交易器获取）
+            current_leverage = getattr(order, 'leverage', None) or (self._paper_trader.leverage if hasattr(self, '_paper_trader') and self._paper_trader else 10)
+            self.position_leverage_label.setText(f"{current_leverage}x")
+            
+            # 根据杠杆高低设置颜色提示
+            if current_leverage >= 30:
+                leverage_color = "#FF5252"  # 红色：高风险
+            elif current_leverage >= 20:
+                leverage_color = "#FFB74D"  # 橙色：中等风险
+            else:
+                leverage_color = "#81C784"  # 绿色：低风险
+            self.position_leverage_label.setStyleSheet(f"color: {leverage_color}; font-weight: bold;")
             
             # 入场价
             self.position_entry_label.setText(f"${order.entry_price:,.2f}")
@@ -2184,6 +2288,13 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             
             self.tracking_status_label.setText(f"{tracking_icon} {tracking}")
             self.tracking_status_label.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {tracking_color};")
+            
+    def update_adaptive_leverage_lamp(self, is_active: bool):
+        """亮灯=自适应杠杆在用（绿），灰=未用"""
+        if hasattr(self, "adaptive_leverage_lamp"):
+            self.adaptive_leverage_lamp.setStyleSheet(
+                "color: #4CAF50; font-size: 12px;" if is_active else "color: #666; font-size: 12px;"
+            )
             
     def update_monitoring(self, hold_reason: str, danger_level: float, exit_reason: str):
         """更新持仓监控说明 (NEW)"""
@@ -2440,14 +2551,64 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.pending_orders_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{float(o.get('quantity', 0.0)):.3f}"))
             self.pending_orders_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(o.get("status", "等待成交"))))
 
-            rb = o.get("remaining_bars", None)
-            rb_text = str(rb) if rb is not None else "-"
-            self.pending_orders_table.setItem(row, 4, QtWidgets.QTableWidgetItem(rb_text))
-
             fp = str(o.get("template_fingerprint", "-"))
             fp_item = QtWidgets.QTableWidgetItem(fp)
             fp_item.setToolTip(fp)
-            self.pending_orders_table.setItem(row, 5, fp_item)
+            self.pending_orders_table.setItem(row, 4, fp_item)
+
+            # TP/SL%：预计盈亏（金额 + 百分比）。保护单单行显示该笔预计亏/赚；入场单显示 TP/SL 两档预计。
+            trigger = float(o.get("trigger_price", 0) or 0)
+            entry_price = o.get("entry_price")
+            if entry_price is not None:
+                try:
+                    entry_price = float(entry_price)
+                except (TypeError, ValueError):
+                    entry_price = None
+            qty = float(o.get("quantity", 0) or 0)
+            order_type = (o.get("order_type") or "").lower()
+            status_str = str(o.get("status", ""))
+            tpsl_text = "-"
+            if trigger > 0 and entry_price and entry_price > 0 and qty > 0 and order_type in ("sl", "tp"):
+                # 保护单：该行是止损或止盈，trigger 即为 SL 价或 TP 价
+                is_short = "BUY" in (o.get("side") or "").upper()  # 平空 = 原仓位 SHORT
+                if order_type == "sl":
+                    if is_short:
+                        loss_usdt = (trigger - entry_price) * qty
+                        loss_pct = (trigger - entry_price) / entry_price * 100
+                    else:
+                        loss_usdt = (entry_price - trigger) * qty
+                        loss_pct = (entry_price - trigger) / entry_price * 100
+                    tpsl_text = f"预计亏 {loss_usdt:+.2f} USDT ({loss_pct:+.2f}%)"
+                else:
+                    if is_short:
+                        profit_usdt = (entry_price - trigger) * qty
+                        profit_pct = (entry_price - trigger) / entry_price * 100
+                    else:
+                        profit_usdt = (trigger - entry_price) * qty
+                        profit_pct = (trigger - entry_price) / entry_price * 100
+                    tpsl_text = f"预计赚 {profit_usdt:+.2f} USDT ({profit_pct:+.2f}%)"
+            elif trigger > 0 and qty > 0 and (tp_price := (o.get("take_profit") or o.get("tp"))) is not None and (sl_price := (o.get("stop_loss") or o.get("sl"))) is not None:
+                # 入场挂单：用 trigger 作入场价，计算 TP/SL 两档预计盈亏
+                try:
+                    tp_val, sl_val = float(tp_price), float(sl_price)
+                    entry = trigger
+                    side_upper = (o.get("side") or "-").upper()
+                    if "LONG" in side_upper or side_upper == "BUY":
+                        tp_usdt = (tp_val - entry) * qty
+                        tp_pct = (tp_val - entry) / entry * 100
+                        sl_usdt = (entry - sl_val) * qty
+                        sl_pct = (entry - sl_val) / entry * 100
+                    else:
+                        tp_usdt = (entry - tp_val) * qty
+                        tp_pct = (entry - tp_val) / entry * 100
+                        sl_usdt = (sl_val - entry) * qty
+                        sl_pct = (sl_val - entry) / entry * 100
+                    tpsl_text = f"TP 预计赚 {tp_usdt:+.2f} USDT ({tp_pct:+.2f}%) | SL 预计亏 {sl_usdt:+.2f} USDT ({sl_pct:+.2f}%)"
+                except (TypeError, ValueError):
+                    pass
+            tpsl_item = QtWidgets.QTableWidgetItem(tpsl_text)
+            tpsl_item.setForeground(QtGui.QColor("#AB47BC"))
+            self.pending_orders_table.setItem(row, 5, tpsl_item)
     
     def append_event(self, text: str):
         """追加右下事件日志"""
@@ -2752,7 +2913,11 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         side_val = side.value if side else "-"
         entry_price = getattr(order, "entry_price", 0.0)
         quantity = getattr(order, "quantity", 0.0)
-        return f"SYNC-{side_val}-{entry_price:.2f}-{quantity:.6f}"
+        entry_time = getattr(order, "entry_time", None)
+        exit_time = getattr(order, "exit_time", None)
+        entry_ts = entry_time.timestamp() if entry_time else 0.0
+        exit_ts = exit_time.timestamp() if exit_time else 0.0
+        return f"SYNC-{side_val}-{entry_price:.2f}-{quantity:.6f}-{entry_ts:.0f}-{exit_ts:.0f}"
     
     def _insert_trade_row(self, order):
         """内部通用插入行逻辑"""
@@ -2875,18 +3040,18 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             accuracy_item.setForeground(QtGui.QColor("#666"))
         self.table.setItem(row, 9, accuracy_item)
         
-        # ========== 新增列：离场信号触发 ==========
+        # ========== 新增列：离场信号触发 + 基于峰值的精简建议 ==========
         signals = getattr(order, "exit_signals_triggered", [])
         signal_count = len(signals)
-        
+        main_text = f"{signal_count}个" if signal_count > 0 else "-"
+        suggestion = self._peak_suggestion(order, peak_pct, order.profit_pct) if is_closed else ""
+        if suggestion:
+            main_text = main_text + "\n" + suggestion
+        signal_item = QtWidgets.QTableWidgetItem(main_text)
         if signal_count > 0:
-            signal_item = QtWidgets.QTableWidgetItem(f"{signal_count}个")
-            signal_item.setForeground(QtGui.QColor("#00BCD4"))  # 青色
-            
-            # 工具提示：显示所有触发的信号
+            signal_item.setForeground(QtGui.QColor("#00BCD4"))
             signal_details = []
             for i, (signal_name, profit_at_trigger) in enumerate(signals, 1):
-                # 翻译信号名称
                 signal_name_cn = {
                     "momentum_decay": "动量衰减",
                     "market_reversal": "市场反转",
@@ -2894,12 +3059,14 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
                     "derail": "脱轨",
                 }.get(signal_name, signal_name)
                 signal_details.append(f"{i}. {signal_name_cn} (触发时利润: {profit_at_trigger:+.2f}%)")
-            
             tooltip = "持仓期间触发的离场信号：\n" + "\n".join(signal_details)
+            if suggestion:
+                tooltip += f"\n建议：{suggestion}"
             signal_item.setToolTip(tooltip)
         else:
-            signal_item = QtWidgets.QTableWidgetItem("-")
             signal_item.setForeground(QtGui.QColor("#666"))
+            if suggestion:
+                signal_item.setToolTip(f"建议：{suggestion}")
         self.table.setItem(row, 10, signal_item)
         
         # 盈亏(USDT) - 开仓显示未实现，平仓显示已实现（索引 +3）
@@ -2948,10 +3115,29 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         delete_btn.clicked.connect(lambda checked=False, o=order: self._on_delete_clicked(o))
         self.table.setCellWidget(row, 15, delete_btn)
     
+    def _peak_suggestion(self, order, peak_pct: float, profit_pct: float) -> str:
+        """基于峰值与实际盈亏给出精简建议（仅已平仓且峰值有效时）。"""
+        if peak_pct <= 0:
+            return ""
+        detail = getattr(order, "decision_reason", "") or ""
+        reason_val = getattr(order.close_reason, "value", "") if order.close_reason else ""
+        # 峰值高但未兑现 → 应及时止盈
+        if peak_pct >= 1.2 and profit_pct < peak_pct * 0.5:
+            if "止盈" not in detail and "触及止盈" not in detail:
+                return "应及时止盈"
+        # 止损但曾有利 → 可放宽或追踪
+        if reason_val == "止损" and peak_pct > abs(profit_pct) * 0.3:
+            return "可放宽止损"
+        # 追踪止损但回撤大 → 可提前追踪
+        if "追踪" in detail or "追踪止损" in str(reason_val):
+            if profit_pct < peak_pct * 0.6 and peak_pct >= 1.0:
+                return "可提前追踪"
+        return ""
+
     def _classify_exit_reason(self, order) -> str:
         """
         从订单信息中提取具体的离场分类
-        
+
         Returns:
             具体的离场原因分类字符串
         """
@@ -2984,6 +3170,10 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
                 return "紧追止损"
             else:
                 return "追踪止损"
+        elif order.close_reason.value == "分段止盈":
+            return "分段止盈"
+        elif order.close_reason.value == "分段止损":
+            return "分段止损"
         elif "阶梯止盈" in detail or "partial" in detail.lower():
             return "分段减仓"
         elif "触及止损价" in detail or order.close_reason.value == "止损":
@@ -3834,6 +4024,8 @@ class PaperTradingTab(QtWidgets.QWidget):
             reason_map = {
                 "保本": 5,          # 追踪止损保本触发
                 "止盈": 6,          # 止盈
+                "分段止盈": 6,      # 阶梯止盈部分平仓
+                "分段止损": 10,     # 阶梯止损部分平仓
                 "脱轨": 7,          # 相似度脱轨
                 "信号": 8,          # 信号离场
                 "超时": 9,          # 超过最大持仓

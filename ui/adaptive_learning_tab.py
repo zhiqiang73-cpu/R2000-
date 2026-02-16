@@ -1,7 +1,7 @@
 """
-自适应学习标签页 - 盈亏驱动版
+自适应学习标签页 - 图表化版本
 核心逻辑：每笔交易盈亏 → 分析原因 → 自动调整参数 → 提升盈利
-重构：统一卡片风格 + 记忆时间进度 + 从状态文件刷新
+特性：图表化展示 + 进度可视化 + 市场状态自适应 + 美观直观
 """
 import json
 import os
@@ -16,13 +16,13 @@ from config import UI_CONFIG, PAPER_TRADING_CONFIG, SIMILARITY_CONFIG
 
 
 # ═══════════════════════════════════════════════════════════
-# 通用卡片组件 AdaptiveLearningCard（参考 Entry Overview 风格）
+# 增强型卡片组件 - 支持图表化展示
 # ═══════════════════════════════════════════════════════════
 
 class AdaptiveLearningCard(QtWidgets.QFrame):
     """
-    自适应学习卡片 - 统一风格
-    标题栏（渐变 + 左侧色条）+ 参数表格 + 底部最近调整
+    增强型自适应学习卡片 - 支持图表化展示
+    特性：进度条 + 参数表格 + 状态指示器 + 趋势可视化
     """
     def __init__(
         self,
@@ -35,134 +35,268 @@ class AdaptiveLearningCard(QtWidgets.QFrame):
         self._title = title
         self._icon = icon
         self._accent_color = accent_color
+        self._progress_bars = {}  # 存储进度条引用
         self._init_ui()
 
     def _init_ui(self):
         self.setObjectName("adaptiveLearningCard")
         self.setStyleSheet("""
             QFrame#adaptiveLearningCard {
-                background-color: #333;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2a2a2a, stop:1 #1e1e1e);
+                border: 1px solid #444;
+                border-radius: 10px;
+            }
+            QFrame#adaptiveLearningCard:hover {
                 border: 1px solid #555;
-                border-radius: 8px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2d2d2d, stop:1 #212121);
             }
         """)
+        self.setMinimumHeight(200)
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 6)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 标题栏：渐变 + 左侧 3px 色条
+        # 标题栏：渐变 + 左侧色条 + 状态指示灯
         header = QtWidgets.QWidget()
         header.setObjectName("cardHeader")
-        # 将 #rrggbb 转为 rgba 用于渐变
         r, g, b = int(self._accent_color[1:3], 16), int(self._accent_color[3:5], 16), int(self._accent_color[5:7], 16)
         header.setStyleSheet(f"""
             QWidget#cardHeader {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba({r},{g},{b}, 0.25), stop:1 #2d2d2d);
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                border-left: 3px solid {self._accent_color};
+                    stop:0 rgba({r},{g},{b}, 0.3), stop:0.5 rgba({r},{g},{b}, 0.15), stop:1 #252525);
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                border-left: 4px solid {self._accent_color};
+                padding: 2px 0;
             }}
         """)
         header_h = QtWidgets.QHBoxLayout(header)
-        header_h.setContentsMargins(10, 6, 10, 6)
-        header_h.setSpacing(8)
+        header_h.setContentsMargins(12, 8, 12, 8)
+        header_h.setSpacing(10)
+        
+        # 标题
         title_lbl = QtWidgets.QLabel(f"{self._icon} {self._title}")
-        title_lbl.setStyleSheet("color: #e0e0e0; font-weight: bold; font-size: 12px; background: transparent;")
+        title_lbl.setStyleSheet(f"color: #f0f0f0; font-weight: bold; font-size: 13px; background: transparent;")
         header_h.addWidget(title_lbl)
+        
         header_h.addStretch()
+        
+        # 状态指示灯（心跳：learning/active 时定时闪烁）
+        self._status_indicator = QtWidgets.QLabel("●")
+        self._status_indicator.setStyleSheet("color: #666; font-size: 14px; background: transparent;")
+        self._status_indicator.setToolTip("学习状态：未激活")
+        self._status_blink_on = True
+        self._current_status = "inactive"
+        self._status_timer = QtCore.QTimer(self)
+        self._status_timer.timeout.connect(self._on_status_blink)
+        header_h.addWidget(self._status_indicator)
+        
+        # 样本数标签
         self._sample_label = QtWidgets.QLabel("")
-        self._sample_label.setStyleSheet("color: #888; font-size: 10px; background: transparent;")
+        self._sample_label.setStyleSheet("color: #999; font-size: 10px; background: transparent;")
         header_h.addWidget(self._sample_label)
+        
         layout.addWidget(header)
 
         # 分隔线
         sep = QtWidgets.QFrame()
         sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
         sep.setFixedHeight(1)
-        sep.setStyleSheet("background-color: #555; border: none;")
+        sep.setStyleSheet("background-color: #444; border: none;")
         layout.addWidget(sep)
 
-        # 表格区域：参数 | 当前值 | 调整范围 | 状态
-        self._table = QtWidgets.QTableWidget()
-        self._table.setColumnCount(4)
-        self._table.setHorizontalHeaderLabels(["参数", "当前值", "调整范围", "状态"])
-        self._table.horizontalHeader().setStyleSheet("""
-            QHeaderView::section {
-                background-color: #3a3a3a;
-                color: #999;
-                padding: 4px 6px;
-                border: none;
-                border-bottom: 1px solid #555;
-                font-size: 10px;
-                font-weight: bold;
-            }
-        """)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setShowGrid(False)
-        self._table.setAlternatingRowColors(True)
-        self._table.setStyleSheet("""
-            QTableWidget {
-                background-color: transparent;
-                border: none;
-                color: #ddd;
-                font-size: 11px;
-            }
-            QTableWidget::item {
-                padding: 6px 8px;
-                border-bottom: 1px solid #2a2a2a;
-            }
-            QTableWidget::item:alternate {
-                background-color: rgba(58, 58, 58, 0.5);
-            }
-        """)
-        self._table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self._table.setMinimumHeight(60)
-        layout.addWidget(self._table)
+        # 内容区域（可滚动）
+        content_widget = QtWidgets.QWidget()
+        content_widget.setStyleSheet("background: transparent;")
+        content_layout = QtWidgets.QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(12, 10, 12, 10)
+        content_layout.setSpacing(8)
+        
+        # 参数列表容器
+        self._params_container = QtWidgets.QVBoxLayout()
+        self._params_container.setSpacing(6)
+        content_layout.addLayout(self._params_container)
+        
+        content_layout.addStretch()
+        layout.addWidget(content_widget, 1)
 
-        # 底部：最近调整
+        # 底部：最近调整 + 效果指标
         footer = QtWidgets.QWidget()
-        footer.setStyleSheet("background: transparent;")
-        footer_h = QtWidgets.QHBoxLayout(footer)
-        footer_h.setContentsMargins(10, 4, 10, 6)
+        footer.setStyleSheet(f"background: rgba({r},{g},{b}, 0.08); border-top: 1px solid #333; border-bottom-left-radius: 10px; border-bottom-right-radius: 10px;")
+        footer_layout = QtWidgets.QVBoxLayout(footer)
+        footer_layout.setContentsMargins(12, 6, 12, 6)
+        footer_layout.setSpacing(3)
+        
         self._last_adjust_label = QtWidgets.QLabel("最近调整: -")
-        self._last_adjust_label.setStyleSheet("color: #888; font-size: 10px;")
-        footer_h.addWidget(self._last_adjust_label)
-        footer_h.addStretch()
+        self._last_adjust_label.setStyleSheet("color: #999; font-size: 9px;")
+        footer_layout.addWidget(self._last_adjust_label)
+        
+        self._effect_label = QtWidgets.QLabel("学习效果: -")
+        self._effect_label.setStyleSheet("color: #aaa; font-size: 9px;")
+        footer_layout.addWidget(self._effect_label)
+        
         layout.addWidget(footer)
 
     def set_sample_count(self, text: str):
-        """设置样本数显示，如 '样本: 25笔'"""
+        """设置样本数显示"""
         self._sample_label.setText(text)
 
-    def set_content(
+    def _on_status_blink(self):
+        """心跳闪烁：learning/active 时交替亮暗"""
+        if self._current_status not in ("active", "learning"):
+            return
+        colors = {"active": "#4CAF50", "learning": "#FFA726"}
+        base = colors.get(self._current_status, "#666")
+        if self._status_blink_on:
+            self._status_indicator.setStyleSheet(f"color: {base}; font-size: 14px; background: transparent;")
+        else:
+            r, g, b = int(base[1:3], 16), int(base[3:5], 16), int(base[5:7], 16)
+            dim = f"rgba({r},{g},{b},0.4)"
+            self._status_indicator.setStyleSheet(f"color: {dim}; font-size: 14px; background: transparent;")
+        self._status_blink_on = not self._status_blink_on
+
+    def set_status(self, status: str):
+        """
+        设置学习状态指示灯；learning/active 时启动心跳闪烁
+        status: "active" (绿), "learning" (黄), "inactive" (灰)
+        """
+        self._current_status = status
+        colors = {
+            "active": ("#4CAF50", "已学习：数据充足，心跳=运行中"),
+            "learning": ("#FFA726", "积累中：样本不足，心跳=运行中"),
+            "inactive": ("#666", "未激活：无样本数据"),
+        }
+        color, tooltip = colors.get(status, ("#666", "未知状态"))
+        self._status_indicator.setStyleSheet(f"color: {color}; font-size: 14px; background: transparent;")
+        self._status_indicator.setToolTip(tooltip)
+        if status in ("active", "learning"):
+            if not self._status_timer.isActive():
+                self._status_timer.start(500)
+        else:
+            self._status_timer.stop()
+
+    def set_content_with_progress(
         self,
-        rows: List[Tuple[str, str, str, str]],
+        rows: List[Dict[str, Any]],
         last_adjustment: str = "",
+        effect_text: str = "",
     ):
         """
-        设置表格行：(参数名, 当前值, 调整范围, 状态徽章)
-        状态建议: ✓ 已学习 / ≈ 学习中 / -- 未学习
+        设置内容（增强版）
+        rows: [{"name": "参数名", "value": "当前值", "range": "范围", "progress": 0.75, "color": "#4CAF50"}, ...]
         """
-        self._table.setRowCount(0)
-        for i, (param, current, range_txt, status) in enumerate(rows):
-            row = self._table.rowCount()
-            self._table.insertRow(row)
-            for col, text in enumerate([param, current, range_txt, status]):
-                item = QtWidgets.QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-                if col == 3:
-                    if "✓" in status or "已学习" in status:
-                        item.setForeground(QtGui.QColor("#4CAF50"))
-                    elif "≈" in status or "学习中" in status:
-                        item.setForeground(QtGui.QColor("#FFA726"))
-                    else:
-                        item.setForeground(QtGui.QColor("#888"))
-                self._table.setItem(row, col, item)
+        # 清空现有内容
+        while self._params_container.count():
+            item = self._params_container.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._progress_bars.clear()
+        
+        # 添加参数行
+        for row_data in rows:
+            param_widget = self._create_param_row(
+                row_data.get("name", ""),
+                row_data.get("value", "-"),
+                row_data.get("range", "-"),
+                row_data.get("progress", 0.0),
+                row_data.get("color", self._accent_color),
+                row_data.get("status", ""),
+                row_data.get("tooltip", ""),
+            )
+            self._params_container.addWidget(param_widget)
+        
+        # 更新底部信息
         self._last_adjust_label.setText(f"最近调整: {last_adjustment}" if last_adjustment else "最近调整: -")
+        self._effect_label.setText(f"学习效果: {effect_text}" if effect_text else "学习效果: -")
+
+    def _create_param_row(self, name: str, value: str, range_txt: str, progress: float, color: str, status: str, param_tooltip: str = "") -> QtWidgets.QWidget:
+        """创建单个参数行（带进度条）；param_tooltip 用于参数名说明（如 KELLY_MAX）"""
+        row_widget = QtWidgets.QWidget()
+        row_widget.setStyleSheet("background: rgba(0,0,0,0.2); border-radius: 5px; padding: 4px;")
+        row_layout = QtWidgets.QVBoxLayout(row_widget)
+        row_layout.setContentsMargins(8, 6, 8, 6)
+        row_layout.setSpacing(4)
+        
+        # 第一行：参数名 + 状态标签
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(8)
+        
+        name_label = QtWidgets.QLabel(name)
+        name_label.setStyleSheet("color: #ddd; font-size: 11px; font-weight: bold;")
+        if param_tooltip:
+            name_label.setToolTip(param_tooltip)
+        top_row.addWidget(name_label)
+        
+        top_row.addStretch()
+        
+        if status:
+            status_label = QtWidgets.QLabel(status)
+            if "✓" in status or "已学习" in status:
+                status_color = "#4CAF50"
+            elif "≈" in status or "学习中" in status:
+                status_color = "#FFA726"
+            else:
+                status_color = "#666"
+            status_label.setStyleSheet(f"color: {status_color}; font-size: 9px; padding: 2px 6px; background: rgba(255,255,255,0.05); border-radius: 3px;")
+            top_row.addWidget(status_label)
+        
+        row_layout.addLayout(top_row)
+        
+        # 第二行：当前值 + 范围
+        middle_row = QtWidgets.QHBoxLayout()
+        middle_row.setSpacing(6)
+        
+        value_label = QtWidgets.QLabel(f"当前: {value}")
+        value_label.setStyleSheet(f"color: {color}; font-size: 10px; font-weight: bold;")
+        middle_row.addWidget(value_label)
+        
+        if range_txt and range_txt != "-":
+            range_label = QtWidgets.QLabel(f"范围: {range_txt}")
+            range_label.setStyleSheet("color: #888; font-size: 9px;")
+            middle_row.addWidget(range_label)
+        
+        middle_row.addStretch()
+        row_layout.addLayout(middle_row)
+        
+        # 第三行：进度条
+        if progress > 0:
+            progress_bar = QtWidgets.QProgressBar()
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(int(progress * 100))
+            progress_bar.setTextVisible(False)
+            progress_bar.setFixedHeight(4)
+            progress_bar.setStyleSheet(f"""
+                QProgressBar {{
+                    background-color: rgba(255,255,255,0.05);
+                    border: none;
+                    border-radius: 2px;
+                }}
+                QProgressBar::chunk {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 {color}, stop:1 rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.5));
+                    border-radius: 2px;
+                }}
+            """)
+            row_layout.addWidget(progress_bar)
+            self._progress_bars[name] = progress_bar
+        
+        return row_widget
+
+    def set_content(self, rows: List[Tuple[str, str, str, str]], last_adjustment: str = ""):
+        """兼容旧版本的简单接口"""
+        enhanced_rows = []
+        for name, value, range_txt, status in rows:
+            enhanced_rows.append({
+                "name": name,
+                "value": value,
+                "range": range_txt,
+                "progress": 0.5 if "已学习" in status else 0.0,
+                "color": self._accent_color,
+                "status": status
+            })
+        self.set_content_with_progress(enhanced_rows, last_adjustment)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -685,7 +819,7 @@ class AdaptationResultTable(QtWidgets.QFrame):
         param_display = {
             "STOP_LOSS_ATR": "止损距离",
             "TAKE_PROFIT_ATR": "止盈距离",
-            "TRAILING_STAGE1_PCT": "追踪启动",
+            "STAGED_TP_1_PCT": "分段止盈1档",
             "FUSION_THRESHOLD": "匹配阈值",
             "ENTRY_COOLDOWN_SEC": "开仓冷却",
             "MIN_RR_RATIO": "盈亏比",
@@ -697,7 +831,7 @@ class AdaptationResultTable(QtWidgets.QFrame):
         param_units = {
             "STOP_LOSS_ATR": "×ATR",
             "TAKE_PROFIT_ATR": "×ATR",
-            "TRAILING_STAGE1_PCT": "%",
+            "STAGED_TP_1_PCT": "%",
             "FUSION_THRESHOLD": "",
             "ENTRY_COOLDOWN_SEC": "秒",
             "MIN_RR_RATIO": "",
@@ -1028,25 +1162,58 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
 
         root_layout.addWidget(top_bar)
 
-        # ═══ 6 个统一风格卡片（2x3 网格）═══
+        # ═══ 7 个图表化卡片（3行 x 3列布局，底部居中一个）═══
         grid = QtWidgets.QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(12)
+        grid.setContentsMargins(0, 0, 0, 0)
 
+        # 第一行：核心参数学习
         self._card_kelly = AdaptiveLearningCard("凯利仓位学习", "💹", "#4CAF50")
         self._card_bayesian = AdaptiveLearningCard("贝叶斯胜率学习", "🎯", "#2196F3")
         self._card_tpsl = AdaptiveLearningCard("TP/SL距离学习", "📉", "#FF9800")
-        self._card_rejection = AdaptiveLearningCard("门控拦截追踪", "🚫", "#F44336")
+        
+        # 第二行：进阶学习模块
+        self._card_regime = AdaptiveLearningCard("市场状态自适应", "🌐", "#00BCD4")  # 新增
         self._card_exit_timing = AdaptiveLearningCard("出场时机学习", "⏱", "#9C27B0")
+        self._card_rejection = AdaptiveLearningCard("门控拦截追踪", "🚫", "#F44336")
+        
+        # 第三行：辅助追踪（居中显示）
         self._card_near_miss = AdaptiveLearningCard("近似信号追踪", "🔍", "#607D8B")
 
+        # 布局：3行3列，第三行居中
         grid.addWidget(self._card_kelly, 0, 0)
         grid.addWidget(self._card_bayesian, 0, 1)
         grid.addWidget(self._card_tpsl, 0, 2)
-        grid.addWidget(self._card_rejection, 1, 0)
+        
+        grid.addWidget(self._card_regime, 1, 0)
         grid.addWidget(self._card_exit_timing, 1, 1)
-        grid.addWidget(self._card_near_miss, 1, 2)
+        grid.addWidget(self._card_rejection, 1, 2)
+        
+        # 第三行居中
+        grid.addWidget(self._card_near_miss, 2, 1)
+        
+        # 设置列拉伸比例（让第三行居中）
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
 
         root_layout.addLayout(grid, 1)
+
+        # ═══ 开平仓纪要（每笔开仓/平仓日志）═══
+        journal_group = QtWidgets.QGroupBox("开平仓纪要")
+        journal_group.setStyleSheet("QGroupBox { font-weight: bold; color: #b0bec5; }")
+        journal_layout = QtWidgets.QVBoxLayout(journal_group)
+        self.adaptive_journal_log = QtWidgets.QPlainTextEdit()
+        self.adaptive_journal_log.setReadOnly(True)
+        self.adaptive_journal_log.setMaximumBlockCount(500)
+        self.adaptive_journal_log.setPlaceholderText("每笔开仓与平仓会在此记录，便于对照自适应学习。")
+        self.adaptive_journal_log.setStyleSheet(
+            "QPlainTextEdit { background: #1e1e1e; color: #b0bec5; font-family: Consolas, monospace; font-size: 11px; }"
+        )
+        self.adaptive_journal_log.setMinimumHeight(120)
+        self.adaptive_journal_log.setMaximumHeight(200)
+        journal_layout.addWidget(self.adaptive_journal_log)
+        root_layout.addWidget(journal_group)
 
         # ═══ 底部：冷启动面板 ═══
         self.cold_start_panel = ColdStartPanel()
@@ -1054,6 +1221,17 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
 
         # 首次从状态文件刷新
         QtCore.QTimer.singleShot(100, self.refresh_from_state_files)
+
+    def append_adaptive_journal(self, line: str):
+        """追加一行开平仓纪要（主线程调用）；带时间戳"""
+        if not hasattr(self, "adaptive_journal_log") or not self.adaptive_journal_log:
+            return
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.adaptive_journal_log.appendPlainText(f"[{ts}] {line}")
+        sb = self.adaptive_journal_log.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
 
     def _on_clear_clicked(self):
         """清除记忆：弹窗确认后发送信号，由主窗口执行实际清除"""
@@ -1081,7 +1259,8 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
 
     def refresh_from_state_files(self):
         """
-        从各状态文件读取 created_at / last_save_time 及内容，更新顶部时间进度与 6 张卡片。
+        从各状态文件读取 created_at / last_save_time 及内容，更新顶部时间进度与 7 张卡片。
+        包含：凯利仓位、贝叶斯胜率、TP/SL、市场状态、出场时机、门控拦截、近似信号
         """
         all_created: List[float] = []
         all_last_save: List[float] = []
@@ -1102,29 +1281,86 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
             if kelly_max is None:
                 kelly_max = PAPER_TRADING_CONFIG.get("KELLY_MAX_POSITION", 0.8)
             if kelly_min is None:
-                kelly_min = PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.1)
+                kelly_min = PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.05)
             # 显示为百分比（若存的是 0~1）
             kelly_max_pct = int(kelly_max * 100) if isinstance(kelly_max, (int, float)) and 0 < kelly_max <= 1 else int(kelly_max)
             kelly_min_pct = int(kelly_min * 100) if isinstance(kelly_min, (int, float)) and 0 < kelly_min <= 1 else int(kelly_min)
             hist = kelly_adapter.get("adjustment_history") or data.get("parameter_history") or []
-            sample_count = len(hist) if isinstance(hist, list) else 0
+            # 样本数 = 使用凯利仓位的交易笔数（来自 kelly_fraction_stats 或 position_distribution），不再用调整次数
+            kelly_fraction_stats = kelly_adapter.get("kelly_fraction_stats") or {}
+            trade_count = 0
+            if isinstance(kelly_fraction_stats, dict):
+                for v in kelly_fraction_stats.values():
+                    if isinstance(v, dict) and "trades" in v:
+                        trade_count += int(v.get("trades", 0))
+            if trade_count == 0:
+                pos_dist = kelly_adapter.get("position_distribution") or []
+                trade_count = len(pos_dist) if isinstance(pos_dist, list) else 0
+            sample_count = trade_count
             last_adj = ""
             for h in reversed((hist[:10] if isinstance(hist, list) else [])):
                 if isinstance(h, dict) and ("KELLY" in str(h.get("parameter", "")) or "kelly" in str(h.get("parameter", "")).lower()):
                     last_adj = f"{h.get('parameter', '')} {h.get('old_value', '')}→{h.get('new_value', '')}"
                     break
-            self._card_kelly.set_sample_count(f"样本: {sample_count}笔" if sample_count else "")
-            self._card_kelly.set_content([
-                ("KELLY_FRACTION", f"{kelly_fraction:.2f}", "0.25~1.0", "✓ 已学习" if sample_count else "-- 未学习"),
-                ("KELLY_MAX", f"{kelly_max_pct}%", "50%~90%", "✓ 已学习" if sample_count else "-- 未学习"),
-                ("KELLY_MIN", f"{kelly_min_pct}%", "3%~10%", "✓ 已学习" if sample_count else "-- 未学习"),
-            ], last_adj)
+            # 获取杠杆值和统计信息
+            leverage = kelly_adapter.get("leverage") or PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 10)
+            recent_perf = kelly_adapter.get("recent_performance", [])
+            avg_profit = sum(recent_perf) / len(recent_perf) if recent_perf else 0
+            
+            # 学习进度与状态：按「凯利交易笔数」判定，≥20 笔视为已学习，>0 笔为学习中
+            adj_count = len(hist) if isinstance(hist, list) else 0
+            learning_progress = min(sample_count / 20, 1.0) if sample_count else 0
+            status = "✓ 已学习" if sample_count >= 20 else ("≈ 学习中" if sample_count > 0 else "-- 未学习")
+            effect_text = f"平均收益 {avg_profit:+.2f}%" if recent_perf else "-"
+            # 样本与学习次数：始终显示「样本 N 笔」；有调整时显示「已调整 M 次」
+            sample_text = f"样本: {sample_count}笔"
+            if adj_count > 0:
+                sample_text += f" · 已调整 {adj_count}次"
+            self._card_kelly.set_sample_count(sample_text)
+            self._card_kelly.set_status("active" if sample_count >= 20 else ("learning" if sample_count > 0 else "inactive"))
+            self._card_kelly.set_content_with_progress([
+                {
+                    "name": "KELLY_FRACTION",
+                    "value": f"{kelly_fraction:.2f}",
+                    "range": "0.25~1.0",
+                    "progress": learning_progress,
+                    "color": "#4CAF50",
+                    "status": status
+                },
+                {
+                    "name": "KELLY_MAX",
+                    "value": f"{kelly_max_pct}%",
+                    "range": "50%~90%",
+                    "progress": kelly_max / 1.0 if kelly_max and kelly_max <= 1 else (kelly_max or 0) / 100,
+                    "color": "#2196F3",
+                    "status": status,
+                    "tooltip": "单笔最大仓位上限（占资金比例）。当前 80% 表示单笔最多用 80% 资金开仓，避免单笔过重。"
+                },
+                {
+                    "name": "KELLY_MIN",
+                    "value": f"{kelly_min_pct}%",
+                    "range": "3%~10%",
+                    "progress": kelly_min / 0.1 if kelly_min and kelly_min <= 1 else (kelly_min or 0) / 10,
+                    "color": "#FF9800",
+                    "status": status
+                },
+                {
+                    "name": "LEVERAGE",
+                    "value": f"{leverage}x",
+                    "range": "5x~50x",
+                    "progress": min(leverage / 50, 1.0),
+                    "color": "#9C27B0",
+                    "status": status
+                },
+            ], last_adj, effect_text)
         else:
-            self._card_kelly.set_sample_count("")
+            self._card_kelly.set_sample_count("样本: 0笔")
+            self._card_kelly.set_status("inactive")
             self._card_kelly.set_content([
                 ("KELLY_FRACTION", "-", "0.8~1.0", "-- 未学习"),
                 ("KELLY_MAX", "-", "50%~90%", "-- 未学习"),
                 ("KELLY_MIN", "-", "3%~10%", "-- 未学习"),
+                ("LEVERAGE", "-", "5x~50x", "-- 未学习"),
             ], "")
 
         # ── 贝叶斯（bayesian_state.json）──
@@ -1140,13 +1376,41 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
             dists = data.get("distributions", {})
             total_recv = state.get("total_signals_received", 0)
             total_acc = state.get("total_signals_accepted", 0)
-            sample = total_recv
-            status = "✓ 已学习" if len(dists) > 0 or total_recv > 0 else "-- 未学习"
-            self._card_bayesian.set_sample_count(f"样本: {total_recv} 信号" if sample else "")
-            self._card_bayesian.set_content([
-                ("分布数", str(len(dists)), "-", status),
-                ("总信号/通过", f"{total_recv} / {total_acc}", "-", status),
-            ], "")
+            
+            # 计算通过率和学习进度
+            pass_rate = (total_acc / total_recv * 100) if total_recv > 0 else 0
+            learning_progress = min(total_recv / 50, 1.0) if total_recv else 0
+            status = "✓ 已学习" if total_recv >= 50 else ("≈ 学习中" if total_recv > 0 else "-- 未学习")
+            effect_text = f"通过率 {pass_rate:.1f}%" if total_recv > 0 else "-"
+            
+            self._card_bayesian.set_sample_count(f"样本: {total_recv} 信号" if total_recv else "")
+            self._card_bayesian.set_status("active" if total_recv >= 50 else ("learning" if total_recv > 0 else "inactive"))
+            self._card_bayesian.set_content_with_progress([
+                {
+                    "name": "分布数量",
+                    "value": str(len(dists)),
+                    "range": f"{total_recv}个信号",
+                    "progress": min(len(dists) / 10, 1.0),
+                    "color": "#2196F3",
+                    "status": status
+                },
+                {
+                    "name": "信号通过率",
+                    "value": f"{pass_rate:.1f}%" if total_recv > 0 else "-",
+                    "range": f"{total_acc}/{total_recv}",
+                    "progress": pass_rate / 100 if total_recv > 0 else 0,
+                    "color": "#4CAF50" if pass_rate >= 60 else ("#FFA726" if pass_rate >= 40 else "#F44336"),
+                    "status": status
+                },
+                {
+                    "name": "学习进度",
+                    "value": f"{int(learning_progress * 100)}%",
+                    "range": "目标50信号",
+                    "progress": learning_progress,
+                    "color": "#00BCD4",
+                    "status": status
+                },
+            ], "", effect_text)
         else:
             self._card_bayesian.set_sample_count("")
             self._card_bayesian.set_content([
@@ -1166,16 +1430,116 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
                 all_last_save.append(float(last_save))
             total_rec = state.get("total_records", 0)
             total_ev = state.get("total_evaluations", 0)
+            
+            # 计算评估进度
+            eval_rate = (total_ev / total_rec * 100) if total_rec > 0 else 0
+            learning_progress = min(total_rec / 30, 1.0) if total_rec else 0
+            status = "✓ 已学习" if total_rec >= 30 else ("≈ 学习中" if total_rec > 0 else "-- 未学习")
+            effect_text = f"评估率 {eval_rate:.1f}%" if total_rec > 0 else "-"
+            
             self._card_tpsl.set_sample_count(f"样本: {total_rec}笔" if total_rec else "")
-            self._card_tpsl.set_content([
-                ("记录数", str(total_rec), "-", "✓ 已学习" if total_rec else "-- 未学习"),
-                ("已评估", str(total_ev), "-", "✓ 已学习" if total_ev else "-- 未学习"),
-            ], "")
+            self._card_tpsl.set_status("active" if total_rec >= 30 else ("learning" if total_rec > 0 else "inactive"))
+            self._card_tpsl.set_content_with_progress([
+                {
+                    "name": "交易记录",
+                    "value": str(total_rec),
+                    "range": "目标30笔",
+                    "progress": learning_progress,
+                    "color": "#FF9800",
+                    "status": status
+                },
+                {
+                    "name": "已评估",
+                    "value": str(total_ev),
+                    "range": f"{eval_rate:.1f}%完成",
+                    "progress": eval_rate / 100 if total_rec > 0 else 0,
+                    "color": "#4CAF50",
+                    "status": status
+                },
+            ], "", effect_text)
         else:
             self._card_tpsl.set_sample_count("")
             self._card_tpsl.set_content([
                 ("记录数", "-", "-", "-- 未学习"),
                 ("已评估", "-", "-", "-- 未学习"),
+            ], "")
+
+        # ── 市场状态自适应（adaptive_controller_state.json - regime_adapter）──
+        data = self._load_state_file("kelly")  # 复用凯利文件中的 regime_adapter
+        if data:
+            regime_adapter = data.get("regime_adapter") or {}
+            regime_accuracy = regime_adapter.get("regime_accuracy", {})
+            adjustment_history = regime_adapter.get("adjustment_history", [])
+            
+            # 计算总体准确率
+            total_correct = sum(stats.get("correct", 0) for stats in regime_accuracy.values())
+            total_wrong = sum(stats.get("wrong", 0) for stats in regime_accuracy.values())
+            total_pred = total_correct + total_wrong
+            overall_acc = (total_correct / total_pred * 100) if total_pred > 0 else 0
+            
+            # 找出表现最好和最差的市场状态
+            regime_scores = []
+            for regime, stats in regime_accuracy.items():
+                correct = stats.get("correct", 0)
+                wrong = stats.get("wrong", 0)
+                total = correct + wrong
+                if total >= 3:  # 至少3个样本
+                    acc = correct / total * 100
+                    regime_scores.append((regime, acc, total))
+            
+            regime_scores.sort(key=lambda x: x[1], reverse=True)
+            best_regime = regime_scores[0] if regime_scores else ("未知", 0, 0)
+            worst_regime = regime_scores[-1] if len(regime_scores) > 1 else ("未知", 0, 0)
+            
+            # 最近调整
+            last_adj = ""
+            if adjustment_history:
+                last = adjustment_history[-1] if isinstance(adjustment_history, list) else {}
+                if isinstance(last, dict):
+                    param = last.get("parameter", "")
+                    old_val = last.get("old_value", "")
+                    new_val = last.get("new_value", "")
+                    last_adj = f"{param}: {old_val}→{new_val}"
+            
+            # 状态判断
+            status = "✓ 已学习" if total_pred >= 10 else ("≈ 学习中" if total_pred > 0 else "-- 未学习")
+            effect_text = f"准确率 {overall_acc:.1f}%" if total_pred > 0 else "-"
+            
+            self._card_regime.set_sample_count(f"预测: {total_pred}次" if total_pred else "")
+            self._card_regime.set_status("active" if total_pred >= 10 else ("learning" if total_pred > 0 else "inactive"))
+            self._card_regime.set_content_with_progress([
+                {
+                    "name": "整体准确率",
+                    "value": f"{overall_acc:.1f}%" if total_pred > 0 else "-",
+                    "range": f"{total_pred}次预测",
+                    "progress": overall_acc / 100 if total_pred > 0 else 0,
+                    "color": "#4CAF50" if overall_acc >= 65 else ("#FFA726" if overall_acc >= 50 else "#F44336"),
+                    "status": status
+                },
+                {
+                    "name": f"最佳: {best_regime[0]}",
+                    "value": f"{best_regime[1]:.1f}%" if best_regime[2] > 0 else "-",
+                    "range": f"{best_regime[2]}笔",
+                    "progress": best_regime[1] / 100 if best_regime[2] > 0 else 0,
+                    "color": "#4CAF50",
+                    "status": "✓" if best_regime[2] >= 5 else "≈"
+                },
+                {
+                    "name": f"待改进: {worst_regime[0]}",
+                    "value": f"{worst_regime[1]:.1f}%" if worst_regime[2] > 0 and worst_regime[0] != best_regime[0] else "-",
+                    "range": f"{worst_regime[2]}笔" if worst_regime[2] > 0 else "-",
+                    "progress": worst_regime[1] / 100 if worst_regime[2] > 0 and worst_regime[0] != best_regime[0] else 0,
+                    "color": "#F44336",
+                    "status": "△"
+                },
+            ], last_adj, effect_text)
+        else:
+            self._card_regime.set_sample_count("")
+            self._card_regime.set_status("inactive")
+            self._card_regime.set_content([
+                ("整体准确率", "-", "-", "-- 未学习"),
+                ("市场状态数", "-", "-", "-- 未学习"),
+                ("阈值调整", "-", "-", "-- 未学习"),
             ], "")
 
         # ── 门控拦截（rejection_tracker_state.json）──
@@ -1190,11 +1554,33 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
                 all_last_save.append(float(last_save))
             total_rej = state.get("total_rejections_recorded", 0)
             total_ev = state.get("total_evaluations_done", 0)
+            
+            # 计算评估进度和拦截率
+            eval_rate = (total_ev / total_rej * 100) if total_rej > 0 else 0
+            learning_progress = min(total_rej / 20, 1.0) if total_rej else 0
+            status = "✓ 已学习" if total_rej >= 20 else ("≈ 学习中" if total_rej > 0 else "-- 未学习")
+            effect_text = f"{total_rej}次拦截" if total_rej > 0 else "-"
+            
             self._card_rejection.set_sample_count(f"样本: {total_rej}笔" if total_rej else "")
-            self._card_rejection.set_content([
-                ("拒绝记录", str(total_rej), "-", "✓ 已学习" if total_rej else "-- 未学习"),
-                ("已评估", str(total_ev), "-", "✓ 已学习" if total_ev else "-- 未学习"),
-            ], "")
+            self._card_rejection.set_status("active" if total_rej >= 20 else ("learning" if total_rej > 0 else "inactive"))
+            self._card_rejection.set_content_with_progress([
+                {
+                    "name": "拦截记录",
+                    "value": str(total_rej),
+                    "range": "目标20笔",
+                    "progress": learning_progress,
+                    "color": "#F44336",
+                    "status": status
+                },
+                {
+                    "name": "已评估",
+                    "value": str(total_ev),
+                    "range": f"{eval_rate:.1f}%完成",
+                    "progress": eval_rate / 100 if total_rej > 0 else 0,
+                    "color": "#4CAF50",
+                    "status": status
+                },
+            ], "", effect_text)
         else:
             self._card_rejection.set_sample_count("")
             self._card_rejection.set_content([
@@ -1214,11 +1600,33 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
                 all_last_save.append(float(last_save))
             total_ex = state.get("total_exits_recorded", 0)
             total_ev = state.get("total_evaluations_done", 0)
+            
+            # 计算评估进度
+            eval_rate = (total_ev / total_ex * 100) if total_ex > 0 else 0
+            learning_progress = min(total_ex / 25, 1.0) if total_ex else 0
+            status = "✓ 已学习" if total_ex >= 25 else ("≈ 学习中" if total_ex > 0 else "-- 未学习")
+            effect_text = f"{total_ex}次出场" if total_ex > 0 else "-"
+            
             self._card_exit_timing.set_sample_count(f"样本: {total_ex}笔" if total_ex else "")
-            self._card_exit_timing.set_content([
-                ("出场记录", str(total_ex), "-", "✓ 已学习" if total_ex else "-- 未学习"),
-                ("已评估", str(total_ev), "-", "✓ 已学习" if total_ev else "-- 未学习"),
-            ], "")
+            self._card_exit_timing.set_status("active" if total_ex >= 25 else ("learning" if total_ex > 0 else "inactive"))
+            self._card_exit_timing.set_content_with_progress([
+                {
+                    "name": "出场记录",
+                    "value": str(total_ex),
+                    "range": "目标25笔",
+                    "progress": learning_progress,
+                    "color": "#9C27B0",
+                    "status": status
+                },
+                {
+                    "name": "已评估",
+                    "value": str(total_ev),
+                    "range": f"{eval_rate:.1f}%完成",
+                    "progress": eval_rate / 100 if total_ex > 0 else 0,
+                    "color": "#4CAF50",
+                    "status": status
+                },
+            ], "", effect_text)
         else:
             self._card_exit_timing.set_sample_count("")
             self._card_exit_timing.set_content([
@@ -1238,11 +1646,33 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
                 all_last_save.append(float(last_save))
             total_nm = state.get("total_near_misses_recorded", 0)
             total_ev = state.get("total_evaluations_done", 0)
+            
+            # 计算评估进度
+            eval_rate = (total_ev / total_nm * 100) if total_nm > 0 else 0
+            learning_progress = min(total_nm / 15, 1.0) if total_nm else 0
+            status = "✓ 已学习" if total_nm >= 15 else ("≈ 学习中" if total_nm > 0 else "-- 未学习")
+            effect_text = f"{total_nm}个近似" if total_nm > 0 else "-"
+            
             self._card_near_miss.set_sample_count(f"样本: {total_nm}笔" if total_nm else "")
-            self._card_near_miss.set_content([
-                ("近似信号记录", str(total_nm), "-", "✓ 已学习" if total_nm else "-- 未学习"),
-                ("已评估", str(total_ev), "-", "✓ 已学习" if total_ev else "-- 未学习"),
-            ], "")
+            self._card_near_miss.set_status("active" if total_nm >= 15 else ("learning" if total_nm > 0 else "inactive"))
+            self._card_near_miss.set_content_with_progress([
+                {
+                    "name": "近似信号",
+                    "value": str(total_nm),
+                    "range": "目标15个",
+                    "progress": learning_progress,
+                    "color": "#607D8B",
+                    "status": status
+                },
+                {
+                    "name": "已评估",
+                    "value": str(total_ev),
+                    "range": f"{eval_rate:.1f}%完成",
+                    "progress": eval_rate / 100 if total_nm > 0 else 0,
+                    "color": "#4CAF50",
+                    "status": status
+                },
+            ], "", effect_text)
         else:
             self._card_near_miss.set_sample_count("")
             self._card_near_miss.set_content([
@@ -1417,16 +1847,16 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
                     ))
         
         # 分析追踪止损情况
-        trailing_records = [r for r in self._trade_records[-20:] 
+        trailing_records = [r for r in self._trade_records[-20:]
                           if "追踪" in r.close_reason or "保本" in r.close_reason]
         if trailing_records:
             avg_peak_loss = sum(r.peak_profit_pct - r.profit_pct for r in trailing_records) / len(trailing_records)
             if avg_peak_loss > 30:  # 峰值流失超过30%
-                current_ts = PAPER_TRADING_CONFIG.get("TRAILING_STAGE1_PCT", 1.0)
-                new_ts = max(current_ts - 0.2, 0.5)
+                current_ts = PAPER_TRADING_CONFIG.get("STAGED_TP_1_PCT", 5.0)
+                new_ts = max(current_ts - 0.5, 3.0)
                 if new_ts != current_ts:
                     results.append(AdaptationResult(
-                        parameter="TRAILING_STAGE1_PCT",
+                        parameter="STAGED_TP_1_PCT",
                         old_value=current_ts,
                         new_value=new_ts,
                         reason=f"峰值利润流失{avg_peak_loss:.0f}%",

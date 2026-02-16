@@ -52,6 +52,9 @@ class TradeContext:
     exit_snapshot: Optional[Dict]
     peak_profit_pct: float
     
+    # 持仓过程（开仓→平仓之间的指标快照）
+    indicator_snapshots_during_hold: Optional[List[Dict]] = None
+    
     # 仓位大小
     position_pct: float = 0.5  # 仓位占账户的百分比
     
@@ -109,6 +112,8 @@ class TradeContext:
             elif isinstance(order.exit_snapshot, dict):
                 exit_snapshot = order.exit_snapshot
         
+        snapshots = getattr(order, 'indicator_snapshots', None) or getattr(order, 'indicator_snapshots_during_hold', None) or []
+        
         return TradeContext(
             order_id=order.order_id,
             symbol=order.symbol,
@@ -126,6 +131,7 @@ class TradeContext:
             market_regime_at_entry=getattr(order, 'regime_at_entry', '未知'),
             exit_snapshot=exit_snapshot,
             peak_profit_pct=order.peak_profit_pct,
+            indicator_snapshots_during_hold=snapshots if isinstance(snapshots, list) else list(snapshots) if snapshots else None,
             position_pct=position_pct,
             prototype_stats=prototype_stats,
             counterfactual_result=counterfactual_result,
@@ -145,16 +151,22 @@ class DeepSeekReviewer:
             config: DEEPSEEK_CONFIG from config.py
         """
         self.enabled = config.get("ENABLED", False)
-        self.api_key = config.get("API_KEY", "")
+        self.api_key = (config.get("API_KEY", "") or "").strip()
         self.model = config.get("MODEL", "deepseek-chat")
-        self.max_tokens = config.get("MAX_TOKENS", 800)
+        self.max_tokens = config.get("MAX_TOKENS", 2000)
         self.temperature = config.get("TEMPERATURE", 0.3)
-        self.api_url = "https://api.deepseek.com/v1/chat/completions"
+        # 官方示例使用 /chat/completions（无 /v1），与 OpenAI 兼容的 v1 路径若返回 401 可尝试此处
+        self.api_url = "https://api.deepseek.com/chat/completions"
         
         # 结果存储目录
         self.reviews_dir = "data/deepseek_reviews"
         os.makedirs(self.reviews_dir, exist_ok=True)
-        
+
+        if self.enabled and self.api_key:
+            print(f"[DeepSeekReviewer] API Key 已加载 (长度 {len(self.api_key)} 字符)，端点: {self.api_url}")
+        elif self.enabled and not self.api_key:
+            print("[DeepSeekReviewer] 已启用但未读到 API Key，请检查 .env 中 DEEPSEEK_API_KEY 与启动目录")
+
         # 异步任务队列
         self.pending_reviews: List[TradeContext] = []
         self.review_thread: Optional[threading.Thread] = None
@@ -248,7 +260,7 @@ class DeepSeekReviewer:
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是一位专业的量化交易分析师，擅长复盘交易、识别问题、提出改进建议。请用中文回答，简洁且有针对性。"
+                    "content": "你是一位专业的量化交易分析师，擅长复盘交易、识别问题、提出改进建议。请用中文回答，对每一条检查项给出明确结论：通过则简要说明理由，有问题则展开分析原因、可能后果、以及具体改进建议（含数值或逻辑）。不要只写结论，关键项要有 1～3 句论证或建议。"
                 },
                 {
                     "role": "user",
@@ -317,15 +329,39 @@ class DeepSeekReviewer:
 - 入场理由: {ctx.entry_reason}
 """
         
-        # 入场指标快照
+        # 入场指标快照（开仓时刻）
         if ctx.entry_snapshot:
             prompt += f"""
+## 入场时指标（开仓时刻）
 - KDJ: J={ctx.entry_snapshot.get('kdj_j', 0):.1f}, D={ctx.entry_snapshot.get('kdj_d', 0):.1f}, K={ctx.entry_snapshot.get('kdj_k', 0):.1f} (趋势: {ctx.entry_snapshot.get('kdj_trend', 'flat')})
-- MACD: 柱状图={ctx.entry_snapshot.get('macd_hist', 0):.2f}, 斜率={ctx.entry_snapshot.get('macd_hist_slope', 0):.2f}
-- RSI: {ctx.entry_snapshot.get('rsi', 50):.1f}
-- ADX: {ctx.entry_snapshot.get('adx', 0):.1f}
-- 布林位置: {ctx.entry_snapshot.get('boll_position', 0.5):.2f} (0=下轨, 1=上轨)
+- MACD: 柱={ctx.entry_snapshot.get('macd_hist', 0):.2f}, 斜率={ctx.entry_snapshot.get('macd_hist_slope', 0):.2f}
+- RSI: {ctx.entry_snapshot.get('rsi', 50):.1f} | ADX: {ctx.entry_snapshot.get('adx', 0):.1f}
+- 布林位置: {ctx.entry_snapshot.get('boll_position', 0.5):.2f} (0=下轨 1=上轨) | ATR: {ctx.entry_snapshot.get('atr', 0):.2f}
 """
+        
+        # 出场指标快照（平仓时刻）
+        if ctx.exit_snapshot:
+            prompt += f"""
+## 出场时指标（平仓时刻）
+- KDJ: J={ctx.exit_snapshot.get('kdj_j', 0):.1f}, D={ctx.exit_snapshot.get('kdj_d', 0):.1f}, K={ctx.exit_snapshot.get('kdj_k', 0):.1f} (趋势: {ctx.exit_snapshot.get('kdj_trend', 'flat')})
+- MACD: 柱={ctx.exit_snapshot.get('macd_hist', 0):.2f}, 斜率={ctx.exit_snapshot.get('macd_hist_slope', 0):.2f}
+- RSI: {ctx.exit_snapshot.get('rsi', 50):.1f} | ADX: {ctx.exit_snapshot.get('adx', 0):.1f}
+- 布林位置: {ctx.exit_snapshot.get('boll_position', 0.5):.2f} | ATR: {ctx.exit_snapshot.get('atr', 0):.2f}
+"""
+        
+        # 持仓过程（开仓→平仓的指标变化）
+        snaps = ctx.indicator_snapshots_during_hold or []
+        if snaps:
+            recent = snaps[-8:] if len(snaps) >= 8 else snaps
+            prompt += "\n## 持仓过程（指标变化）\n"
+            for i, s in enumerate(recent):
+                if isinstance(s, dict):
+                    bar = s.get('bar_idx', i)
+                    kdj = s.get('kdj_j', 0)
+                    macd = s.get('macd_hist', 0)
+                    rsi = s.get('rsi', 50)
+                    price = s.get('price', 0)
+                    prompt += f"- 第{bar}根: 价={price:.2f} KDJ-J={kdj:.0f} MACD={macd:+.1f} RSI={rsi:.0f}\n"
         
         # 反事实分析
         if ctx.counterfactual_result:
@@ -421,14 +457,239 @@ class DeepSeekReviewer:
 
 ## 重要说明
 ⚠️ 你的分析**仅供参考**，不会自动修改系统参数。
-✓ 请给出**具体的、可操作的**建议，包含数值和逻辑。
-✓ 如果某项检查通过，简单说"✓ 合理"；如果有问题，详细说明**为什么**有问题以及**如何改进**。
-✓ 重点突出**实际问题**和**具体改进方向**。
-
-请简洁回答，控制在800字以内。
+✓ 对**有问题的项**：请展开写清原因、影响、以及可操作改进（含数值或逻辑），每条至少 1～3 句。
+✓ 对**通过的项**：可简要写"✓ 合理"并附一句理由。
+✓ 重点突出**实际问题**和**具体改进方向**，不必刻意压缩字数，保证意见充分、可执行。
 """
         
         return prompt
+    
+    def request_holding_advice_async(self, order, df, state, reasoning_result, on_result):
+        """
+        持仓中实时 DeepSeek 建议（交易员角色）
+        
+        传入：持仓摘要、5层推理、指标、系统决策
+        返回：是否继续持仓/是否平仓 + 对系统决策的评判
+        先仅展示，不参与执行。
+        
+        Args:
+            order: PaperOrder 当前持仓
+            df: DataFrame K线数据
+            state: EngineState（用于写入结果）
+            reasoning_result: ReasoningResult 5层推理
+            on_result: callback(state) 结果回调，在主线程更新 state
+        """
+        if not self.enabled or not self.api_key:
+            return
+        def _worker():
+            try:
+                prompt = self._build_holding_prompt(order, df, state, reasoning_result)
+                result = self._call_holding_api(prompt)
+                if result and on_result:
+                    on_result(result)
+            except Exception as e:
+                if on_result:
+                    on_result({"advice": "", "judgement": f"请求失败: {e}", "error": str(e)})
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+    
+    def _build_holding_prompt(self, order, df, state, reasoning_result) -> str:
+        """构建持仓中 DeepSeek 提示词（含开仓、持仓过程、当前指标）"""
+        side = getattr(order, 'side', None)
+        side_str = side.value if hasattr(side, 'value') else "LONG"
+        entry_price = getattr(order, 'entry_price', 0)
+        current_price = state.current_price if hasattr(state, 'current_price') else entry_price
+        profit_pct = getattr(order, 'profit_pct', 0)
+        peak_pct = getattr(order, 'peak_profit_pct', 0)
+        similarity = getattr(order, 'current_similarity', 0) or getattr(order, 'entry_similarity', 0)
+        hold_bars = getattr(order, 'hold_bars', 0)
+        regime = getattr(state, 'market_regime', '未知')
+        regime_at_entry = getattr(order, 'regime_at_entry', regime)
+        exit_sug = getattr(state, 'holding_exit_suggestion', '继续持有')
+        tpsl_action = getattr(state, 'tpsl_action', 'hold')
+        position_sug = getattr(state, 'position_suggestion', '维持')
+        tp = getattr(order, 'take_profit', None)
+        sl = getattr(order, 'stop_loss', None)
+        partial_tp = getattr(order, 'partial_tp_count', 0)
+        partial_sl = getattr(order, 'partial_sl_count', 0)
+        partial_tp_count = getattr(order, 'partial_tp_count', 0)
+        entry_atr = getattr(order, 'entry_atr', 0)
+        
+        # 当前K线指标（从 df 最后一根读取）
+        curr = {}
+        if df is not None and len(df) > 0:
+            row = df.iloc[-1]
+            curr = {
+                'kdj_j': row.get('kdj_j', row.get('j', 50)),
+                'kdj_d': row.get('kdj_d', row.get('d', 50)),
+                'kdj_k': row.get('kdj_k', row.get('k', 50)),
+                'macd_hist': row.get('macd_hist', 0),
+                'macd_signal': row.get('macd_signal', 0),
+                'rsi': row.get('rsi_14', row.get('rsi', 50)),
+                'adx': row.get('adx', 25),
+                'boll_position': row.get('boll_position', 0.5),
+                'atr': row.get('atr', 0),
+                'volume_ratio': row.get('volume_ratio', 1.0),
+                'open': row.get('open', current_price),
+                'high': row.get('high', current_price),
+                'low': row.get('low', current_price),
+                'close': row.get('close', current_price),
+            }
+        
+        # 入场时指标（entry_snapshot 或 indicator_snapshots 首根）
+        entry_ind = {}
+        if hasattr(order, 'entry_snapshot') and order.entry_snapshot:
+            sn = order.entry_snapshot
+            if hasattr(sn, 'to_dict'):
+                entry_ind = sn.to_dict()
+            elif isinstance(sn, dict):
+                entry_ind = sn
+        snaps = getattr(order, 'indicator_snapshots', []) or getattr(order, 'indicator_snapshots_during_hold', [])
+        if not entry_ind and snaps:
+            entry_ind = snaps[0] if isinstance(snaps[0], dict) else {}
+        
+        prompt = f"""你是一位专业期货交易员，正在管理一笔持仓。请基于**开仓、持仓过程、当前指标**的全过程数据给出决策建议，并评判当前系统决策是否合理。
+
+## 一、开仓与持仓摘要
+- 方向: {side_str}
+- 入场价: {entry_price:.2f} | 当前价: {current_price:.2f}
+- 盈亏(含杠杆): {profit_pct:+.2f}% | 峰值: {peak_pct:+.2f}%
+- 止盈价: {tp} | 止损价: {sl}
+- 相似度: {similarity:.1%} | 持仓: {hold_bars}根K线
+- 分段止盈: {partial_tp}次 | 分段止损: {partial_sl}次
+- 入场ATR: {entry_atr:.2f} | 市场(入场→当前): {regime_at_entry} → {regime}
+
+## 二、入场时指标（开仓时刻）
+"""
+        if entry_ind:
+            prompt += f"""- KDJ: J={entry_ind.get('kdj_j', 0):.1f} D={entry_ind.get('kdj_d', 0):.1f} K={entry_ind.get('kdj_k', 0):.1f} 趋势={entry_ind.get('kdj_trend', 'flat')}
+- MACD: 柱={entry_ind.get('macd_hist', 0):.2f} 斜率={entry_ind.get('macd_hist_slope', 0):.2f}
+- RSI: {entry_ind.get('rsi', 50):.1f} | ADX: {entry_ind.get('adx', 25):.1f}
+- 布林位置: {entry_ind.get('boll_position', 0.5):.2f} (0下轨 1上轨) | ATR: {entry_ind.get('atr', 0):.2f}
+"""
+        else:
+            prompt += "- (无快照)\n"
+        
+        prompt += f"""
+## 三、当前K线指标（最新）
+- KDJ: J={curr.get('kdj_j', 50):.1f} D={curr.get('kdj_d', 50):.1f} K={curr.get('kdj_k', 50):.1f}
+- MACD: 柱={curr.get('macd_hist', 0):.2f} 信号={curr.get('macd_signal', 0):.2f}
+- RSI: {curr.get('rsi', 50):.1f} | ADX: {curr.get('adx', 25):.1f}
+- 布林位置: {curr.get('boll_position', 0.5):.2f} (0下轨 1上轨)
+- ATR: {curr.get('atr', 0):.2f} | 量比: {curr.get('volume_ratio', 1.0):.2f}
+- 价格: O={curr.get('open', curr.get('close', current_price)):.2f} H={curr.get('high', current_price):.2f} L={curr.get('low', current_price):.2f} C={curr.get('close', current_price):.2f}
+
+## 四、持仓过程（最近指标变化）
+"""
+        # 持仓期间指标快照摘要（indicator_snapshots 每根K线存一次）
+        snaps = getattr(order, 'indicator_snapshots', []) or getattr(order, 'indicator_snapshots_during_hold', [])
+        if snaps:
+            recent = snaps[-5:] if len(snaps) >= 5 else snaps
+            for i, s in enumerate(recent):
+                if isinstance(s, dict):
+                    bar = s.get('bar_idx', i)
+                    kdj = s.get('kdj_j', 0)
+                    macd = s.get('macd_hist', 0)
+                    rsi = s.get('rsi', 50)
+                    prompt += f"- 第{bar}根: KDJ-J={kdj:.0f} MACD柱={macd:+.1f} RSI={rsi:.0f}\n"
+        else:
+            prompt += "- (无过程快照)\n"
+        
+        prompt += """
+## 五、5层推理与系统决策
+"""
+        if reasoning_result and hasattr(reasoning_result, 'layers'):
+            for i, layer in enumerate(reasoning_result.layers[:5]):
+                prompt += f"- {layer.name}: {layer.summary}\n"
+        if reasoning_result and hasattr(reasoning_result, 'verdict'):
+            prompt += f"- 综合判决: {reasoning_result.verdict}\n"
+        if reasoning_result and hasattr(reasoning_result, 'narrative'):
+            prompt += f"- 综合叙述: {reasoning_result.narrative}\n"
+        
+        prompt += f"""
+## 当前系统决策
+- 止盈建议: {exit_sug}
+- TP/SL动作: {tpsl_action}
+- 仓位建议: {position_sug}
+
+请用两段回答：
+1. **决策**：是否建议继续持仓？是否建议平仓或部分止盈？1-2句理由。
+2. **评判**：对当前系统决策的评判（同意/更保守/更激进 + 简短理由）。
+"""
+        return prompt
+    
+    def _call_holding_api(self, prompt: str) -> Optional[Dict]:
+        """调用 DeepSeek API 获取持仓建议"""
+        if not self.api_key:
+            return None
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "你是一位专业期货交易员，会收到开仓、持仓过程、当前指标的全过程数据。请基于这些指标（KDJ/MACD/RSI/ADX/布林/ATR等）和技术逻辑，结合开仓→持仓→当前的变化趋势，给出决策建议。用中文回答，简洁专业。"},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 400,
+        }
+        try:
+            response = requests.post(self.api_url, headers=headers, json=payload, timeout=15)
+            if response.status_code == 200:
+                result = response.json()
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return {"advice": content, "judgement": "", "error": None}
+            if response.status_code == 401:
+                try:
+                    err_body = response.json()
+                    err_msg = err_body.get("error", {}).get("message", response.text) if isinstance(err_body, dict) else response.text
+                except Exception:
+                    err_msg = response.text
+                print(f"[DeepSeekReviewer] 401 响应: {err_msg[:200]}")
+                return {
+                    "advice": "",
+                    "judgement": f"API 认证失败(401)：{err_msg[:80]}",
+                    "error": response.text,
+                }
+            return {"advice": "", "judgement": f"API错误: {response.status_code}", "error": response.text}
+        except Exception as e:
+            return {"advice": "", "judgement": f"请求失败: {e}", "error": str(e)}
+    
+    def request_idle_advice_async(self, state, df, on_result):
+        """
+        无持仓时每 2 分钟请求一次：当前市场/等待建议（1～2 句）。
+        on_result(result_dict) 在后台线程调用，主线程需通过信号接收。
+        """
+        if not self.enabled or not self.api_key:
+            return
+        price = getattr(state, "current_price", 0) or 0
+        regime = getattr(state, "market_regime", "未知")
+        bars = getattr(state, "total_bars", 0)
+        recent = ""
+        if df is not None and len(df) >= 3:
+            try:
+                closes = df["close"].iloc[-5:].tolist()
+                recent = "最近5根收盘: " + ", ".join(f"{c:.0f}" for c in closes)
+            except Exception:
+                recent = ""
+        prompt = f"""当前无持仓，等待信号。请给 1～2 句简要意见（市场状态、是否适合观望或可关注方向）。
+- 当前价: {price:.2f}
+- 市场状态: {regime}
+- 已处理K线: {bars}
+{("- " + recent) if recent else ""}
+请用中文回答，1～2 句即可。"""
+        def _worker():
+            try:
+                result = self._call_holding_api(prompt)
+                if result and on_result:
+                    on_result(result)
+            except Exception as e:
+                if on_result:
+                    on_result({"advice": "", "judgement": f"请求失败: {e}", "error": str(e)})
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
     
     def _save_review(self, order_id: str, review_result: Dict):
         """保存复盘结果到文件"""

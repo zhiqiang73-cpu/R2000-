@@ -398,6 +398,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # WF Evolution 信号
     _evo_progress_signal = QtCore.pyqtSignal(object)   # EvolutionProgress
     _evo_done_signal = QtCore.pyqtSignal(object)       # EvolutionResult
+    # DeepSeek 每 2 分钟意见结果（从工作线程发射到主线程）
+    _deepseek_interval_result = QtCore.pyqtSignal(dict)
     
     def __init__(self):
         super().__init__()
@@ -481,6 +483,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._deepseek_poll_timer = QtCore.QTimer(self)
         self._deepseek_poll_timer.setInterval(5000)  # 每5秒检查一次
         self._deepseek_poll_timer.timeout.connect(self._poll_deepseek_reviews)
+        # DeepSeek 每 2 分钟一次意见（持仓=持仓建议，无仓=市场/等待建议）
+        self._deepseek_interval_timer = QtCore.QTimer(self)
+        self._deepseek_interval_timer.setInterval(120000)  # 2 分钟
+        self._deepseek_interval_timer.timeout.connect(self._on_deepseek_interval_tick)
+        self._deepseek_interval_result.connect(self._on_deepseek_interval_result)
 
         # GA 完成信号（analysis_panel 在后续 _init_ui 中创建后再连接按钮）
         self._ga_done_signal.connect(self._on_ga_finished)
@@ -3414,6 +3421,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._live_chart_timer.start()
                 self._adaptive_dashboard_timer.start()
                 self._deepseek_poll_timer.start()
+                self._deepseek_interval_timer.start()
                 
                 # 初始化冷启动面板状态
                 self._init_cold_start_panel_from_engine()
@@ -3444,6 +3452,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # NEW: 停止自适应仪表板刷新
         self._adaptive_dashboard_timer.stop()
         self._deepseek_poll_timer.stop()
+        self._deepseek_interval_timer.stop()
         
         # NEW: 停止DeepSeek后台工作线程
         if hasattr(self, '_deepseek_reviewer'):
@@ -3454,6 +3463,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._adaptive_controller.save_state()
         self._adaptive_dashboard_timer.stop()
         self._deepseek_poll_timer.stop()
+        self._deepseek_interval_timer.stop()
         
         # 停止DeepSeek后台工作线程
         if self._deepseek_reviewer:
@@ -3582,6 +3592,21 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(object)
     def _update_live_state(self, state):
         """更新实时状态（主线程）"""
+        # 注入最新 DeepSeek 复盘到 state，供综合决策卡片显示
+        reviewer = getattr(self._live_engine, '_deepseek_reviewer', None) if self._live_engine else None
+        if reviewer and getattr(reviewer, 'enabled', False):
+            try:
+                recent = reviewer.get_all_reviews(limit=1)
+                if recent:
+                    r = recent[0]
+                    analysis = (r.get("analysis") or "").strip()
+                    if analysis:
+                        state.deepseek_holding_advice = analysis
+                        state.deepseek_judgement = (r.get("judgement") or "").strip()
+                        state.deepseek_heartbeat = True
+            except Exception:
+                pass
+        
         # 更新控制面板
         self.paper_trading_tab.control_panel.update_ws_status(state.is_connected)
         self.paper_trading_tab.control_panel.update_price(state.current_price)
@@ -3592,6 +3617,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._live_engine:
             order = self._live_engine.paper_trader.current_position
             self.paper_trading_tab.status_panel.update_position(order)
+            # 自适应杠杆亮灯：有凯利仓位学习即亮绿（会随学习调整，未必已调过）
+            ac = getattr(self._live_engine, "_adaptive_controller", None)
+            kelly = getattr(ac, "kelly_adapter", None) if ac else None
+            leverage_active = kelly is not None
+            self.paper_trading_tab.status_panel.update_adaptive_leverage_lamp(leverage_active)
+            # 开仓纪要：首次出现该持仓时记一笔
+            if order is not None:
+                last_id = getattr(self, "_last_adaptive_position_id", None)
+                if order.order_id != last_id:
+                    self._last_adaptive_position_id = order.order_id
+                    lev = getattr(order, "leverage", None) or (self._live_engine.paper_trader.leverage if self._live_engine.paper_trader else 10)
+                    kp = getattr(order, "kelly_position_pct", None)
+                    kp_str = f" 凯利{kp:.1%}" if kp and kp > 0 else ""
+                    self.adaptive_learning_tab.append_adaptive_journal(
+                        f"开仓 {order.side.value} 杠杆{lev}x{kp_str} @ {order.entry_price:,.2f} 数量{order.quantity:.4f}"
+                    )
+            else:
+                self._last_adaptive_position_id = None
             self.paper_trading_tab.status_panel.update_current_price(state.current_price)
             # 更新持仓标记（显示当前持仓在K线上的位置）
             current_idx = getattr(self._live_engine, "_current_bar_idx", None)
@@ -3601,9 +3644,14 @@ class MainWindow(QtWidgets.QMainWindow):
             stats = self._live_engine.get_stats()
             self.paper_trading_tab.status_panel.update_stats(stats)
             
-            # 更新推理引擎显示（如果有推理结果）
-            if hasattr(state, 'reasoning_result') and state.reasoning_result:
-                self.paper_trading_tab.update_reasoning_layers(state.reasoning_result)
+            # 更新推理引擎显示（综合决策在 status_panel 的「推理」子 tab）
+            status_panel = getattr(self.paper_trading_tab, 'status_panel', None)
+            if status_panel and hasattr(status_panel, 'update_reasoning_layers'):
+                status_panel.update_reasoning_layers(
+                    getattr(state, 'reasoning_result', None),
+                    state,
+                    order
+                )
             self.paper_trading_tab.control_panel.update_account_stats(stats)
             
             # 更新模板统计
@@ -3722,7 +3770,9 @@ class MainWindow(QtWidgets.QMainWindow):
             tracker = getattr(self._live_engine, "_exit_timing_tracker", None)
             if tracker:
                 from config import PAPER_TRADING_CONFIG as _ptc_exit
-                exit_suggestions = tracker.get_suggestions(_ptc_exit)
+                state = getattr(self._live_engine, "state", None)
+                current_regime = getattr(state, "market_regime", "") or ""
+                exit_suggestions = tracker.get_suggestions(_ptc_exit, current_regime=current_regime)
             self.adaptive_learning_tab.update_exit_timing(exit_records, exit_scores, exit_suggestions)
 
             # 止盈止损
@@ -3901,6 +3951,35 @@ class MainWindow(QtWidgets.QMainWindow):
                             self.adaptive_learning_tab.trade_timeline.update_deepseek_review(order_id, review)
         except Exception as e:
             print(f"[MainWindow] 轮询DeepSeek复盘结果失败: {e}")
+    
+    def _on_deepseek_interval_tick(self):
+        """每 2 分钟触发：有持仓请求持仓建议，无持仓请求市场/等待建议。"""
+        if not self._live_engine or not getattr(self._live_engine, '_deepseek_reviewer', None) or not self._live_engine._deepseek_reviewer.enabled:
+            return
+        reviewer = self._live_engine._deepseek_reviewer
+        state = self._live_engine.state
+        df = getattr(self._live_engine, 'get_df_for_chart', lambda: None)() if self._live_engine else None
+        if df is None:
+            df = getattr(self._live_engine, '_df_buffer', None)
+        order = self._live_engine.paper_trader.current_position if self._live_engine else None
+        reasoning = getattr(state, 'reasoning_result', None)
+        def on_result(result):
+            self._deepseek_interval_result.emit(result)
+        if order is not None:
+            reviewer.request_holding_advice_async(order, df, state, reasoning, on_result)
+        else:
+            reviewer.request_idle_advice_async(state, df, on_result)
+    
+    @QtCore.pyqtSlot(dict)
+    def _on_deepseek_interval_result(self, result):
+        """主线程：把 2 分钟意见写入 state，供推理/DeepSeek 展示。"""
+        if not self._live_engine:
+            return
+        advice = (result.get("advice") or "").strip()
+        judgement = (result.get("judgement") or "").strip()
+        self._live_engine.state.deepseek_holding_advice = advice
+        self._live_engine.state.deepseek_judgement = judgement
+        self._live_engine.state.deepseek_heartbeat = True
     
     def _refresh_adaptive_timeline(self):
         """刷新自适应学习时间线（检查新的复盘结果）- 别名方法"""
@@ -4435,9 +4514,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # 根据真实平仓原因 + 追踪阶段 确定标记类型
             close_reason_str = None
             if order.close_reason:
-                reason_val = order.close_reason.value  # "止盈"/"止损"/"脱轨"/"超时"/"信号"/"手动"
+                reason_val = order.close_reason.value  # "止盈"/"止损"/"分段止盈"/"分段止损"/"脱轨"/"超时"/"信号"/"手动"
                 trailing = getattr(order, "trailing_stage", 0)
-                if reason_val == "止盈" and trailing >= 1 and order.profit_pct < 0.3:
+                if reason_val in ("分段止盈", "分段止损"):
+                    close_reason_str = reason_val
+                elif reason_val == "止盈" and trailing >= 1 and order.profit_pct < 0.3:
                     # 追踪止损触发在保本区 (利润<0.3%) → 保本平仓
                     close_reason_str = "保本"
                 elif reason_val == "止盈":
@@ -4475,8 +4556,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception as e:
                     print(f"[MainWindow] 添加交易到时间线失败: {e}")
             
-            # 记录事件（使用细化后的平仓原因）
+            # 记录事件（使用细化后的平仓原因；若有 close_reason_detail 则一并展示）
             reason_display = close_reason_str or (order.close_reason.value if order.close_reason else "未知")
+            detail = getattr(order, "close_reason_detail", "") or ""
+            if detail:
+                reason_display = f"{reason_display}({detail})"
             profit_color = "盈利" if order.profit_pct >= 0 else "亏损"
             pnl_usdt = getattr(order, "realized_pnl", 0.0)
             event_msg = (
@@ -4485,6 +4569,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"原因={reason_display} | 持仓={order.hold_bars}根K线"
             )
             self.paper_trading_tab.status_panel.append_event(event_msg)
+            
+            # 自适应页·开平仓纪要：平仓一条
+            reason_display = close_reason_str or (order.close_reason.value if order.close_reason else "未知")
+            self.adaptive_learning_tab.append_adaptive_journal(
+                f"平仓 {side} 盈亏{order.profit_pct:+.2f}% ({getattr(order, 'realized_pnl', 0):+.2f} USDT) 原因={reason_display} 持仓{order.hold_bars}根K"
+            )
             
             # NEW: 添加交易到时间线
             self.adaptive_learning_tab.add_trade_to_timeline(order, deepseek_review=None)

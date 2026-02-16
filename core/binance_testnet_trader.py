@@ -354,6 +354,26 @@ class BinanceTestnetTrader:
             })
         except Exception:
             pass
+    
+    def set_leverage(self, leverage: int):
+        """运行时修改杠杆"""
+        if leverage < 1 or leverage > 125:
+            raise ValueError(f"杠杆倍数必须在1-125之间，当前: {leverage}")
+        
+        old_leverage = self.leverage
+        self.leverage = leverage
+        
+        # 调用交易所API修改杠杆
+        try:
+            self._signed_request("POST", "/fapi/v1/leverage", {
+                "symbol": self.symbol,
+                "leverage": int(leverage),
+            })
+            print(f"[BinanceTestnet] 杠杆已更新: {old_leverage}x -> {leverage}x")
+        except Exception as e:
+            # 如果API调用失败，回滚本地值
+            self.leverage = old_leverage
+            raise Exception(f"更新杠杆失败: {e}")
 
     def _get_usdt_balance(self) -> float:
         rows = self._signed_request("GET", "/fapi/v2/balance")
@@ -384,50 +404,81 @@ class BinanceTestnetTrader:
 
     def _infer_close_reason(self, order: PaperOrder, exit_price: float) -> CloseReason:
         """
-        根据平仓价格和订单的TP/SL设置，推断真正的平仓原因
-        
-        逻辑：
-        1. 如果平仓价在止盈价附近（±0.1%），认为是止盈
-        2. 如果平仓价在止损价附近（±0.1%），认为是止损
-        3. 如果盈亏符合止盈方向，认为是止盈
-        4. 如果盈亏符合止损方向，认为是止损
-        5. 否则标记为"未知"（但用SIGNAL代替，因为可能是追踪止损等情况）
+        根据平仓价格和订单的TP/SL设置，推断真正的平仓原因；尽量返回止盈/止损/追踪止损以便参与 TP/SL 学习。
+        会设置 order.close_reason_detail 供日志展示（如 "挂单触发(交易所成交)"）。
         """
-        tolerance = 0.001  # 0.1% 容差
-        
+        tolerance_tight = 0.001   # 0.1% 严格容差
+        tolerance_loose = 0.005   # 0.5% 宽松容差（交易所滑点时用）
+        setattr(order, "close_reason_detail", "")
+
+        def set_detail(msg: str):
+            setattr(order, "close_reason_detail", msg)
+
         # 检查是否触及止盈
         if order.take_profit is not None:
             tp = order.take_profit
-            if abs(exit_price - tp) / tp < tolerance:
+            if abs(exit_price - tp) / tp < tolerance_tight:
+                set_detail("挂单触发(止盈)")
                 return CloseReason.TAKE_PROFIT
-            # LONG: 平仓价 >= TP 表示止盈触发
-            # SHORT: 平仓价 <= TP 表示止盈触发
             if order.side == OrderSide.LONG and exit_price >= tp:
+                set_detail("挂单触发(止盈)")
                 return CloseReason.TAKE_PROFIT
             if order.side == OrderSide.SHORT and exit_price <= tp:
+                set_detail("挂单触发(止盈)")
                 return CloseReason.TAKE_PROFIT
-        
+
         # 检查是否触及止损（区分追踪止损和真正止损）
         if order.stop_loss is not None:
             sl = order.stop_loss
-            # 判断SL是否在盈利区（追踪止损/保本止损）
             is_profit_sl = (
                 (order.side == OrderSide.LONG and sl >= order.entry_price) or
                 (order.side == OrderSide.SHORT and sl <= order.entry_price)
             )
             sl_reason = CloseReason.TRAILING_STOP if is_profit_sl else CloseReason.STOP_LOSS
-            
-            if abs(exit_price - sl) / sl < tolerance:
+            detail_sl = "追踪止损" if is_profit_sl else "挂单触发(止损)"
+
+            if abs(exit_price - sl) / sl < tolerance_tight:
+                set_detail(detail_sl)
                 return sl_reason
-            # LONG: 平仓价 <= SL 表示止损触发
-            # SHORT: 平仓价 >= SL 表示止损触发
             if order.side == OrderSide.LONG and exit_price <= sl:
+                set_detail(detail_sl)
                 return sl_reason
             if order.side == OrderSide.SHORT and exit_price >= sl:
+                set_detail(detail_sl)
                 return sl_reason
-        
-        # 无法确定原因：退出价既不在TP也不在SL附近
-        # 使用 EXCHANGE_CLOSE 标记，表示“交易所侧被动平仓（非本系统主动触发）”
+
+        # 宽松容差再判一次（交易所滑点可能导致成交价略偏离设定）
+        if order.take_profit is not None:
+            tp = order.take_profit
+            if abs(exit_price - tp) / tp < tolerance_loose:
+                set_detail(f"挂单触发(止盈,按价格推断; 出场{exit_price:.2f} vs TP{tp:.2f})")
+                return CloseReason.TAKE_PROFIT
+        if order.stop_loss is not None:
+            sl = order.stop_loss
+            is_profit_sl = (
+                (order.side == OrderSide.LONG and sl >= order.entry_price) or
+                (order.side == OrderSide.SHORT and sl <= order.entry_price)
+            )
+            sl_reason = CloseReason.TRAILING_STOP if is_profit_sl else CloseReason.STOP_LOSS
+            if abs(exit_price - sl) / sl < tolerance_loose:
+                set_detail("追踪止损" if is_profit_sl else f"挂单触发(止损,按价格推断; 出场{exit_price:.2f} vs SL{sl:.2f})")
+                return sl_reason
+
+        # 仍无法精确匹配：按“更接近 TP 还是 SL”推断，便于参与 TP/SL 学习；详情中写出出场价与设定价，避免误解
+        if order.take_profit is not None and order.stop_loss is not None:
+            dist_tp = abs(exit_price - order.take_profit) / order.take_profit
+            dist_sl = abs(exit_price - order.stop_loss) / order.stop_loss
+            if dist_tp <= dist_sl:
+                set_detail(f"挂单触发(止盈,按价格推断; 出场{exit_price:.2f} vs TP{order.take_profit:.2f})")
+                return CloseReason.TAKE_PROFIT
+            is_profit_sl = (
+                (order.side == OrderSide.LONG and order.stop_loss >= order.entry_price) or
+                (order.side == OrderSide.SHORT and order.stop_loss <= order.entry_price)
+            )
+            set_detail("追踪止损" if is_profit_sl else f"挂单触发(止损,按价格推断; 出场{exit_price:.2f} vs SL{order.stop_loss:.2f})")
+            return CloseReason.TRAILING_STOP if is_profit_sl else CloseReason.STOP_LOSS
+
+        set_detail("交易所平仓(原因不明)")
         return CloseReason.EXCHANGE_CLOSE
     
     def _fetch_real_close_reason(self, order: PaperOrder) -> CloseReason:
@@ -471,14 +522,17 @@ class BinanceTestnetTrader:
             
             if "STOP" in order_type or "STOP_MARKET" in order_type:
                 print("[平仓诊断] ✓ 确认止损触发")
+                setattr(order, "close_reason_detail", "挂单触发(交易所STOP单)")
                 return CloseReason.STOP_LOSS
-            
+
             if "TAKE_PROFIT" in order_type:
                 print("[平仓诊断] ✓ 确认止盈触发")
+                setattr(order, "close_reason_detail", "挂单触发(交易所止盈单)")
                 return CloseReason.TAKE_PROFIT
-            
+
             if "LIQUIDATION" in order_type or "LIQUIDATION" in orig_type:
                 print("[平仓诊断] ⚠️ 强制平仓（爆仓）")
+                setattr(order, "close_reason_detail", "强制平仓(爆仓)")
                 return CloseReason.STOP_LOSS
             
             if order_type == "MARKET" and status == "FILLED":
@@ -579,6 +633,8 @@ class BinanceTestnetTrader:
                 prev_pos.exit_time = exit_time
                 prev_pos.exit_bar_idx = self.current_bar_idx
                 prev_pos.close_reason = close_reason
+                if not getattr(prev_pos, "close_reason_detail", ""):
+                    prev_pos.close_reason_detail = "挂单触发(交易所保护单)" if (close_reason and close_reason != CloseReason.EXCHANGE_CLOSE) else ""
                 prev_pos.realized_pnl = net_pnl
                 prev_pos.unrealized_pnl = 0.0
                 margin_used = prev_pos.margin_used if prev_pos.margin_used > 0 else 1.0
@@ -610,7 +666,7 @@ class BinanceTestnetTrader:
         if (existing is not None
                 and existing.side == side
                 and abs(existing.entry_price - entry) < 0.01):
-            # 更新行情相关字段，保留所有追踪状态（trailing_stage, peak_price等）
+            # 更新行情相关字段，保留 peak_price 等
             existing.quantity = qty
             existing.margin_used = margin
             existing.unrealized_pnl = pnl
@@ -651,6 +707,7 @@ class BinanceTestnetTrader:
             entry_fp = None
             entry_sim = 0.0
             entry_reason = ""
+            entry_kelly_pct = 0.0
             if self._entry_stop_orders:
                 last_entry = self._entry_stop_orders[-1]
                 entry_tp = last_entry.get("take_profit")
@@ -659,6 +716,9 @@ class BinanceTestnetTrader:
                 entry_fp = last_entry.get("template_fingerprint")
                 entry_sim = float(last_entry.get("entry_similarity", 0.0) or 0.0)
                 entry_reason = last_entry.get("entry_reason", "")
+                psp = last_entry.get("position_size_pct")
+                if psp is not None:
+                    entry_kelly_pct = float(psp)
             else:
                 # 没有挂单记录时，只允许短时间内且方向/价格近似一致才回填
                 recent_window_sec = 180.0
@@ -690,6 +750,7 @@ class BinanceTestnetTrader:
                 template_fingerprint=entry_fp,
                 entry_similarity=entry_sim,
                 entry_reason=entry_reason,
+                kelly_position_pct=entry_kelly_pct,
             )
             
             # 【核心】新仓位同步后，如果有TP/SL，立即挂交易所保护单
@@ -1149,6 +1210,7 @@ class BinanceTestnetTrader:
                 "template_fingerprint": template_fingerprint,
                 "entry_similarity": entry_similarity,
                 "entry_reason": entry_reason,
+                "position_size_pct": position_size_pct,  # 凯利仓位，同步建仓时回填到 order 供学习
             })
             # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
             self._last_entry_tp = take_profit
@@ -1180,9 +1242,11 @@ class BinanceTestnetTrader:
                 "template_fingerprint": o.get("template_fingerprint") or "-",
                 "entry_similarity": float(o.get("entry_similarity", 0.0) or 0.0),
                 "status": "入场挂单",
+                "take_profit": o.get("take_profit"),
+                "stop_loss": o.get("stop_loss"),
             })
         
-        # ── 止损保护单 ──
+        # ── 止损保护单（含 entry_price 供 UI 显示预计亏损金额/比例）──
         if self._exchange_sl_order_id and self._exchange_sl_order_id > 0:
             pos = self.current_position
             exit_side = "BUY" if (pos and pos.side == OrderSide.SHORT) else "SELL"
@@ -1198,9 +1262,11 @@ class BinanceTestnetTrader:
                 "template_fingerprint": "止损保护",
                 "entry_similarity": 0.0,
                 "status": "🛡️止损",
+                "entry_price": pos.entry_price if pos else None,
+                "order_type": "sl",
             })
         
-        # ── 止盈保护单 ──
+        # ── 止盈保护单（含 entry_price 供 UI 显示预计盈利金额/比例）──
         if self._exchange_tp_order_id and self._exchange_tp_order_id > 0:
             pos = self.current_position
             exit_side = "BUY" if (pos and pos.side == OrderSide.SHORT) else "SELL"
@@ -1216,6 +1282,8 @@ class BinanceTestnetTrader:
                 "template_fingerprint": "止盈保护",
                 "entry_similarity": 0.0,
                 "status": "🎯止盈",
+                "entry_price": pos.entry_price if pos else None,
+                "order_type": "tp",
             })
         
         return snapshots
@@ -1228,7 +1296,8 @@ class BinanceTestnetTrader:
                       stop_loss: Optional[float] = None,
                       template_fingerprint: Optional[str] = None,
                       entry_similarity: float = 0.0,
-                      entry_reason: str = "") -> Optional[PaperOrder]:
+                      entry_reason: str = "",
+                      position_size_pct: Optional[float] = None) -> Optional[PaperOrder]:
         self._sync_from_exchange(force=True)
         if self.current_position is not None:
             print("[BinanceTrader] 交易所已有持仓，跳过开仓")
@@ -1236,10 +1305,10 @@ class BinanceTestnetTrader:
 
         self._set_leverage(self.leverage)
         
-        # 获取余额和计算数量
+        # 获取余额和计算数量（凯利仓位传入时用其计算数量）
         balance = self._get_usdt_balance()
         available = self._get_usdt_available_balance()
-        qty = self._calc_entry_quantity(price)
+        qty = self._calc_entry_quantity(price, position_size_pct)
         side_str = "BUY" if side == OrderSide.LONG else "SELL"
         
         # 格式化数量，确保不超过精度限制
@@ -1289,6 +1358,7 @@ class BinanceTestnetTrader:
             else:
                 entry_fee = (executed_qty * avg_price) * 0.0005  # Taker费率
 
+        kelly_pct = position_size_pct if position_size_pct is not None else 0.0
         order = PaperOrder(
             order_id=str(resp.get("orderId", self._new_client_order_id("ENTRY_LOCAL"))),
             symbol=self.symbol,
@@ -1306,6 +1376,7 @@ class BinanceTestnetTrader:
             entry_reason=entry_reason,
             peak_price=avg_price,  # 初始峰值 = 入场价
             total_fee=entry_fee,
+            kelly_position_pct=kelly_pct,
         )
         # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
         self._last_entry_tp = take_profit

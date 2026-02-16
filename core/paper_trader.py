@@ -39,6 +39,8 @@ class CloseReason(Enum):
     TAKE_PROFIT = "止盈"
     STOP_LOSS = "止损"
     TRAILING_STOP = "追踪止损"    # 追踪止损/保本止损触发（有盈利但未到TP）
+    PARTIAL_TP = "分段止盈"       # 阶梯止盈部分平仓
+    PARTIAL_SL = "分段止损"       # 阶梯止损部分平仓
     DERAIL = "脱轨"          # 动态追踪脱轨
     MAX_HOLD = "超时"        # 超过最大持仓时间
     MANUAL = "手动"          # 手动平仓
@@ -106,6 +108,7 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 exit_time=exit_time,
                 exit_bar_idx=t.get("exit_bar_idx"),
                 close_reason=close_reason,
+                close_reason_detail=t.get("close_reason_detail", "") or "",
                 realized_pnl=float(t.get("realized_pnl", 0)),
                 profit_pct=float(t.get("profit_pct", 0)),
                 total_fee=float(t.get("total_fee", 0)),
@@ -114,11 +117,18 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 entry_reason=t.get("entry_reason", ""),
                 decision_reason=t.get("decision_reason", ""),
                 hold_bars=int(t.get("hold_bars", 0)),
+                # === 利润追踪字段 ===
+                peak_profit_pct=float(t.get("peak_profit_pct", 0)),
+                partial_tp_count=int(t.get("partial_tp_count", 0)),
+                partial_sl_count=int(t.get("partial_sl_count", 0)),
+                # === 离场学习字段 ===
                 exit_signals_triggered=t.get("exit_signals_triggered", []),
                 entry_atr=float(t.get("entry_atr", 0)),
+                # === 翻转单标记 ===
                 is_flip_trade=bool(t.get("is_flip_trade", False)),
                 flip_reason=t.get("flip_reason", ""),
-                entry_trajectory=entry_trajectory,  # 【指纹3D图】轨迹矩阵
+                # === 指纹3D图 ===
+                entry_trajectory=entry_trajectory,
                 # === 自适应学习字段 ===
                 similarity_history=t.get("similarity_history", []),
                 reasoning_history=t.get("reasoning_history", []),
@@ -178,7 +188,8 @@ class PaperOrder:
     exit_time: Optional[datetime] = None
     exit_bar_idx: Optional[int] = None
     close_reason: Optional[CloseReason] = None
-    
+    close_reason_detail: str = ""   # 平仓原因补充（如 "挂单触发(交易所成交)" / "按价格推断"）
+
     # 盈亏
     unrealized_pnl: float = 0.0      # 未实现盈亏 (USDT)
     realized_pnl: float = 0.0        # 已实现盈亏 (USDT)
@@ -202,8 +213,8 @@ class PaperOrder:
     # 利润追踪
     peak_price: float = 0.0           # 持仓期间最有利价格
     peak_profit_pct: float = 0.0      # 持仓期间峰值收益率 (%)
-    trailing_stage: int = 0           # 追踪止损阶段: 0=未激活, 1=保本, 2=锁利, 3=紧追
-    partial_tp_count: int = 0         # 已执行减仓次数
+    partial_tp_count: int = 0         # 已执行分段止盈次数
+    partial_sl_count: int = 0         # 已执行分段止损次数
     
     # 离场信号学习（用于自适应优化）
     exit_signals_triggered: List[tuple] = field(default_factory=list)  # [(signal_name, profit_at_trigger), ...]
@@ -301,6 +312,7 @@ class PaperOrder:
             "exit_time": self.exit_time.isoformat() if self.exit_time else None,
             "exit_bar_idx": self.exit_bar_idx,
             "close_reason": self.close_reason.value if self.close_reason else None,
+            "close_reason_detail": getattr(self, "close_reason_detail", "") or "",
             "realized_pnl": self.realized_pnl,
             "profit_pct": self.profit_pct,
             "total_fee": self.total_fee,
@@ -310,8 +322,8 @@ class PaperOrder:
             "decision_reason": self.decision_reason,
             "hold_bars": self.hold_bars,
             "peak_profit_pct": self.peak_profit_pct,
-            "trailing_stage": self.trailing_stage,
             "partial_tp_count": self.partial_tp_count,
+            "partial_sl_count": self.partial_sl_count,
             "exit_signals_triggered": self.exit_signals_triggered,
             "entry_atr": self.entry_atr,
             "is_flip_trade": self.is_flip_trade,
@@ -514,6 +526,18 @@ class PaperTrader:
         
         return len(self.pending_stop_orders) > 0
     
+    def set_leverage(self, leverage: int):
+        """运行时修改杠杆"""
+        if leverage < 1 or leverage > 125:
+            raise ValueError(f"杠杆倍数必须在1-125之间，当前: {leverage}")
+        
+        old_leverage = self.leverage
+        self.leverage = leverage
+        
+        # 如果有持仓，需要调用交易所API修改杠杆（测试网可能不支持）
+        # 这里只修改内部变量，新订单会使用新杠杆
+        print(f"[PaperTrader] 杠杆已更新: {old_leverage}x -> {leverage}x")
+    
     def open_position(self,
                       side: OrderSide,
                       price: float,
@@ -598,6 +622,63 @@ class PaperTrader:
         """撤销待处理的触发单"""
         self.pending_stop_orders = [o for o in self.pending_stop_orders if o["order_id"] != order_id]
         print(f"[PaperTrader] 已撤销触发单: {order_id}")
+
+    def get_pending_entry_orders_snapshot(self, current_bar_idx: int = None) -> list:
+        """返回挂单快照（与 BinanceTestnetTrader 同结构，含 take_profit/stop_loss 与持仓保护单供 UI 显示 TP/SL 预计盈亏）"""
+        out = []
+        for o in self.pending_stop_orders:
+            expire_bar = int(o.get("expire_bar", -1))
+            remaining_bars = None
+            if current_bar_idx is not None and expire_bar >= 0:
+                remaining_bars = max(0, expire_bar - int(current_bar_idx))
+            side = o.get("side")
+            side_str = side.value if hasattr(side, "value") else str(side)
+            out.append({
+                "order_id": o.get("order_id"),
+                "client_id": o.get("client_id", ""),
+                "side": side_str,
+                "trigger_price": float(o.get("trigger_price", 0) or 0),
+                "quantity": float(o.get("quantity", 0) or 0),
+                "start_bar": int(o.get("start_bar", -1)),
+                "expire_bar": expire_bar,
+                "remaining_bars": remaining_bars,
+                "template_fingerprint": o.get("fp") or o.get("template_fingerprint") or "-",
+                "entry_similarity": float(o.get("sim") or o.get("entry_similarity") or 0),
+                "status": "入场挂单",
+                "take_profit": o.get("tp"),
+                "stop_loss": o.get("sl"),
+            })
+        # 有持仓时追加止损/止盈保护单行，供 UI 显示「预计亏/赚 金额+百分比」
+        pos = self.current_position
+        if pos and pos.stop_loss is not None:
+            exit_side = "BUY" if pos.side == OrderSide.SHORT else "SELL"
+            out.append({
+                "order_id": f"SIM_SL_{pos.order_id}",
+                "client_id": "R3000_SL",
+                "side": exit_side,
+                "trigger_price": float(pos.stop_loss),
+                "quantity": pos.quantity,
+                "remaining_bars": None,
+                "template_fingerprint": "止损保护",
+                "status": "🛡️止损",
+                "entry_price": pos.entry_price,
+                "order_type": "sl",
+            })
+        if pos and pos.take_profit is not None:
+            exit_side = "BUY" if pos.side == OrderSide.SHORT else "SELL"
+            out.append({
+                "order_id": f"SIM_TP_{pos.order_id}",
+                "client_id": "R3000_TP",
+                "side": exit_side,
+                "trigger_price": float(pos.take_profit),
+                "quantity": pos.quantity,
+                "remaining_bars": None,
+                "template_fingerprint": "止盈保护",
+                "status": "🎯止盈",
+                "entry_price": pos.entry_price,
+                "order_type": "tp",
+            })
+        return out
 
     def _create_filled_order(self, side, price, qty, margin, bar_idx, tp, sl, fp, sim, reason,
                               trajectory: Optional[np.ndarray] = None,
@@ -1038,7 +1119,9 @@ class PaperTrader:
             order.update_pnl(actual_price, self.leverage)
             if self.on_order_update:
                 self.on_order_update(order)
-            print(f"[PaperTrader] 市价部分平仓: {reason.value} @ {actual_price:.2f} | 数量={close_qty:.6f}")
+            print(f"[PaperTrader] 市价部分平仓: {reason.value} @ {actual_price:.2f} | 数量={close_qty:.6f} | 盈亏: {profit_pct:+.2f}%")
+            if self.on_trade_closed:
+                self.on_trade_closed(closed_order)
         return closed_order
     
     def _check_limit_order_fill(self, price: float, high: float, low: float) -> bool:
@@ -1116,8 +1199,10 @@ class PaperTrader:
             if self.on_order_update:
                 self.on_order_update(order)
             print(f"[PaperTrader] 限价部分成交: {reason.value} @ {actual_price:.2f} | 数量={close_qty:.6f}")
+            if self.on_trade_closed:
+                self.on_trade_closed(closed_order)
         return closed_order
-    
+
     def _cancel_and_relist_limit_order(self, current_price: float, bar_idx: int):
         """重新挂单"""
         order = self.current_position

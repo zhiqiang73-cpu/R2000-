@@ -6,11 +6,12 @@ R3000 量化 MVP 系统 - 全局配置文件
 import os
 
 # ==================== 环境变量加载 ====================
-# 简易 .env 加载（避免引入第三方依赖）
-_env_path = os.path.join(os.path.dirname(__file__), ".env")
-if os.path.exists(_env_path):
+# 简易 .env 加载（避免引入第三方依赖）；先读 config 同目录，再读当前工作目录
+def _load_dotenv(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
     try:
-        with open(_env_path, "r", encoding="utf-8") as _f:
+        with open(path, "r", encoding="utf-8-sig") as _f:  # utf-8-sig 去除 BOM
             for _line in _f:
                 _line = _line.strip()
                 if not _line or _line.startswith("#") or "=" not in _line:
@@ -18,11 +19,16 @@ if os.path.exists(_env_path):
                 _key, _val = _line.split("=", 1)
                 _key = _key.strip()
                 _val = _val.strip().strip('"').strip("'")
-                if _key and _key not in os.environ:
+                # 始终用 .env 覆盖，避免系统环境变量里的旧 Key 覆盖 .env 中的新 Key
+                if _key:
                     os.environ[_key] = _val
+        return True
     except Exception:
-        # 环境变量加载失败不影响主流程
-        pass
+        return False
+
+_env_dir = os.path.dirname(os.path.abspath(__file__))
+_load_dotenv(os.path.join(_env_dir, ".env"))
+_load_dotenv(os.path.join(os.getcwd(), ".env"))  # 若从别处启动，再试当前目录
 
 # ==================== 数据配置 ====================
 DATA_CONFIG = {
@@ -549,8 +555,8 @@ PAPER_TRADING_CONFIG = {
     "MAX_HOLD_BARS": 240,
     
     # ── 止损保护参数（防止正常波动被扫损）──
-    "MIN_SL_PCT": 0.0015,       # 最小止损距离 0.15%（约103点，允许正常波动但避免被轻易扫损）
-    "ATR_SL_MULTIPLIER": 2.5,   # SL = 2.5 x ATR（适中倍数，平衡风险控制与避免过度宽松）
+    "MIN_SL_PCT": 0.004,        # 最小止损距离 0.4%（约272点@68000，放宽避免被扫损）
+    "ATR_SL_MULTIPLIER": 4.0,   # SL = 4.0 x ATR（放宽倍数，约600点@ATR=150）
     "MIN_RR_RATIO": 1.4,        # 最低盈亏比：TP >= SL x 1.4
     "SL_PROTECTION_SEC": 60,    # 新仓保护期（秒），保护期内止损暂缓，原来 8 秒太短
     
@@ -577,13 +583,24 @@ PAPER_TRADING_CONFIG = {
     "HOLD_ALERT_THRESHOLD": 0.5,
     "HOLD_DERAIL_THRESHOLD": 0.3,
     
-    # ── 追踪止损阶段阈值（降低以更早锁定利润）──
-    "TRAILING_STAGE1_PCT": 1.0,       # 阶段1(保本)激活阈值：峰值利润>=1%（原1.5%）
-    "TRAILING_STAGE2_PCT": 2.0,       # 阶段2(锁利40%)激活阈值：峰值利润>=2%（原3%）
-    "TRAILING_STAGE3_PCT": 3.5,       # 阶段3(紧追60%)激活阈值：峰值利润>=3.5%（原5%）
-    "TRAILING_LOCK_PCT_STAGE2": 0.50, # 阶段2锁定峰值利润的比例（50%，原40%）
-    "TRAILING_LOCK_PCT_STAGE3": 0.70, # 阶段3锁定峰值利润的比例（70%，原60%）
-    
+    # ── 市场恶化减仓（与分段止盈区分）──
+    "REGIME_REDUCE_ENABLED": True,     # 是否启用市场恶化减仓
+    "REGIME_REDUCE_MIN_PROFIT_PCT": 1.0,  # 至少盈利多少%才触发（市场恶化时）
+    "REGIME_REDUCE_PCT": 0.25,         # 减仓比例（25%）
+
+    # ── 弱化·震荡：先保本收紧（有浮盈才把止损挪到入场价，触发=保本出场）──
+    "REGIME_WEAKEN_MIN_PROFIT_PCT": 0.2,   # 至少浮盈 0.2% 才收紧到 entry，否则不收紧
+
+    # ── 分段止盈 / 分段止损（做多/做空共用，第一档5% 第二档10%）──
+    "STAGED_TP_1_PCT": 5.0,           # 分段止盈第1档：峰值利润 >= 5% 减仓 30%
+    "STAGED_TP_2_PCT": 10.0,          # 分段止盈第2档：峰值利润 >= 10% 再减仓 30%
+    "STAGED_TP_RATIO_1": 0.30,        # 第1档减仓比例
+    "STAGED_TP_RATIO_2": 0.30,        # 第2档减仓比例
+    "STAGED_SL_1_PCT": 5.0,           # 分段止损第1档：亏损 >= 5% 减仓 30%
+    "STAGED_SL_2_PCT": 10.0,          # 分段止损第2档：亏损 >= 10% 再减仓 30%
+    "STAGED_SL_RATIO_1": 0.30,
+    "STAGED_SL_RATIO_2": 0.30,
+
     # ── 价格动量衰减离场（新增）──
     # 当价格接近峰值但动能衰减时主动离场
     "MOMENTUM_EXIT_ENABLED": True,     # 是否启用动量衰减离场
@@ -683,6 +700,16 @@ PAPER_TRADING_CONFIG = {
     "KELLY_MAX_RANGE": (0.5, 0.9),         # KELLY_MAX 自适应调整范围
     "KELLY_MIN_RANGE": (0.03, 0.10),       # KELLY_MIN 自适应调整范围（下限3%~10%）
     
+    # ── 杠杆自适应配置 ──
+    "LEVERAGE_ADAPTIVE": True,             # 是否启用杠杆自适应调整
+    "LEVERAGE_DEFAULT": 10,                # 默认杠杆倍数
+    "LEVERAGE_MIN": 5,                     # 最小杠杆倍数
+    "LEVERAGE_MAX": 50,                    # 最大杠杆倍数
+    "LEVERAGE_ADJUST_THRESHOLD": 20,       # 触发调整所需的最少交易数
+    "LEVERAGE_PROFIT_THRESHOLD": 2.0,      # 提高杠杆的平均收益阈值（%）
+    "LEVERAGE_LOSS_THRESHOLD": -1.0,       # 降低杠杆的平均亏损阈值（%）
+    "LEVERAGE_DRAWDOWN_LIMIT": 20.0,       # 降低杠杆的回撤限制（%）
+    
     # ── 入场拒绝跟踪器（门控自适应学习）──
     "REJECTION_TRACKER_ENABLED": True,      # 是否启用拒绝跟踪
     "REJECTION_EVAL_BARS": 30,              # 拒绝后多少根K线进行事后评估
@@ -712,12 +739,16 @@ PAPER_TRADING_CONFIG = {
 }
 
 # ==================== DeepSeek API 配置 ====================
+_deepseek_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()  # 去除首尾空格，避免 401
 DEEPSEEK_CONFIG = {
-    "ENABLED": bool(os.getenv("DEEPSEEK_API_KEY")),  # 有密钥即启用
-    "API_KEY": os.getenv("DEEPSEEK_API_KEY", ""),    # DeepSeek API 密钥（https://platform.deepseek.com）
+    "ENABLED": bool(_deepseek_key),                  # 有密钥即启用
+    "API_KEY": _deepseek_key,                         # DeepSeek API 密钥（https://platform.deepseek.com）
     "MODEL": "deepseek-chat",            # 模型名称
-    "MAX_TOKENS": 800,                   # 最大生成token数
+    "MAX_TOKENS": 2000,                  # 最大生成token数（复盘分析需适当展开意见）
     "TEMPERATURE": 0.3,                  # 温度参数（0.3=更确定性，适合分析）
+    
+    # 持仓中实时 DeepSeek（仅展示）
+    "HOLDING_INTERVAL_BARS": 3,          # 每 N 根 K 线收线调用一次（有持仓时）
 }
 
 # ==================== 日志配置 ====================

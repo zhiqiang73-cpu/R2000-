@@ -32,6 +32,8 @@ CLOSE_REASON_LABELS = {
     "止盈": "止盈 (TP)",
     "止损": "止损 (SL)",
     "追踪止损": "追踪止损",
+    "分段止盈": "分段止盈",
+    "分段止损": "分段止损",
     "脱轨": "脱轨离场",
     "超时": "超时离场",
     "信号": "信号离场",
@@ -44,6 +46,8 @@ CLOSE_REASON_COLORS = {
     "止盈": "#4CAF50",        # green
     "止损": "#F44336",        # red
     "追踪止损": "#FF9800",    # orange
+    "分段止盈": "#8BC34A",    # light green
+    "分段止损": "#FF5722",    # deep orange
     "脱轨": "#9C27B0",        # purple
     "超时": "#607D8B",        # blue-grey
     "信号": "#2196F3",        # blue
@@ -61,42 +65,36 @@ EXIT_VERDICT_LABELS = {
 }
 
 # ── 可调出场参数定义（阈值边界 & 调整步长）──
+# 分段止盈/止损与市场状态自适应：强趋势时放宽阈值让利润跑，震荡时收紧阈值早锁利
 
 ADJUSTABLE_EXIT_PARAMS: Dict[str, Dict[str, Any]] = {
-    "TRAILING_STAGE1_PCT": {
-        "label": "追踪止损阶段1激活阈值(%)",
-        "loosen_step": 0.5,     # 放宽 = 提高阈值（更不容易激活追踪 → 让利润跑更久）
-        "tighten_step": -0.3,   # 收紧 = 降低阈值（更容易激活追踪 → 更早锁利）
-        "min": 0.3,
-        "max": 3.0,
+    "STAGED_TP_1_PCT": {
+        "label": "分段止盈第1档阈值(%)",
+        "loosen_step": 0.5,     # 放宽 = 提高阈值（更晚触发第一档 → 让利润跑更久）
+        "tighten_step": -0.5,   # 收紧 = 降低阈值（更早触发第一档 → 早锁利）
+        "min": 3.0,
+        "max": 12.0,
     },
-    "TRAILING_STAGE2_PCT": {
-        "label": "追踪止损阶段2激活阈值(%)",
-        "loosen_step": 0.5,
-        "tighten_step": -0.3,
-        "min": 1.0,
-        "max": 5.0,
-    },
-    "TRAILING_STAGE3_PCT": {
-        "label": "追踪止损阶段3激活阈值(%)",
+    "STAGED_TP_2_PCT": {
+        "label": "分段止盈第2档阈值(%)",
         "loosen_step": 0.5,
         "tighten_step": -0.5,
+        "min": 6.0,
+        "max": 20.0,
+    },
+    "STAGED_SL_1_PCT": {
+        "label": "分段止损第1档阈值(%)",
+        "loosen_step": -0.5,    # 放宽 = 降低绝对值（更晚触发第一档减仓）
+        "tighten_step": 0.5,    # 收紧 = 提高绝对值（更早触发第一档减仓）
         "min": 2.0,
-        "max": 8.0,
+        "max": 10.0,
     },
-    "TRAILING_LOCK_PCT_STAGE2": {
-        "label": "阶段2锁利比例",
-        "loosen_step": -0.05,   # 放宽 = 降低锁利比例（给更多利润空间）
-        "tighten_step": 0.05,   # 收紧 = 提高锁利比例（更早锁住利润）
-        "min": 0.30,
-        "max": 0.70,
-    },
-    "TRAILING_LOCK_PCT_STAGE3": {
-        "label": "阶段3锁利比例",
-        "loosen_step": -0.05,
-        "tighten_step": 0.05,
-        "min": 0.50,
-        "max": 0.85,
+    "STAGED_SL_2_PCT": {
+        "label": "分段止损第2档阈值(%)",
+        "loosen_step": -0.5,
+        "tighten_step": 0.5,
+        "min": 5.0,
+        "max": 18.0,
     },
     "MOMENTUM_MIN_PROFIT_PCT": {
         "label": "动量离场最低利润阈值(%)",
@@ -125,8 +123,13 @@ ADJUSTABLE_EXIT_PARAMS: Dict[str, Dict[str, Any]] = {
 
 CLOSE_REASON_PARAM_MAP: Dict[str, List[str]] = {
     "追踪止损": [
-        "TRAILING_STAGE1_PCT", "TRAILING_STAGE2_PCT", "TRAILING_STAGE3_PCT",
-        "TRAILING_LOCK_PCT_STAGE2", "TRAILING_LOCK_PCT_STAGE3",
+        "STAGED_TP_1_PCT", "STAGED_TP_2_PCT",
+    ],
+    "分段止盈": [
+        "STAGED_TP_1_PCT", "STAGED_TP_2_PCT",
+    ],
+    "分段止损": [
+        "STAGED_SL_1_PCT", "STAGED_SL_2_PCT",
     ],
     "信号": [
         "MOMENTUM_MIN_PROFIT_PCT", "MOMENTUM_DECAY_THRESHOLD",
@@ -660,20 +663,29 @@ class ExitTimingTracker:
                 suggestions.append(sug)
         return suggestions
 
-    def get_suggestions(self, config_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def get_suggestions(self, config_dict: Dict[str, Any], current_regime: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        获取所有具体的参数调整建议（供 UI 展示）
+        获取所有具体的参数调整建议（供 UI 展示）。
 
         将 suggest_all_adjustments() 的每条建议展开为逐参数的具体调整条目。
+        若传入 current_regime，则根据市场强弱做自适应步长：
+        - 强趋势/趋势市：建议放宽时步长放大 1.2 倍（让利润多跑）
+        - 震荡/弱市：建议收紧时步长放大 1.2 倍（早锁利）
 
         Args:
             config_dict: 运行时配置字典（通常为 PAPER_TRADING_CONFIG）
+            current_regime: 当前市场状态（如 "强多头"/"震荡"/"弱空头"），用于自适应步长
 
         Returns:
             逐参数的调整条目列表
         """
         raw = self.suggest_all_adjustments()
         expanded: List[Dict[str, Any]] = []
+
+        # 市场状态对步长的自适应系数
+        regime = (current_regime or "").strip()
+        strong_trend = any(x in regime for x in ("强", "趋势", "多头", "空头")) and "震荡" not in regime
+        choppy = "震荡" in regime or "弱" in regime
 
         for sug in raw:
             action = sug.get("action", "")
@@ -692,6 +704,12 @@ class ExitTimingTracker:
                 step = param_def.get(step_key, 0)
                 if step == 0:
                     continue
+
+                # 根据市场状态放大步长（自适应）
+                if strong_trend and action == "loosen":
+                    step = step * 1.2
+                elif choppy and action == "tighten":
+                    step = step * 1.2
 
                 min_bound = param_def.get("min", float("-inf"))
                 max_bound = param_def.get("max", float("inf"))
