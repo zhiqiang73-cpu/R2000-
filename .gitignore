@@ -35,6 +35,7 @@ wheels/
 Thumbs.db
 
 # Project specific
+.env
 data/output/
 data/paper_trading/api_config.json
 data/memory/

@@ -434,7 +434,7 @@ SIMILARITY_CONFIG = {
     
     # 欧氏距离参数
     "EUCLIDEAN_NORMALIZE": True,       # 是否归一化欧氏距离
-    "EUCLIDEAN_MAX_DISTANCE": 50.0,    # 归一化时的最大距离参考值（根据实际特征空间调整）
+    "EUCLIDEAN_MAX_DISTANCE": 200.0,   # 归一化上界（32维特征含RSI/KDJ等，距离常 50~200+，过小会导致“距离”恒为0%）
     
     # DTW 参数
     "DTW_RADIUS": 10,                  # FastDTW 半径约束（加速计算，增大可提高精度但变慢）
@@ -442,7 +442,7 @@ SIMILARITY_CONFIG = {
     "DTW_MAX_DISTANCE": 8000.0,        # 归一化时的最大距离参考值（DTW累积距离很大，典型值~5000）
     
     # 综合分数阈值
-    "FUSION_THRESHOLD": 0.65,          # 多维融合分数阈值（低于此拒绝匹配）
+    "FUSION_THRESHOLD": 0.40,          # 多维融合分数阈值（低于此拒绝匹配，默认40%）
     "HIGH_CONFIDENCE_THRESHOLD": 0.80, # 高置信度阈值（高于此视为强匹配）
     
     # 序列特征提取参数
@@ -554,9 +554,9 @@ PAPER_TRADING_CONFIG = {
     "TAKE_PROFIT_ATR": 3.5,             # TP = 3.5 x ATR（适中的止盈倍数，平衡捕获利润与避免过度持仓）
     "MAX_HOLD_BARS": 240,
     
-    # ── 止损保护参数（防止正常波动被扫损）──
-    "MIN_SL_PCT": 0.004,        # 最小止损距离 0.4%（约272点@68000，放宽避免被扫损）
-    "ATR_SL_MULTIPLIER": 4.0,   # SL = 4.0 x ATR（放宽倍数，约600点@ATR=150）
+    # ── 止损保护参数 ──
+    "MIN_SL_PCT": 0.004,        # 最小止损距离 0.4%（原配置，TP/SL 较近）
+    "ATR_SL_MULTIPLIER": 4.0,   # SL = 4.0 x ATR（原配置）
     "MIN_RR_RATIO": 1.4,        # 最低盈亏比：TP >= SL x 1.4
     "SL_PROTECTION_SEC": 60,    # 新仓保护期（秒），保护期内止损暂缓，原来 8 秒太短
     
@@ -591,15 +591,23 @@ PAPER_TRADING_CONFIG = {
     # ── 弱化·震荡：先保本收紧（有浮盈才把止损挪到入场价，触发=保本出场）──
     "REGIME_WEAKEN_MIN_PROFIT_PCT": 0.2,   # 至少浮盈 0.2% 才收紧到 entry，否则不收紧
 
-    # ── 分段止盈 / 分段止损（做多/做空共用，第一档5% 第二档10%）──
-    "STAGED_TP_1_PCT": 5.0,           # 分段止盈第1档：峰值利润 >= 5% 减仓 30%
-    "STAGED_TP_2_PCT": 10.0,          # 分段止盈第2档：峰值利润 >= 10% 再减仓 30%
-    "STAGED_TP_RATIO_1": 0.30,        # 第1档减仓比例
-    "STAGED_TP_RATIO_2": 0.30,        # 第2档减仓比例
-    "STAGED_SL_1_PCT": 5.0,           # 分段止损第1档：亏损 >= 5% 减仓 30%
-    "STAGED_SL_2_PCT": 10.0,          # 分段止损第2档：亏损 >= 10% 再减仓 30%
-    "STAGED_SL_RATIO_1": 0.30,
-    "STAGED_SL_RATIO_2": 0.30,
+    # ── 分段止盈 / 分段止损（三档阶梯式委托单）──
+    # 以下 % 均为「收益率%」（杠杆后），挂单价格按 价格变动% = 收益率% / 杠杆 换算（如 20x 下 5% 收益 ≈ 0.25% 价格）
+    # 止盈 7/14/21 = 止损 5/10/15 × 1.4，盈亏比 1.4:1
+    "STAGED_TP_1_PCT": 7.0,          # 分段止盈第1档：收益率 7%（= SL1 5%×1.4）
+    "STAGED_TP_2_PCT": 14.0,         # 分段止盈第2档：收益率 14%（= SL2 10%×1.4）
+    "STAGED_TP_3_PCT": 21.0,         # 分段止盈第3档（硬止盈）：收益率 21%（= SL3 15%×1.4）
+    "STAGED_TP_RATIO_1": 0.30,        # 第1档减仓比例（总仓位的30%）
+    "STAGED_TP_RATIO_2": 0.30,        # 第2档减仓比例（剩余仓位的30% = 总仓位21%）
+    "STAGED_TP_RATIO_3": 1.00,        # 第3档全平剩余仓位
+    "STAGED_SL_1_PCT": 5.0,           # 分段止损第1档：亏损收益率 5% 减仓30%
+    "STAGED_SL_2_PCT": 10.0,          # 分段止损第2档：亏损收益率 10%
+    "STAGED_SL_3_PCT": 15.0,          # 分段止损第3档（硬止损）：亏损收益率 15% 全平
+    "STAGED_SL_RATIO_1": 0.30,        # 第1档减仓比例
+    "STAGED_SL_RATIO_2": 0.30,        # 第2档减仓比例
+    "STAGED_SL_RATIO_3": 1.00,        # 第3档全平剩余仓位
+    "LIMIT_PRICE_BAND_PCT": 5.0,      # Binance 限价单价格带（相对 mark 偏离上限 %），超出则用 STOP_MARKET
+    "STAGED_ORDERS_SEQUENTIAL": True,  # 逐档挂单：第1档触发后再挂第2档，第2档触发再挂第3档；若已越过第2档则直接挂第3档
 
     # ── 价格动量衰减离场（新增）──
     # 当价格接近峰值但动能衰减时主动离场
@@ -701,11 +709,12 @@ PAPER_TRADING_CONFIG = {
     "KELLY_MIN_RANGE": (0.03, 0.10),       # KELLY_MIN 自适应调整范围（下限3%~10%）
     
     # ── 杠杆自适应配置 ──
-    "LEVERAGE_ADAPTIVE": True,             # 是否启用杠杆自适应调整
-    "LEVERAGE_DEFAULT": 10,                # 默认杠杆倍数
+    "LEVERAGE_ADAPTIVE": True,             # 是否启用杠杆自适应调整（每笔开平仓都调整）
+    "LEVERAGE_DEFAULT": 20,                # 默认杠杆倍数（程序启动与自适应基线）
     "LEVERAGE_MIN": 5,                     # 最小杠杆倍数
-    "LEVERAGE_MAX": 50,                    # 最大杠杆倍数
-    "LEVERAGE_ADJUST_THRESHOLD": 20,       # 触发调整所需的最少交易数
+    "LEVERAGE_MAX": 100,                   # 最大杠杆倍数
+    "LEVERAGE_ADJUST_STEP": 2,             # 每笔交易后杠杆调整步长（盈利+step/亏损-step）
+    "LEVERAGE_ADJUST_THRESHOLD": 20,       # 旧逻辑：触发调整所需的最少交易数（现以每笔为准）
     "LEVERAGE_PROFIT_THRESHOLD": 2.0,      # 提高杠杆的平均收益阈值（%）
     "LEVERAGE_LOSS_THRESHOLD": -1.0,       # 降低杠杆的平均亏损阈值（%）
     "LEVERAGE_DRAWDOWN_LIMIT": 20.0,       # 降低杠杆的回撤限制（%）

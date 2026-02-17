@@ -468,46 +468,72 @@ class KellyAdapter:
         
         return None
     
-    def suggest_leverage_adjustment(self, min_trades: int = 20) -> Optional[int]:
+    def adjust_leverage_after_trade(self, profit_pct: float) -> Optional[int]:
         """
-        建议 LEVERAGE 调整
-        
-        Args:
-            min_trades: 最少交易数
+        每笔开平仓后按盈亏调整杠杆：盈利则放大、亏损则缩小。
+        范围 [LEVERAGE_MIN, LEVERAGE_MAX]，步长 LEVERAGE_ADJUST_STEP，基线 LEVERAGE_DEFAULT=20。
         
         Returns:
-            建议的新杠杆值，None 表示不建议调整
+            新杠杆值（若发生调整），否则 None
+        """
+        from config import PAPER_TRADING_CONFIG
+        if not PAPER_TRADING_CONFIG.get("LEVERAGE_ADAPTIVE", True):
+            return None
+        default_lev = PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20)
+        min_lev = PAPER_TRADING_CONFIG.get("LEVERAGE_MIN", 5)
+        max_lev = PAPER_TRADING_CONFIG.get("LEVERAGE_MAX", 100)
+        step = PAPER_TRADING_CONFIG.get("LEVERAGE_ADJUST_STEP", 2)
+        current = int(self.leverage) if self.leverage is not None else default_lev
+        current = max(min_lev, min(max_lev, current))
+        if profit_pct > 0:
+            new_lev = min(current + step, max_lev)
+        else:
+            new_lev = max(current - step, min_lev)
+        if new_lev == current:
+            return None
+        old_lev = self.leverage
+        self.leverage = new_lev
+        self.adjustment_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "parameter": "LEVERAGE",
+            "old_value": float(old_lev or current),
+            "new_value": float(self.leverage),
+            "delta": float(self.leverage - (old_lev or current)),
+            "reason": f"每笔调整: 本笔盈亏{profit_pct:+.2f}% → {'放大' if profit_pct > 0 else '缩小'}",
+        })
+        if len(self.adjustment_history) > 50:
+            self.adjustment_history = self.adjustment_history[-50:]
+        return self.leverage
+
+    def suggest_leverage_adjustment(self, min_trades: int = 20) -> Optional[int]:
+        """
+        建议 LEVERAGE 调整（基于近期多笔表现，用于 auto_adjust_parameters）。
+        日常以 adjust_leverage_after_trade 每笔调整为准；此处保留兼容。
         """
         from config import PAPER_TRADING_CONFIG
         if not PAPER_TRADING_CONFIG.get("LEVERAGE_ADAPTIVE", False):
             return None
         if len(self.recent_performance) < min_trades:
             return None
-        
-        current_leverage = self.leverage or PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 10)
+        current_leverage = self.leverage or PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20)
         min_leverage = PAPER_TRADING_CONFIG.get("LEVERAGE_MIN", 5)
-        max_leverage = PAPER_TRADING_CONFIG.get("LEVERAGE_MAX", 50)
-        
+        max_leverage = PAPER_TRADING_CONFIG.get("LEVERAGE_MAX", 100)
         recent_profits = list(self.recent_performance)
         avg_profit = np.mean(recent_profits)
         win_rate = sum(1 for p in recent_profits if p > 0) / len(recent_profits)
-        
         profit_threshold = PAPER_TRADING_CONFIG.get("LEVERAGE_PROFIT_THRESHOLD", 2.0)
         loss_threshold = PAPER_TRADING_CONFIG.get("LEVERAGE_LOSS_THRESHOLD", -1.0)
         drawdown_limit = PAPER_TRADING_CONFIG.get("LEVERAGE_DRAWDOWN_LIMIT", 20.0)
-        
-        if (avg_profit > profit_threshold and win_rate > 0.55 and 
+        if (avg_profit > profit_threshold and win_rate > 0.55 and
             self.drawdown_tracker < 10.0 and current_leverage < max_leverage):
             suggested = min(current_leverage + 2, max_leverage)
             if suggested > current_leverage:
                 return suggested
-        
         elif (avg_profit < loss_threshold or self.drawdown_tracker > drawdown_limit or win_rate < 0.40):
             reduction = 5 if self.drawdown_tracker > drawdown_limit else 2
             suggested = max(current_leverage - reduction, min_leverage)
             if suggested < current_leverage:
                 return suggested
-        
         return None
     
     def auto_adjust_parameters(self, learning_rate: float = 0.1):
@@ -593,26 +619,7 @@ class KellyAdapter:
             
             self.kelly_min = new_min
         
-        # 4. 调整杠杆
-        suggested_leverage = self.suggest_leverage_adjustment()
-        if suggested_leverage is not None:
-            if self.leverage is None:
-                from config import PAPER_TRADING_CONFIG
-                self.leverage = PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 10)
-            
-            old_leverage = self.leverage
-            self.leverage = suggested_leverage
-            
-            avg_profit = np.mean(list(self.recent_performance)) if self.recent_performance else 0
-            adjustments.append({
-                "timestamp": datetime.now().isoformat(),
-                "parameter": "LEVERAGE",
-                "old_value": float(old_leverage),
-                "new_value": float(self.leverage),
-                "delta": float(self.leverage - old_leverage),
-                "delta_pct": float((self.leverage - old_leverage) / old_leverage * 100),
-                "reason": f"基于表现调整 (平均收益: {avg_profit:.2f}%, 回撤: {self.drawdown_tracker:.1f}%)",
-            })
+        # 4. 杠杆由每笔开平仓的 adjust_leverage_after_trade 单独调整，此处不再调整
         
         # 记录调整历史
         if adjustments:
@@ -629,7 +636,7 @@ class KellyAdapter:
             "KELLY_FRACTION": self.kelly_fraction or PAPER_TRADING_CONFIG.get("KELLY_FRACTION", 0.25),
             "KELLY_MAX": self.kelly_max or PAPER_TRADING_CONFIG.get("KELLY_MAX_POSITION", 0.8),
             "KELLY_MIN": self.kelly_min or PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.05),
-            "LEVERAGE": self.leverage or PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 10),
+            "LEVERAGE": self.leverage or PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20),
         }
     
     def to_dict(self) -> dict:
@@ -1099,8 +1106,13 @@ class AdaptiveController:
             self.stats["consecutive_losses"] += 1
             self.stats["consecutive_wins"] = 0
         
-        # 凯利参数自适应调整（每10笔）
-        if self.stats["total_trades"] % 10 == 0:
+        # 杠杆自适应：每笔平仓后都按盈亏调整（盈利放大、亏损缩小，5x~100x，默认20x）
+        from config import PAPER_TRADING_CONFIG
+        if self.kelly_adapter and PAPER_TRADING_CONFIG.get("LEVERAGE_ADAPTIVE", True):
+            self.kelly_adapter.adjust_leverage_after_trade(order.profit_pct)
+        
+        # 仓位自适应：每笔平仓后都调整凯利参数（KELLY_FRACTION / KELLY_MAX / KELLY_MIN），下一笔开仓即生效
+        if self.kelly_adapter:
             self.kelly_adapter.auto_adjust_parameters(self.current_learning_rate)
         
         # 市场状态自适应调整

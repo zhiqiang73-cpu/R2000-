@@ -549,16 +549,28 @@ class BayesianTradeFilter:
             return min_position_pct, f"新原型，试探仓位 {min_position_pct:.0%}"
         
         dist = self.distributions[key]
-        
-        # 样本不足，用最小仓位
-        if dist.trade_count < min_sample_count:
-            return min_position_pct, f"样本不足({dist.trade_count}<{min_sample_count})，试探仓位 {min_position_pct:.0%}"
-        
         p = dist.expected_win_rate  # 胜率
         b = dist.profit_loss_ratio  # 盈亏比
         
-        # 凯利公式
+        # 盈亏比为 0 或无效时避免除零，使用最小仓位
+        if b is None or not (b > 0):
+            return min_position_pct, f"盈亏比无效(b={b})，使用最小仓位{min_position_pct:.0%}继续学习"
+        
+        # 凯利公式（共用）
         kelly_full = p - (1 - p) / b
+        
+        # 样本不足时：若有回测先验（alpha+beta 已体现历史），用「先验凯利」打 6 折，让仓位随信号质量变化而非总是最小
+        if dist.trade_count < min_sample_count:
+            prior_strength = dist.alpha + dist.beta
+            if prior_strength >= 3 and kelly_full > 0:
+                kelly_scaled = kelly_full * kelly_fraction * 0.6
+                position_pct = float(np.clip(kelly_scaled, min_position_pct, max_position_pct))
+                reason = (
+                    f"先验凯利(样本{dist.trade_count}<{min_sample_count}, 保守×0.6) "
+                    f"胜率={p:.1%} 盈亏比={b:.2f} → 仓位={position_pct:.1%}"
+                )
+                return position_pct, reason
+            return min_position_pct, f"样本不足({dist.trade_count}<{min_sample_count})，试探仓位 {min_position_pct:.0%}"
         
         # 凯利值 <= 0 时，使用最小仓位继续学习（不拒绝交易）
         if kelly_full <= 0:
@@ -571,7 +583,7 @@ class BayesianTradeFilter:
         position_pct = np.clip(kelly_scaled, min_position_pct, max_position_pct)
         
         reason = (
-            f"凯利={kelly_full:.2%}(胜率={p:.1%}, 盈亏比={b:.2f}) | "
+            f"凯利={kelly_full:.2%}(胜率={p:.1%}, 盈亏比={b:.2f}, 实盘{dist.trade_count}笔) | "
             f"最终仓位={position_pct:.1%}"
         )
         

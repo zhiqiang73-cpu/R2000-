@@ -162,10 +162,10 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         account_layout.addRow("初始资金:", self.balance_spin)
         
         self.leverage_spin = QtWidgets.QSpinBox()
-        self.leverage_spin.setRange(10, 10)
-        self.leverage_spin.setValue(10)
+        self.leverage_spin.setRange(5, 100)
+        self.leverage_spin.setValue(20)
         self.leverage_spin.setSuffix("x")
-        self.leverage_spin.setToolTip("实时执行固定为 10x")
+        self.leverage_spin.setToolTip("默认 20x；自适应每笔开平仓按盈亏在 5x~100x 间自动调整")
         account_layout.addRow("杠杆:", self.leverage_spin)
 
         # 单次仓位 + 凯利公式标识 + 心跳灯
@@ -1469,9 +1469,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter if ci else QtCore.Qt.AlignmentFlag.AlignLeft)
             grid.addWidget(lbl, 0, ci)
 
-        # -- read thresholds from config --
-        sl_atr = PAPER_TRADING_CONFIG.get("ATR_SL_MULTIPLIER", 4.0)
-        min_sl_pct = PAPER_TRADING_CONFIG.get("MIN_SL_PCT", 0.004)
+        # -- read thresholds from config（平仓条件以分段止盈/分段止损为主，不再单独展示硬止损）--
         safe_th = PAPER_TRADING_CONFIG.get("HOLD_SAFE_THRESHOLD", 0.7)
         alert_th = PAPER_TRADING_CONFIG.get("HOLD_ALERT_THRESHOLD", 0.5)
         derail_th = PAPER_TRADING_CONFIG.get("HOLD_DERAIL_THRESHOLD", 0.3)
@@ -1485,12 +1483,11 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         max_hold = PAPER_TRADING_CONFIG.get("MAX_HOLD_BARS", 240)
 
         exit_rows = [
-            ("止损",          f"{sl_atr:.1f}×ATR 或 最低 {min_sl_pct*100:.1f}%"),
+            ("分段止盈",      f"峰值 ≥ {tp1:.0f}% 减仓{r1:.0%}，≥ {tp2:.0f}% 再减{r1:.0%}"),
+            ("分段止损",      f"亏损 ≥ {sl1:.0f}% 减仓{r1:.0%}，≥ {sl2:.0f}% 再减{r1:.0%}（与开仓硬止损并存）"),
             ("安全持仓",      f"相似度 ≥ {safe_th:.0%}"),
             ("警戒",          f"相似度 {alert_th:.0%}~{safe_th:.0%}"),
             ("脱轨平仓",      f"相似度 < {derail_th:.0%}"),
-            ("分段止盈",      f"峰值 ≥ {tp1:.0f}% 减仓{r1:.0%}，≥ {tp2:.0f}% 再减{r1:.0%}"),
-            ("分段止损",      f"亏损 ≥ {sl1:.0f}% 减仓{r1:.0%}，≥ {sl2:.0f}% 再减{r1:.0%}"),
             ("动能衰竭",      f"盈利 ≥ {mom_min:.1f}% 且 K线缩量{mom_decay:.0%}"),
             ("最大持仓",      f"{max_hold}根K线"),
         ]
@@ -2119,18 +2116,24 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         
         # 更新综合决策（使用 reasoning_result + state 持仓建议）
         if hasattr(self, '_verdict_widgets'):
-            verdict_text = "等待持仓信号..."
             action_text = ""
-            if reasoning_result is not None and hasattr(reasoning_result, 'verdict'):
-                verdict_map = {
-                    'hold_firm': '坚定持仓',
-                    'tighten_watch': '收紧观察',
-                    'prepare_exit': '准备平仓',
-                    'exit_now': '立即平仓',
-                }
-                verdict_text = verdict_map.get(reasoning_result.verdict, reasoning_result.verdict)
-                if hasattr(reasoning_result, 'narrative') and reasoning_result.narrative:
-                    verdict_text = f"{verdict_text} | {reasoning_result.narrative}"
+            # 首先根据是否有持仓设置基础文本
+            if order is not None:
+                verdict_text = "持仓中"
+                # 如果有推理结果，使用详细判断
+                if reasoning_result is not None and hasattr(reasoning_result, 'verdict'):
+                    verdict_map = {
+                        'hold_firm': '坚定持仓',
+                        'tighten_watch': '收紧观察',
+                        'prepare_exit': '准备平仓',
+                        'exit_now': '立即平仓',
+                    }
+                    verdict_text = verdict_map.get(reasoning_result.verdict, reasoning_result.verdict)
+                    if hasattr(reasoning_result, 'narrative') and reasoning_result.narrative:
+                        verdict_text = f"{verdict_text} | {reasoning_result.narrative}"
+            else:
+                # 无持仓时
+                verdict_text = "等待入场信号"
             # 叠加持仓止盈建议
             if state is not None and getattr(state, 'holding_exit_suggestion', ''):
                 exit_sug = state.holding_exit_suggestion
@@ -2248,7 +2251,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.position_margin_label.setText(f"{order.margin_used:,.2f} USDT")
             
             # 杠杆（从订单或交易器获取）
-            current_leverage = getattr(order, 'leverage', None) or (self._paper_trader.leverage if hasattr(self, '_paper_trader') and self._paper_trader else 10)
+            current_leverage = getattr(order, 'leverage', None) or (self._paper_trader.leverage if hasattr(self, '_paper_trader') and self._paper_trader else 20)
             self.position_leverage_label.setText(f"{current_leverage}x")
             
             # 根据杠杆高低设置颜色提示
@@ -2879,17 +2882,25 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         self.stacked.setCurrentIndex(1 if has_data else 0)
     
     def add_trade(self, order):
-        """添加单个交易记录"""
+        """添加单个交易记录。分段止盈/止损每段一条；同一笔的「持」行在收到平仓时复用为平仓行。"""
         key = self._trade_key(order)
         if key in self._rows_by_key:
             # 已存在则更新（例如平仓、或同步更新）
             row_idx = self._rows_by_key[key]
             self._update_trade_row(row_idx, order)
-            # 更新后重新调整该行高度
             self.table.resizeRowToContents(row_idx)
         else:
-            row = self._insert_trade_row(order)
-            self._rows_by_key[key] = row
+            order_id = str(getattr(order, "order_id", "") or "")
+            exit_time = getattr(order, "exit_time", None)
+            # 已平仓且存在同笔持仓行时，复用该行显示平仓，避免留下多余「持」
+            if exit_time is not None and order_id and order_id in self._rows_by_key:
+                row_idx = self._rows_by_key.pop(order_id)
+                self._update_trade_row(row_idx, order)
+                self._rows_by_key[key] = row_idx
+                self.table.resizeRowToContents(row_idx)
+            else:
+                row = self._insert_trade_row(order)
+                self._rows_by_key[key] = row
         self._update_empty_state()
     
     def set_history(self, trades: List):
@@ -2905,18 +2916,21 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         self.table.resizeRowsToContents()
             
     def _trade_key(self, order) -> str:
-        """生成稳定的交易标识"""
+        """生成稳定的交易标识。已平仓（含分段）用 order_id+exit_ts 区分，保证每段一行。"""
         order_id = str(getattr(order, "order_id", "") or "")
+        exit_time = getattr(order, "exit_time", None)
+        exit_ts = exit_time.timestamp() if exit_time else 0.0
         if order_id and not order_id.startswith("EXCHANGE_SYNC"):
+            # 已平仓则按平仓时间区分，便于分段止盈/分段止损每段一条记录
+            if exit_time is not None:
+                return f"{order_id}-{exit_ts:.3f}"
             return order_id
         side = getattr(order, "side", None)
         side_val = side.value if side else "-"
         entry_price = getattr(order, "entry_price", 0.0)
         quantity = getattr(order, "quantity", 0.0)
         entry_time = getattr(order, "entry_time", None)
-        exit_time = getattr(order, "exit_time", None)
         entry_ts = entry_time.timestamp() if entry_time else 0.0
-        exit_ts = exit_time.timestamp() if exit_time else 0.0
         return f"SYNC-{side_val}-{entry_price:.2f}-{quantity:.6f}-{entry_ts:.0f}-{exit_ts:.0f}"
     
     def _insert_trade_row(self, order):

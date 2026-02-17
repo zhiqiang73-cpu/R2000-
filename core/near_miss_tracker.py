@@ -57,7 +57,7 @@ def classify_miss_band(similarity: float, threshold: float) -> str:
         return "MARGINAL"
 
 
-# ── 可调参数定义（余弦阈值的边界 & 调整步长）──
+# ── 可调参数定义（余弦 / 融合 / 欧氏 / DTW 阈值）──
 
 ADJUSTABLE_NEAR_MISS: Dict[str, Dict[str, Any]] = {
     "COSINE_THRESHOLD": {
@@ -65,6 +65,24 @@ ADJUSTABLE_NEAR_MISS: Dict[str, Dict[str, Any]] = {
         "tighten_step": 0.01,
         "min": 0.80,
         "max": 0.99,
+    },
+    "FUSION_THRESHOLD": {
+        "loosen_step": -0.03,
+        "tighten_step": 0.02,
+        "min": 0.25,
+        "max": 0.75,
+    },
+    "EUCLIDEAN_MIN_THRESHOLD": {
+        "loosen_step": -0.05,
+        "tighten_step": 0.03,
+        "min": 0.15,
+        "max": 0.70,
+    },
+    "DTW_MIN_THRESHOLD": {
+        "loosen_step": -0.05,
+        "tighten_step": 0.03,
+        "min": 0.10,
+        "max": 0.60,
     },
 }
 
@@ -613,12 +631,15 @@ class NearMissTracker:
 
         return None  # 阈值合理
 
-    def get_suggestions(self, config_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def get_suggestions(self, config_dict: Dict[str, Any], 
+                        fusion_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
         """
         计算具体的调整建议列表（TrackerCard UI 可直接使用）。
+        支持融合/欧氏/DTW 门槛（需传入 fusion_threshold 等当前值）。
 
         Args:
             config_dict: 运行时配置字典（通常为 PAPER_TRADING_CONFIG）
+            fusion_threshold: 当前融合门槛（用于 FUSION_THRESHOLD 建议）
 
         Returns:
             逐参数的调整条目列表
@@ -632,6 +653,8 @@ class NearMissTracker:
 
         for param_key, param_def in ADJUSTABLE_NEAR_MISS.items():
             current_val = config_dict.get(param_key)
+            if current_val is None and param_key == "FUSION_THRESHOLD" and fusion_threshold is not None:
+                current_val = fusion_threshold
             if current_val is None:
                 continue
 
@@ -649,11 +672,17 @@ class NearMissTracker:
                 continue  # 已在边界
 
             action_text = "放宽" if action == "loosen" else "收紧"
+            labels = {
+                "COSINE_THRESHOLD": "余弦相似度阈值",
+                "FUSION_THRESHOLD": "融合评分阈值",
+                "EUCLIDEAN_MIN_THRESHOLD": "欧氏距离阈值",
+                "DTW_MIN_THRESHOLD": "DTW形态阈值",
+            }
             expanded.append({
                 "param_key": param_key,
                 "action": action,
                 "action_text": action_text,
-                "label": "余弦相似度阈值",
+                "label": labels.get(param_key, param_key),
                 "old_value": current_val,
                 "new_value": round(new_value, 4),
                 "step": step,

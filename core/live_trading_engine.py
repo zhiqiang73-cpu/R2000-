@@ -284,9 +284,10 @@ class LiveTradingEngine:
             realtime_emit_interval=PAPER_TRADING_CONFIG.get("REALTIME_DECISION_SEC", 0.05),
         )
         
-        # 执行参数固定：每次开仓 50% 仓位，杠杆 10x
+        # 执行参数固定：每次开仓 50% 仓位，杠杆默认 20x（可被自适应每笔调整）
         self.fixed_position_size_pct = 0.5
-        self.fixed_leverage = 10
+        default_lev = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
+        self.fixed_leverage = int(leverage) if leverage is not None and leverage > 0 else default_lev
 
         # Binance 测试网真实执行器（不再使用本地虚拟模式）
         self._paper_trader = BinanceTestnetTrader(
@@ -757,6 +758,15 @@ class LiveTradingEngine:
                 self._current_bar_idx,
                 CloseReason.MANUAL,
             )
+        # 退出前强制保存交易记录，避免异常关闭导致丢失
+        try:
+            trader = getattr(self, "_paper_trader", None)
+            if trader is not None and getattr(trader, "save_history", None):
+                path = getattr(trader, "history_file", None)
+                if path:
+                    trader.save_history(path)
+        except Exception as e:
+            print(f"[LiveEngine] 停止时保存交易记录失败: {e}")
         
         # 保存拒绝跟踪器状态 & 生成会话结束报告
         if self._rejection_tracker:
@@ -897,6 +907,7 @@ class LiveTradingEngine:
                                   reason: str = "") -> Optional[Dict]:
         """
         自适应学习通用参数调整入口（出场时机/止盈止损/近似信号/早期出场）。
+        支持融合/欧氏/DTW 开仓门槛自适应。
         """
         tracker_map = {
             "exit_timing": self._exit_timing_tracker,
@@ -905,15 +916,36 @@ class LiveTradingEngine:
             "early_exit": self._early_exit_tracker,
         }
         tracker = tracker_map.get(source)
-        if not tracker:
-            return None
         if source == "near_miss":
+            # 融合/欧氏/DTW 门槛：直接更新 proto_matcher，不通过 config
+            if param_key == "FUSION_THRESHOLD" and self._proto_matcher:
+                old = getattr(self._proto_matcher, "fusion_threshold", 0.40)
+                self._proto_matcher.fusion_threshold = float(new_value)
+                if self._cold_start_manager and hasattr(self._cold_start_manager, "_state"):
+                    self._cold_start_manager._state.fusion_threshold = float(new_value)
+                print(f"[LiveEngine] 融合评分阈值自适应: {old:.2f} → {new_value:.2f}")
+                return {"param_key": param_key, "old_value": old, "new_value": new_value}
+            if param_key in ("EUCLIDEAN_MIN_THRESHOLD", "DTW_MIN_THRESHOLD") and self._proto_matcher:
+                euc_val = new_value if param_key == "EUCLIDEAN_MIN_THRESHOLD" else None
+                dtw_val = new_value if param_key == "DTW_MIN_THRESHOLD" else None
+                self._proto_matcher.set_single_dimension_thresholds(
+                    long_euclidean=euc_val, long_dtw=dtw_val,
+                    short_euclidean=euc_val, short_dtw=dtw_val,
+                )
+                print(f"[LiveEngine] {param_key} 自适应: → {new_value:.2f}")
+                return {"param_key": param_key, "new_value": new_value}
+            if not tracker:
+                return None
             record = tracker.apply_adjustment(PAPER_TRADING_CONFIG, param_key, new_value, reason=reason)
             if record is not None:
                 if param_key == "COSINE_THRESHOLD":
                     self.cosine_threshold = float(record.new_value)
                     self.state.entry_threshold = float(record.new_value)
+                    if self._proto_matcher:
+                        self._proto_matcher.cosine_threshold = float(record.new_value)
                 return record.to_dict()
+            return None
+        if not tracker:
             return None
         if source in ("exit_timing", "tpsl", "early_exit"):
             return tracker.apply_adjustment(PAPER_TRADING_CONFIG, param_key, new_value, reason=reason)
@@ -1222,6 +1254,10 @@ class LiveTradingEngine:
                             print(f"[LiveEngine] ⚡ Tick触发{close_reason.value} @ {kline.close:.2f}")
                             self.state.last_event = f"⚡ Tick触发{close_reason.value}"
                             self._reset_position_state()
+                        else:
+                            # 【regime-原型一致性】持仓时也运行预匹配，使“匹配原型”与当前市场状态一致
+                            # 否则会一直显示开仓时的 LONG 原型，而市场已变为震荡偏空（应显示 SHORT）
+                            self._preview_match(kline)
                 else:
                     # 未持仓时，tick级仅做预匹配（UI预览），不做入场决策
                     # 实盘/测试网入场决策统一在K线收线时执行，避免：
@@ -1603,7 +1639,23 @@ class LiveTradingEngine:
                 self._paper_trader._place_exchange_tp_sl(order)
         except Exception as e:
             print(f"[LiveEngine] 补全TP/SL失败: {e}")
-    
+
+    def _sync_exchange_sl_if_used(self, sl_price: float, force: bool = False):
+        """
+        若当前使用交易所模式（Binance 等），立即将内存中的止损价同步到交易所（可绕过节流）。
+        供其他需立刻生效的 SL 更新场景使用。
+        """
+        if not hasattr(self._paper_trader, "_update_exchange_sl"):
+            return
+        if self._paper_trader.current_position is None:
+            return
+        try:
+            ok = self._paper_trader._update_exchange_sl(sl_price, force=force)
+            if ok:
+                print(f"[LiveEngine] 已同步交易所止损至保本: SL={sl_price:.2f}")
+        except Exception as e:
+            print(f"[LiveEngine] 同步交易所止损失败: {e}")
+
     def _execute_reverse_entry(self, kline: KlineData, atr: float):
         """
         反手单入场：止损后自动反方向开仓
@@ -2059,21 +2111,42 @@ class LiveTradingEngine:
             # 近似信号追踪（仅在未达阈值时记录）
             if self._near_miss_tracker and direction is None:
                 near_ratio = float(PAPER_TRADING_CONFIG.get("NEAR_MISS_RATIO", 0.85))
+                fp_str = ""
                 if self.use_prototypes:
                     best_sim = max(long_sim, short_sim)
                     best_dir = "LONG" if long_sim >= short_sim else "SHORT"
+                    best_res = long_result if long_sim >= short_sim else short_result
+                    thresh = getattr(self._proto_matcher, "fusion_threshold", 0.40) if self._proto_matcher else 0.40
+                    detail = {
+                        "market_regime": self.state.market_regime,
+                        "combined_score": best_res.get("combined_score", best_sim),
+                        "cosine_sim": best_res.get("cosine_similarity", 0.0),
+                        "euclidean_sim": best_res.get("euclidean_similarity", 0.0),
+                        "dtw_sim": best_res.get("dtw_similarity", 0.0),
+                    }
+                    proto = best_res.get("best_prototype") if isinstance(best_res, dict) else None
+                    if proto is not None:
+                        d = getattr(proto, "direction", "") or "?"
+                        i = getattr(proto, "prototype_id", "") or "?"
+                        fp_str = f"proto_{d}_{i}"
                 else:
                     best_sim = max(getattr(long_result, "dtw_similarity", 0.0),
                                    getattr(short_result, "dtw_similarity", 0.0))
                     best_dir = "LONG" if getattr(long_result, "dtw_similarity", 0.0) >= getattr(short_result, "dtw_similarity", 0.0) else "SHORT"
-                if best_sim > 0 and best_sim < self.cosine_threshold and best_sim >= self.cosine_threshold * near_ratio:
+                    thresh = self.cosine_threshold
+                    detail = {"market_regime": self.state.market_regime}
+                    tmpl = long_result.best_template if long_sim >= short_sim else short_result.best_template
+                    fp_str = tmpl.fingerprint() if tmpl else ""
+                if best_sim > 0 and best_sim < thresh and best_sim >= thresh * near_ratio:
                     self._near_miss_tracker.record_near_miss(
                         price=price,
                         direction=best_dir,
                         similarity=best_sim,
-                        threshold=self.cosine_threshold,
+                        threshold=thresh,
+                        market_regime=self.state.market_regime,
                         bar_idx=self._current_bar_idx,
-                        detail={"market_regime": self.state.market_regime},
+                        fingerprint=fp_str,
+                        detail=detail,
                     )
 
             if direction is not None and chosen_fp:
@@ -3366,14 +3439,18 @@ class LiveTradingEngine:
         if not self.state.exit_reason:
             self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
         
-        # 【新增】更新详细的离场/持有说明（含空间位置评分细项）
+        # 【新增】更新详细的离场/持有说明（含空间位置评分细项 + 止损层级监控）
         pnl_pct = order.profit_pct
         score_suffix = ""
         if self._df_buffer is not None and len(self._df_buffer) >= 20:
             pos_score, score_detail = self._calc_position_score(order.side.value)
             self.state.position_score = pos_score
             score_suffix = f" | 位置评分={pos_score:.0f} ({score_detail})" if score_detail else ""
-        self.state.decision_reason = f"[持仓中] {order.side.value} | 相似度={order.current_similarity:.1%} | 收益={pnl_pct:+.2f}%{score_suffix}"
+        
+        # 【止损层级监控】显示当前距离各档止损的距离
+        sl_monitor = self._get_stop_loss_monitor(order, pnl_pct)
+        
+        self.state.decision_reason = f"[持仓中] {order.side.value} | 相似度={order.current_similarity:.1%} | 收益={pnl_pct:+.2f}%{score_suffix}{sl_monitor}"
         
         # 新开仓保护期：保护期内止损暂缓触发，允许止盈
         from config import PAPER_TRADING_CONFIG as _ptc
@@ -3453,127 +3530,7 @@ class LiveTradingEngine:
         # ══════════════════════════════════════════════════════════
         self._update_holding_reasoning_chain(order)
         
-        # ══════════════════════════════════════════════════════════
-        # 【新增】前3根K线紧急止损守卫 (Early Exit Guard)
-        # 问题：前3根保护期内只有硬止损保护，形成致命盲区
-        # 方案：
-        #   1. 亏损超阈值(默认-1.5%) → 紧急平仓
-        #   2. 原始市场状态与持仓方向冲突 → 收紧止损至入场价附近
-        # 注意：使用原始状态(_infer)而非确认状态(_confirm)，更灵敏
-        # ══════════════════════════════════════════════════════════
-        if order.hold_bars < 3:
-            early_exit_pct = PAPER_TRADING_CONFIG.get("EARLY_EXIT_ADVERSE_PCT", 1.5)
-            
-            # ─── 检查1：亏损超过紧急阈值 → 立即平仓 ───
-            # profit_pct 已包含杠杆，负值代表亏损
-            if order.profit_pct <= -early_exit_pct:
-                reason_text = (
-                    f"[紧急止损] 保护期第{order.hold_bars}根K线, "
-                    f"亏损{order.profit_pct:.1f}% 超过紧急阈值-{early_exit_pct}%"
-                )
-                print(f"[LiveEngine] 🚨 {reason_text}")
-                self.state.last_event = f"🚨 保护期紧急止损({order.profit_pct:.1f}%)"
-                if self._close_and_reset(kline.close, self._current_bar_idx,
-                                         CloseReason.STOP_LOSS, order, reason_text):
-                    return
-            
-            # ─── 检查2：原始市场状态与持仓方向冲突 → 收紧止损 ───
-            raw_regime = self._infer_market_regime()
-            _BULL_REGIMES = {"强多头", "弱多头", "震荡偏多"}
-            _BEAR_REGIMES = {"强空头", "弱空头", "震荡偏空"}
-            
-            regime_conflict = (
-                (order.side == OrderSide.LONG and raw_regime in _BEAR_REGIMES) or
-                (order.side == OrderSide.SHORT and raw_regime in _BULL_REGIMES)
-            )
-            
-            if regime_conflict:
-                tighten_pct = PAPER_TRADING_CONFIG.get("EARLY_EXIT_TIGHTEN_PCT", 0.005)
-                entry = order.entry_price
-                old_sl = order.stop_loss
-                old_sl_str = f"{old_sl:.2f}" if old_sl is not None else "无"
-                
-                if order.side == OrderSide.LONG:
-                    tightened_sl = entry * (1 - tighten_pct)
-                    if old_sl is None or tightened_sl > old_sl:
-                        order.stop_loss = tightened_sl
-                        print(f"[LiveEngine] ⚠ 保护期市场冲突(LONG vs {raw_regime}): "
-                              f"收紧止损 {old_sl_str} → {tightened_sl:.2f}")
-                        self.state.last_event = f"⚠ 保护期收紧止损(市场{raw_regime})"
-                else:  # SHORT
-                    tightened_sl = entry * (1 + tighten_pct)
-                    if old_sl is None or tightened_sl < old_sl:
-                        order.stop_loss = tightened_sl
-                        print(f"[LiveEngine] ⚠ 保护期市场冲突(SHORT vs {raw_regime}): "
-                              f"收紧止损 {old_sl_str} → {tightened_sl:.2f}")
-                        self.state.last_event = f"⚠ 保护期收紧止损(市场{raw_regime})"
-        
-        if order.hold_bars >= 3:  # 与信号离场保护一致
-            market_reversal = self._check_market_reversal(order)
-            if market_reversal["should_exit"]:
-                # 输出详细的决策依据
-                d = market_reversal["details"]
-                curr = self._df_buffer.iloc[-1]
-                prev = self._df_buffer.iloc[-2]
-                votes = d.get('reversal_votes', '?')
-                print(f"[LiveEngine] 🔄 市场反转投票触发 ({votes}/3票):")
-                print(f"  ├─ 方向: {order.side.value} | 持仓: {order.hold_bars}根K线")
-                print(f"  ├─ 市场状态(原始): {d['regime_raw']} "
-                      f"({'转空✓' if d['regime_bearish'] else '转多✓' if d['regime_bullish'] else '中性✗'})"
-                      f" | 确认状态: {d['regime_confirmed']}")
-                print(f"  ├─ MACD柱: {prev['macd_hist']:.2f} → {curr['macd_hist']:.2f} "
-                      f"({'转空✓' if d['macd_bearish'] else '转多✓' if d['macd_bullish'] else '中性✗'})")
-                print(f"  ├─ KDJ-J: {prev['j']:.1f} → {curr['j']:.1f} "
-                      f"({'转空✓' if d['kdj_bearish'] else '转多✓' if d['kdj_bullish'] else '中性✗'})")
-                print(f"  └─ 结论: {market_reversal['reason']}")
-                
-                reason_text = self._build_exit_reason(f"市场反转({market_reversal['reason']})", order)
-                if self._close_and_reset(kline.close, self._current_bar_idx,
-                                         CloseReason.SIGNAL, order, reason_text):
-                    return
-        
-        # ══════════════════════════════════════════════════════════
-        # 【核心】持仓中价格位置翻转检测
-        # 震荡市中：持SHORT到底部 → 平仓+做多 / 持LONG到顶部 → 平仓+做空
-        # 比止损反手更聪明：不等止损，主动在有利位置翻转
-        # ══════════════════════════════════════════════════════════
-        if order.hold_bars >= 3:  # 至少持仓3根K线后才翻转（避免刚开仓就翻）
-            flip_result = self._check_position_flip(order, kline, atr)
-            if flip_result and flip_result.get("should_flip"):
-                flip_dir = flip_result["flip_direction"]
-                flip_pos = flip_result["price_position"]
-                pos_label = "底部" if flip_dir == "LONG" else "顶部"
-                
-                reason_text = (
-                    f"[位置翻转] {order.side.value}→{flip_dir} | "
-                    f"价格在区间{pos_label}({flip_pos:.0%}) | "
-                    f"当前收益={order.profit_pct:+.1f}% | "
-                    f"{flip_result.get('detail', '')}"
-                )
-                print(f"[LiveEngine] 🔄🔄 持仓翻转触发: {reason_text}")
-                
-                # 记录翻转信息到订单（平仓前）
-                order.decision_reason = reason_text
-                
-                # 平仓当前持仓
-                closed = self._close_and_reset(
-                    kline.close, self._current_bar_idx,
-                    CloseReason.POSITION_FLIP, order, reason_text
-                )
-                
-                if closed:
-                    # 准备反手信号（翻转单）
-                    self._flip_pending = True
-                    self._flip_direction = flip_dir
-                    self._flip_price_position = flip_pos
-                    self._flip_proto_fp = flip_result.get("flip_fp", "")
-                    self._flip_similarity = flip_result.get("flip_sim", 0.0)
-                    self._flip_proto = flip_result.get("flip_proto")
-                    self._flip_template = flip_result.get("flip_template")
-                    
-                    print(f"[LiveEngine] 🔄 翻转信号已准备: {flip_dir} | "
-                          f"原型={self._flip_proto_fp} | 相似度={self._flip_similarity:.1%}")
-                return
+        # 仅保留分段止盈/分段止损（5%、10%），已移除：保护期紧急止损、保护期收紧、市场反转、位置翻转
 
         # ══════════════════════════════════════════════════════════
         # 持仓思维链 1：市场状态有没有变化
@@ -3611,24 +3568,8 @@ class LiveTradingEngine:
                     reason = "市场反转" if regime_change == "反转" else f"ATR变化{atr_change_pct:.0%}"
                     print(f"[LiveEngine] {reason} → 重算 TP/SL: TP={new_tp:.2f}, SL={new_sl:.2f}")
             elif regime_change == "弱化·震荡":
-                # 先保本收紧：有浮盈时才把止损挪到入场价，触发时保本出场、不锁亏
-                self.state.tpsl_action = "tighten_sl_only"
-                entry = order.entry_price
-                old_sl = order.stop_loss
-                min_profit = PAPER_TRADING_CONFIG.get("REGIME_WEAKEN_MIN_PROFIT_PCT", 0.2)
-                profit_pct = getattr(order, "profit_pct", 0.0) or 0.0
-                if profit_pct >= min_profit:
-                    # 收紧到入场价（真保本），不设 entry±x% 否则一触发就亏
-                    if order.side == OrderSide.LONG:
-                        if old_sl is None or entry > old_sl:
-                            order.stop_loss = entry
-                            self.state.last_event = "弱化·震荡：收紧至保本"
-                    else:
-                        if old_sl is None or entry < old_sl:
-                            order.stop_loss = entry
-                            self.state.last_event = "弱化·震荡：收紧至保本"
-                else:
-                    self.state.tpsl_action = "hold"
+                # 已移除「弱化·震荡：收紧至保本」逻辑，不再把止损挪到入场价
+                self.state.tpsl_action = "hold"
             else:
                 self.state.tpsl_action = "hold"
         else:
@@ -3638,36 +3579,8 @@ class LiveTradingEngine:
         self._check_staged_partial_sl(kline)
         self._check_staged_partial_tp(kline)
 
-        # ── 价格动量衰减离场（高点检测 + 自适应响应）──
-        momentum_exit = self._check_momentum_decay_exit(order, kline)
-        if momentum_exit["should_exit"]:
-            reason_text = f"[动量衰减] {momentum_exit['reason']} | 峰值利润={order.peak_profit_pct:.1f}% → 当前={order.profit_pct:.1f}%"
-            print(f"[LiveEngine] 📉 动量衰减离场: {reason_text}")
-            self.state.last_event = f"📉 动量衰减平仓"
-            if self._close_and_reset(kline.close, self._current_bar_idx, CloseReason.SIGNAL, order, reason_text):
-                return
-        elif momentum_exit.get("should_tighten_stop", False):
-            # 收紧止损到成本价以上（可信度中高，不立即平但防止回撤）
-            leverage = float(self._paper_trader.leverage)
-            entry = order.entry_price
-            current_profit_pct = order.profit_pct / leverage / 100.0  # 转为价格百分比
-            
-            if order.side == OrderSide.LONG:
-                # 收紧到成本价 + 当前利润的 50%
-                tightened_sl = entry * (1 + current_profit_pct * 0.5)
-                if tightened_sl > (order.stop_loss or 0):
-                    order.stop_loss = tightened_sl
-                    print(f"[LiveEngine] 🔒 动量衰减信号：收紧止损到 {tightened_sl:.2f} (锁定50%利润)")
-                    self.state.last_event = f"🔒 收紧止损(动量衰减信号)"
-            else:  # SHORT
-                tightened_sl = entry * (1 - current_profit_pct * 0.5)
-                if tightened_sl < (order.stop_loss or float('inf')):
-                    order.stop_loss = tightened_sl
-                    print(f"[LiveEngine] 🔒 动量衰减信号：收紧止损到 {tightened_sl:.2f} (锁定50%利润)")
-                    self.state.last_event = f"🔒 收紧止损(动量衰减信号)"
-        
-        # 【思维链4】市场恶化+盈利时的仓位自适应减仓（与分段止盈区分）
-        self._check_regime_deterioration_reduce(order, kline)
+        # 已移除动量衰减离场/收紧，仅保留分段止盈与分段止损
+        # 已移除市场恶化减仓（用户不需要）
 
         # 最大持仓安全网（防止相似度一直在0.5~0.7之间缓慢失血）
         max_hold = getattr(self, 'max_hold_bars', 240)
@@ -3756,44 +3669,6 @@ class LiveTradingEngine:
                 self.state.reasoning_result = rr
             except Exception as e:
                 self.state.reasoning_result = None
-    
-    def _check_regime_deterioration_reduce(self, order, kline: KlineData):
-        """
-        市场恶化 + 盈利时的仓位自适应减仓（与分段止盈区分）
-        
-        条件：市场状态弱化或反转 + 当前盈利 >= 阈值 → 可选减仓
-        与 _check_staged_partial_tp 的区别：后者按峰值利润阶梯（2%/4%）触发；
-        本方法按「市场恶化 + 已有盈利」触发，针对风险偏好调整。
-        """
-        from config import PAPER_TRADING_CONFIG
-        min_profit = PAPER_TRADING_CONFIG.get("REGIME_REDUCE_MIN_PROFIT_PCT", 1.0)
-        reduce_pct = PAPER_TRADING_CONFIG.get("REGIME_REDUCE_PCT", 0.25)
-        if reduce_pct <= 0 or not PAPER_TRADING_CONFIG.get("REGIME_REDUCE_ENABLED", True):
-            return
-        if self.state.position_suggestion != "建议减仓":
-            return
-        if order.profit_pct < min_profit:
-            return
-        # 避免与分段止盈重复减仓：若最近已做过分段止盈，跳过
-        if getattr(order, 'partial_tp_count', 0) > 0:
-            return
-        # 执行一次减仓
-        partial_qty = self._round_to_step(order.quantity * reduce_pct)
-        if partial_qty <= 0:
-            return
-        closed = self._paper_trader.close_position(
-            price=kline.close,
-            bar_idx=self._current_bar_idx,
-            reason=CloseReason.TAKE_PROFIT,
-            quantity=partial_qty
-        )
-        if closed:
-            remaining = self._paper_trader.current_position
-            if remaining is not None:
-                remaining.partial_tp_count = getattr(order, 'partial_tp_count', 0)
-            msg = f"[市场恶化减仓] 市场{self.state.holding_regime_change}，盈利{order.profit_pct:.1f}%，减仓{reduce_pct:.0%}"
-            print(f"[LiveEngine] {msg}")
-            self.state.last_event = f"📉 {msg}"
     
     def _check_holding_similarity(self, kline: KlineData):
         """
@@ -4843,6 +4718,55 @@ class LiveTradingEngine:
         
         return f"[平仓决策] {logic_str} | 触发={reason}"
     
+    def _get_stop_loss_monitor(self, order, pnl_pct: float) -> str:
+        """
+        生成止损层级监控信息
+        
+        显示当前距离各档止损的距离和已触发的分段止损次数
+        
+        Args:
+            order: 当前订单
+            pnl_pct: 当前盈亏百分比
+        
+        Returns:
+            止损层级监控字符串
+        """
+        from config import PAPER_TRADING_CONFIG as _ptc
+        
+        # 获取分段止损配置
+        stage1_pct = _ptc.get("STAGED_SL_1_PCT", 5.0)
+        stage2_pct = _ptc.get("STAGED_SL_2_PCT", 10.0)
+        min_sl_pct = _ptc.get("MIN_SL_PCT", 0.15) * 100  # 转为百分比
+        
+        # 获取已触发的分段次数
+        partial_sl = getattr(order, 'partial_sl_count', 0)
+        
+        # 判断当前在哪个区间
+        if pnl_pct >= 0:
+            # 盈利状态，不显示止损层级
+            return ""
+        
+        abs_loss = abs(pnl_pct)
+        
+        if abs_loss < stage1_pct:
+            # 安全区：未触及第1档
+            status = f"安全区(距第1档 {stage1_pct - abs_loss:.1f}%)"
+        elif abs_loss < stage2_pct:
+            # 第1档已触发
+            status = f"⚠第1档已触(距第2档 {stage2_pct - abs_loss:.1f}%)"
+        elif abs_loss < min_sl_pct:
+            # 第2档已触发
+            status = f"⚠⚠第2档已触(距硬止损 {min_sl_pct - abs_loss:.1f}%)"
+        else:
+            # 接近硬止损
+            status = f"🚨危险区(硬止损{min_sl_pct:.0f}%)"
+        
+        # 显示已减仓次数
+        if partial_sl > 0:
+            status += f" 已减仓{partial_sl}次"
+        
+        return f" | 止损层级: {status}"
+    
     def _get_tp_sl_trigger_reason(self, order, close_reason: CloseReason, kline) -> str:
         """
         根据触发情况生成详细的平仓原因说明
@@ -4874,9 +4798,31 @@ class LiveTradingEngine:
                 sl_in_profit = True
 
         if close_reason == CloseReason.PARTIAL_TP:
-            return getattr(order, 'close_reason_detail', '') or "分段止盈"
+            detail = getattr(order, 'close_reason_detail', '')
+            partial_count = getattr(order, 'partial_tp_count', 0)
+            if detail:
+                return f"{detail} (第{partial_count}次分段止盈，峰值盈利{peak_pct:.1f}%)"
+            return f"分段止盈(第{partial_count}次，峰值盈利{peak_pct:.1f}%)"
+        
         if close_reason == CloseReason.PARTIAL_SL:
-            return getattr(order, 'close_reason_detail', '') or "分段止损"
+            detail = getattr(order, 'close_reason_detail', '')
+            partial_count = getattr(order, 'partial_sl_count', 0)
+            from config import PAPER_TRADING_CONFIG as _ptc
+            stage1_pct = _ptc.get("STAGED_SL_1_PCT", 5.0)
+            stage2_pct = _ptc.get("STAGED_SL_2_PCT", 10.0)
+            current_loss = abs(order.profit_pct)
+            
+            # 判断触发的是哪一档
+            if partial_count == 1:
+                stage_info = f"触发第1档(亏损{stage1_pct:.0f}%)"
+            elif partial_count == 2:
+                stage_info = f"触发第2档(亏损{stage2_pct:.0f}%)"
+            else:
+                stage_info = f"第{partial_count}次触发"
+            
+            if detail:
+                return f"{detail} ({stage_info}，当前亏损{current_loss:.1f}%)"
+            return f"分段止损({stage_info}，当前亏损{current_loss:.1f}%)"
 
         if close_reason == CloseReason.TAKE_PROFIT:
             # 真正的止盈：价格触及TP目标
@@ -4895,7 +4841,15 @@ class LiveTradingEngine:
                 return f"追踪止损(SL={sl:.2f})"
         
         elif close_reason == CloseReason.STOP_LOSS:
-            return f"触及止损价(SL={sl:.2f}, 原始SL={original_sl:.2f})"
+            # 显示硬止损触发信息，包含分段止损历史
+            partial_sl = getattr(order, 'partial_sl_count', 0)
+            from config import PAPER_TRADING_CONFIG as _ptc
+            min_sl_pct = _ptc.get("MIN_SL_PCT", 0.15) * 100
+            
+            if partial_sl > 0:
+                return f"硬止损(SL={sl:.2f}, {min_sl_pct:.0f}%全平线触发，已分段减仓{partial_sl}次)"
+            else:
+                return f"硬止损(SL={sl:.2f}, {min_sl_pct:.0f}%全平线触发)"
         
         else:
             return close_reason.value

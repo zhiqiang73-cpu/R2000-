@@ -546,21 +546,40 @@ class TradeReasoning:
             return "hold_firm"  # 多数有利/中性 → 坚定持仓
     
     def _generate_narrative(self, layers: List[ReasoningLayer], verdict: str) -> str:
-        """生成综合叙述"""
-        # 提取关键点
-        market_summary = layers[0].summary if len(layers) > 0 else ""
-        pattern_summary = layers[1].summary if len(layers) > 1 else ""
-        pnl_summary = layers[3].summary if len(layers) > 3 else ""
+        """生成综合叙述（深度总结：结合5层 + 止盈建议 + 关键指标）"""
+        if len(layers) < 5:
+            return "数据不足，无法生成综合叙述。"
         
-        # 根据判决生成叙述
+        market_summary = layers[0].summary
+        pattern_summary = layers[1].summary
+        momentum_summary = layers[2].summary
+        pnl_summary = layers[3].summary
+        safety_summary = layers[4].summary
+        
+        # 统计各层状态
+        adverse_count = sum(1 for l in layers if l.status == "adverse")
+        favorable_count = sum(1 for l in layers if l.status == "favorable")
+        
         if verdict == "exit_now":
-            return f"⚠️ 建议立即平仓。{pnl_summary}，{pattern_summary}。风险已达临界点。"
+            return (
+                f"⚠️ 建议立即平仓。{pnl_summary}；{pattern_summary}；{safety_summary}。"
+                f"共{adverse_count}层不利，风险已达临界点。"
+            )
         elif verdict == "prepare_exit":
-            return f"🔶 准备平仓。{market_summary}，{pattern_summary}。多项指标转向不利，建议择机离场。"
+            return (
+                f"🔶 准备平仓。{market_summary}；{pattern_summary}；{pnl_summary}。"
+                f"多项指标转向不利，建议择机离场，可考虑部分止盈锁定利润。"
+            )
         elif verdict == "tighten_watch":
-            return f"👀 收紧观察。{pnl_summary}，需警惕变化。部分指标出现预警信号。"
+            return (
+                f"👀 收紧观察。{pnl_summary}；{momentum_summary}。"
+                f"部分指标出现预警信号，建议上移止损或提高追踪锁利比例，密切关注动量变化。"
+            )
         else:
-            return f"✅ 坚定持仓。{market_summary}，{pnl_summary}。多项指标支持继续持仓。"
+            return (
+                f"✅ 坚定持仓。{market_summary}；{pnl_summary}；{momentum_summary}。"
+                f"共{favorable_count}层有利，趋势与形态支持继续持有，保持现有止损即可。"
+            )
     
     def _calculate_trend(self, df: pd.DataFrame, bar_idx: int, column: str, window: int = 3) -> str:
         """计算趋势（rising/falling/flat）"""

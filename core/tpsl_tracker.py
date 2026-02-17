@@ -3,15 +3,20 @@
 判断止盈止损距离是否合理，建议 ATR 倍数调整。
 
 工作流：
-1. 交易被止盈/止损平仓 → record_exit() 记录
+1. 交易被止盈/止损平仓 → record_exit() 记录（含交易所平仓按价格推断的 TP/SL）
 2. 每根K线 → evaluate_pending() 检查平仓后 N 根K线价格走势
 3. 积累足够评估 → get_suggestions() 给出 ATR 倍数调整建议
+4. 用户/自适应学习应用建议 → 更新 PAPER_TRADING_CONFIG（ATR_SL_MULTIPLIER、MIN_SL_PCT、止盈ATR 等）
+5. 后续开仓使用新 TP/SL 距离 → 系统越用越准（止损过紧→放宽、表现好→可收紧）
 
 评估逻辑：
 - STOP_LOSS 后价格反转（朝原方向走）→ SL 过紧（too_tight）
 - STOP_LOSS 后价格继续下跌 → SL 正确（correct）
 - TAKE_PROFIT 后价格继续上涨 → TP 过紧（too_tight）
 - TAKE_PROFIT 后价格反转 → TP 正确（correct）
+
+TP/SL 距离学习效果：建议被应用后，新交易的止盈/止损距离会按 ATR 倍数与最小百分比
+动态调整，减少“止损后立刻反转”或“止盈过近”等情况，提高平仓质量。
 """
 
 import json

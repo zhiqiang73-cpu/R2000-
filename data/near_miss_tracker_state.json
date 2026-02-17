@@ -1,0 +1,193 @@
+{
+  "config": {
+    "eval_bars": 30,
+    "profit_threshold_pct": 0.3,
+    "near_miss_margin": 0.1,
+    "max_history": 200,
+    "min_evaluations_for_suggestion": 15
+  },
+  "state": {
+    "data_version": 1,
+    "created_at": 1771144410.029316,
+    "last_save_time": 1771255551.2126088,
+    "total_near_misses_recorded": 7,
+    "total_evaluations_done": 7,
+    "total_adjustments_applied": 0
+  },
+  "band_scores": {
+    "MARGINAL": {
+      "miss_band": "MARGINAL",
+      "profitable_count": 4,
+      "unprofitable_count": 3,
+      "total_profit_pct": 2.432975443152745,
+      "total_loss_pct": 1.74425832641495,
+      "recent_results": [
+        true,
+        true,
+        false,
+        false,
+        false,
+        true,
+        true
+      ]
+    }
+  },
+  "history": [
+    {
+      "id": "5d09e0bb-824f-4b8f-8d75-0bf330318807",
+      "timestamp": 1771158120.6407518,
+      "timestamp_str": "2026-02-15 20:22:00",
+      "price_at_signal": 70124.1,
+      "direction": "SHORT",
+      "similarity": 0.38579576996117415,
+      "threshold": 0.475,
+      "miss_band": "MARGINAL",
+      "market_regime": "震荡偏空",
+      "bar_idx_at_signal": 508,
+      "fingerprint": "proto_SHORT_2_震荡",
+      "detail": {
+        "votes": 1
+      },
+      "evaluated": true,
+      "price_after_eval": 69669.0,
+      "bars_waited": 30,
+      "price_move_pct": 0.649,
+      "was_profitable": true,
+      "evaluation_time": 1771159921.4510956
+    },
+    {
+      "id": "63fbefe0-cd86-4e7a-afd9-6275e847e9d1",
+      "timestamp": 1771158180.5344098,
+      "timestamp_str": "2026-02-15 20:23:00",
+      "price_at_signal": 70244.4,
+      "direction": "SHORT",
+      "similarity": 0.396957617455458,
+      "threshold": 0.475,
+      "miss_band": "MARGINAL",
+      "market_regime": "震荡偏空",
+      "bar_idx_at_signal": 509,
+      "fingerprint": "proto_SHORT_2_震荡",
+      "detail": {
+        "votes": 1
+      },
+      "evaluated": true,
+      "price_after_eval": 69796.6,
+      "bars_waited": 30,
+      "price_move_pct": 0.6375,
+      "was_profitable": true,
+      "evaluation_time": 1771159980.6780539
+    },
+    {
+      "id": "8a484abc-1d93-41b5-ae5a-361a2ae21e04",
+      "timestamp": 1771204441.425213,
+      "timestamp_str": "2026-02-16 09:14:01",
+      "price_at_signal": 68843.6,
+      "direction": "LONG",
+      "similarity": 0.33572564725548115,
+      "threshold": 0.40725312499999994,
+      "miss_band": "MARGINAL",
+      "market_regime": "强多头",
+      "bar_idx_at_signal": 505,
+      "fingerprint": "proto_LONG_59_强多",
+      "detail": {
+        "votes": 1
+      },
+      "evaluated": true,
+      "price_after_eval": 68251.7,
+      "bars_waited": 30,
+      "price_move_pct": -0.8598,
+      "was_profitable": false,
+      "evaluation_time": 1771210561.038797
+    },
+    {
+      "id": "bd8fb41d-d567-4433-ae60-8b9862e28c99",
+      "timestamp": 1771204499.991231,
+      "timestamp_str": "2026-02-16 09:14:59",
+      "price_at_signal": 68825.6,
+      "direction": "LONG",
+      "similarity": 0.32069554977461223,
+      "threshold": 0.40725312499999994,
+      "miss_band": "MARGINAL",
+      "market_regime": "强多头",
+      "bar_idx_at_signal": 506,
+      "fingerprint": "proto_LONG_59_强多",
+      "detail": {
+        "votes": 1
+      },
+      "evaluated": true,
+      "price_after_eval": 68242.2,
+      "bars_waited": 30,
+      "price_move_pct": -0.8476,
+      "was_profitable": false,
+      "evaluation_time": 1771210619.6854966
+    },
+    {
+      "id": "b160b43b-e4bd-47f2-8695-8223e4fd24e1",
+      "timestamp": 1771214519.8520937,
+      "timestamp_str": "2026-02-16 12:01:59",
+      "price_at_signal": 68415.6,
+      "direction": "SHORT",
+      "similarity": 0.3089328108794962,
+      "threshold": 0.40725312499999994,
+      "miss_band": "MARGINAL",
+      "market_regime": "震荡偏空",
+      "bar_idx_at_signal": 502,
+      "fingerprint": "proto_SHORT_5_震荡",
+      "detail": {
+        "votes": 1
+      },
+      "evaluated": true,
+      "price_after_eval": 68390.4,
+      "bars_waited": 30,
+      "price_move_pct": 0.0368,
+      "was_profitable": false,
+      "evaluation_time": 1771221899.302127
+    },
+    {
+      "id": "80e57df3-954c-4782-9603-002d00317995",
+      "timestamp": 1771175883.4480643,
+      "timestamp_str": "2026-02-16 01:18:03",
+      "price_at_signal": 69005.6,
+      "direction": "SHORT",
+      "similarity": 0.3403538844685916,
+      "threshold": 0.42868749999999994,
+      "miss_band": "MARGINAL",
+      "market_regime": "强空头",
+      "bar_idx_at_signal": 576,
+      "fingerprint": "proto_SHORT_82_强空",
+      "detail": {
+        "votes": 1
+      },
+      "evaluated": true,
+      "price_after_eval": 68562.6,
+      "bars_waited": 30,
+      "price_move_pct": 0.642,
+      "was_profitable": true,
+      "evaluation_time": 1771226339.418411
+    },
+    {
+      "id": "92a9e8b9-e8e0-40cb-9245-59f0fa3582af",
+      "timestamp": 1771175941.0358336,
+      "timestamp_str": "2026-02-16 01:19:01",
+      "price_at_signal": 68917.3,
+      "direction": "SHORT",
+      "similarity": 0.3461167919352969,
+      "threshold": 0.42868749999999994,
+      "miss_band": "MARGINAL",
+      "market_regime": "强空头",
+      "bar_idx_at_signal": 577,
+      "fingerprint": "proto_SHORT_82_强空",
+      "detail": {
+        "votes": 1
+      },
+      "evaluated": true,
+      "price_after_eval": 68569.6,
+      "bars_waited": 30,
+      "price_move_pct": 0.5045,
+      "was_profitable": true,
+      "evaluation_time": 1771226400.8169677
+    }
+  ],
+  "pending_eval": [],
+  "adjustment_history": []
+}

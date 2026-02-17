@@ -1,0 +1,132 @@
+{
+  "created_at": 1771150913.6776943,
+  "last_save_time": 1771275135.6307979,
+  "parameters": {},
+  "parameter_history": [],
+  "stats": {
+    "total_trades": 40,
+    "consecutive_losses": 0,
+    "consecutive_wins": 5,
+    "last_trade_time": "2026-02-17T04:52:15.630762",
+    "per_regime_stats": {}
+  },
+  "feature_db": {
+    "patterns": {},
+    "stats": {}
+  },
+  "regime_adapter": {
+    "regime_accuracy": {
+      "强空头": {
+        "correct": 2,
+        "wrong": 3
+      },
+      "震荡偏空": {
+        "correct": 19,
+        "wrong": 0
+      },
+      "震荡偏多": {
+        "correct": 8,
+        "wrong": 1
+      },
+      "弱空头": {
+        "correct": 0,
+        "wrong": 1
+      },
+      "强多头": {
+        "correct": 0,
+        "wrong": 1
+      }
+    },
+    "misclassification_patterns": [],
+    "adjustment_history": [],
+    "dir_strong_threshold": null,
+    "short_trend_threshold": null,
+    "regime_entry_thresholds": {}
+  },
+  "kelly_adapter": {
+    "kelly_fraction_stats": {
+      "1.0": {
+        "trades": 10,
+        "total_profit": 60.642683828037015,
+        "wins": 6,
+        "losses": 4,
+        "max_drawdown": 13.80451893954538
+      }
+    },
+    "position_distribution": [
+      0.05,
+      0.05,
+      0.05,
+      0.05,
+      0.05,
+      0.05,
+      0.05,
+      0.05,
+      0.20456209731680558,
+      0.20456209731680558
+    ],
+    "kelly_fraction": null,
+    "kelly_max": null,
+    "kelly_min": null,
+    "leverage": 30,
+    "adjustment_history": [
+      {
+        "timestamp": "2026-02-17T00:45:44.862528",
+        "parameter": "LEVERAGE",
+        "old_value": 20.0,
+        "new_value": 22.0,
+        "delta": 2.0,
+        "reason": "每笔调整: 本笔盈亏+6.60% → 放大"
+      },
+      {
+        "timestamp": "2026-02-17T01:16:44.490647",
+        "parameter": "LEVERAGE",
+        "old_value": 22.0,
+        "new_value": 24.0,
+        "delta": 2.0,
+        "reason": "每笔调整: 本笔盈亏+14.95% → 放大"
+      },
+      {
+        "timestamp": "2026-02-17T03:54:03.891614",
+        "parameter": "LEVERAGE",
+        "old_value": 24.0,
+        "new_value": 26.0,
+        "delta": 2.0,
+        "reason": "每笔调整: 本笔盈亏+23.53% → 放大"
+      },
+      {
+        "timestamp": "2026-02-17T04:28:28.597653",
+        "parameter": "LEVERAGE",
+        "old_value": 26.0,
+        "new_value": 28.0,
+        "delta": 2.0,
+        "reason": "每笔调整: 本笔盈亏+6.48% → 放大"
+      },
+      {
+        "timestamp": "2026-02-17T04:52:15.630773",
+        "parameter": "LEVERAGE",
+        "old_value": 28.0,
+        "new_value": 30.0,
+        "delta": 2.0,
+        "reason": "每笔调整: 本笔盈亏+14.51% → 放大"
+      }
+    ],
+    "recent_performance": [
+      0.4669803198926016,
+      -0.9117386853380707,
+      -1.4010779992544349,
+      -0.7447747785542824,
+      -2.8380365678933375,
+      6.598558795652341,
+      14.954644095046504,
+      23.52998370164444,
+      6.477263705533633,
+      14.510881241307622
+    ],
+    "drawdown_tracker": 7.301144378129447,
+    "peak_capital": 6176.4991850822225
+  },
+  "diagnosis_history": [],
+  "current_learning_rate": 0.05,
+  "exploration_counter": 0
+}

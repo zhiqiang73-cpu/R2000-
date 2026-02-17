@@ -204,7 +204,7 @@ class SignalMarker(pg.ScatterPlotItem):
         """清空所有信号"""
         self.historical_data = []
         self.live_data = []
-        self.setData([])
+        self.setData(spots=[])
 
     def add_signal(self, x, y, signal_type):
         """
@@ -214,8 +214,9 @@ class SignalMarker(pg.ScatterPlotItem):
         self._refresh()
 
     def _refresh(self):
-        """合并显示所有数据"""
-        self.setData(self.historical_data + self.live_data)
+        """合并显示所有数据（显式传 spots 确保 pyqtgraph 正确渲染）"""
+        spots = self.historical_data + self.live_data
+        self.setData(spots=spots if spots else [])
 
     def _build_items(self, points, signal_type):
         return [self._build_item(x, y, signal_type) for x, y in points]
@@ -836,6 +837,18 @@ class ChartWidget(QtWidgets.QWidget):
     def set_render_stride(self, speed: int):
         """根据速度降低渲染频率以减少卡顿"""
         self._render_stride = 1
+
+    def get_rightmost_signal_index(self) -> int:
+        """返回当前信号标记中最大的 K 线索引，便于视图范围包含最近一笔交易"""
+        if not hasattr(self, "signal_marker"):
+            return -1
+        all_data = getattr(self.signal_marker, "historical_data", []) + getattr(
+            self.signal_marker, "live_data", []
+        )
+        if not all_data:
+            return -1
+        xs = [item["pos"][0] for item in all_data if isinstance(item.get("pos"), (tuple, list)) and len(item["pos"]) >= 2]
+        return max(xs, default=-1)
     
     def add_signal_at(self, idx: int, label_type: int, df: pd.DataFrame = None):
         """

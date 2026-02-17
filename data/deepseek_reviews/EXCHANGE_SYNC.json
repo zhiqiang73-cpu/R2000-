@@ -1,0 +1,6 @@
+{
+  "analysis": "",
+  "timestamp": "2026-02-17T05:58:57.632183",
+  "model": "deepseek-chat",
+  "error": "HTTPSConnectionPool(host='api.deepseek.com', port=443): Read timed out."
+}

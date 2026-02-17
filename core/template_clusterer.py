@@ -278,9 +278,15 @@ class MultiSimilarityCalculator:
         # 计算欧氏距离
         euclidean_dist = np.linalg.norm(v1_weighted - v2_weighted)
         
-        # 归一化到 [0, 1]：使用 sqrt(D) * max_feature_range 作为归一化因子
-        # 这里使用配置的最大距离
-        normalized_dist = min(1.0, euclidean_dist / self.euclidean_max_dist)
+        # 归一化：使用有效上界，避免因配置过小导致相似度恒为 0
+        # 32 维特征含 RSI/KDJ(0~100)、MACD、比率等，加权后距离常为 50~200+
+        # 有效上界 = max(配置值, sqrt(维度)*20)，保证有区分度
+        D = float(min_len)
+        effective_max = max(
+            float(self.euclidean_max_dist),
+            max(1.0, np.sqrt(D) * 20.0),
+        )
+        normalized_dist = min(1.0, euclidean_dist / effective_max)
         
         # 转换为相似度：距离越小，相似度越高
         return 1.0 - normalized_dist
@@ -3287,7 +3293,8 @@ class PrototypeMatcher:
         w_cos = SIMILARITY_CONFIG.get("COSINE_WEIGHT", 0.30)
         w_euc = SIMILARITY_CONFIG.get("EUCLIDEAN_WEIGHT", 0.40)
         w_dtw = SIMILARITY_CONFIG.get("DTW_WEIGHT", 0.30)
-        max_euc_dist = SIMILARITY_CONFIG.get("EUCLIDEAN_MAX_DIST", 10.0)
+        max_euc_dist = SIMILARITY_CONFIG.get("EUCLIDEAN_MAX_DISTANCE",
+                       SIMILARITY_CONFIG.get("EUCLIDEAN_MAX_DIST", 200.0))
         
         # 获取加权均值
         cur_mean = current_features.get('weighted_mean', np.zeros(32))
@@ -3296,10 +3303,12 @@ class PrototypeMatcher:
         # 1. 余弦相似度（方向）
         cosine_sim = self._cosine_similarity(cur_mean, proto_mean)
         
-        # 2. 欧氏距离相似度（归一化）
+        # 2. 欧氏距离相似度（归一化）：有效上界避免“距离”恒为 0
         if cur_mean.size > 0 and proto_mean.size > 0:
             euc_dist = np.linalg.norm(cur_mean - proto_mean)
-            euclidean_sim = max(0.0, 1.0 - euc_dist / max_euc_dist)
+            D = float(min(cur_mean.size, proto_mean.size))
+            effective_max = max(max_euc_dist, np.sqrt(D) * 20.0)
+            euclidean_sim = max(0.0, 1.0 - euc_dist / effective_max)
         else:
             euclidean_sim = 0.0
         

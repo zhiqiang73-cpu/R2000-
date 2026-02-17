@@ -1,0 +1,249 @@
+{
+  "config": {
+    "decay_enabled": true,
+    "decay_interval_hours": 48.0,
+    "decay_factor": 0.95
+  },
+  "state": {
+    "last_decay_time": 1771167638.3467286
+  },
+  "prototypes": {
+    "proto_SHORT_0_震荡": {
+      "prototype_fingerprint": "proto_SHORT_0_震荡",
+      "peak_profit_history": [
+        0.5292321568301687,
+        1.4783079254917886,
+        0.0,
+        0.4739385171153858,
+        0.3166685112308533,
+        0.008921528249585324
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 6,
+      "last_update_time": 1771025343.8713024
+    },
+    "FLIP_FALLBACK_LONG": {
+      "prototype_fingerprint": "FLIP_FALLBACK_LONG",
+      "peak_profit_history": [
+        1.1465500610745316,
+        0.00033233321804029977,
+        0.8506492562271888,
+        0.3753043893157955,
+        1.043296492342804,
+        0.7869384448148229,
+        0.49451250638067984
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 7,
+      "last_update_time": 1771169285.311321
+    },
+    "FLIP_FALLBACK_SHORT": {
+      "prototype_fingerprint": "FLIP_FALLBACK_SHORT",
+      "peak_profit_history": [
+        1.2718938135651665,
+        1.433576184334325,
+        0.03636011433967164,
+        0.39879672572795943,
+        0.37183859627959515,
+        0.5034278344682793,
+        2.0651504742482554,
+        1.0529486908385801,
+        2.729830492534532,
+        2.729830492534532
+      ],
+      "optimal_tp_pct": 1.907256901769773,
+      "optimal_tp_atr_multiplier": 3.085846520116878,
+      "signal_performances": {},
+      "total_trades": 10,
+      "last_update_time": 1771279073.5615578
+    },
+    "proto_LONG_12_震荡": {
+      "prototype_fingerprint": "proto_LONG_12_震荡",
+      "peak_profit_history": [
+        0.4677060453159214
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 1,
+      "last_update_time": 1771115069.7318628
+    },
+    "proto_SHORT_1_震荡": {
+      "prototype_fingerprint": "proto_SHORT_1_震荡",
+      "peak_profit_history": [
+        0.26797304998555643
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 1,
+      "last_update_time": 1771115469.622847
+    },
+    "proto_LONG_29_震荡": {
+      "prototype_fingerprint": "proto_LONG_29_震荡",
+      "peak_profit_history": [
+        0.2084635948494521,
+        0.6928518179179318,
+        0.29842007883974275,
+        2.064246286917513,
+        1.0116221061384691,
+        0.40345780385407587,
+        0.7949148203975168,
+        0.0,
+        0.6526654923130946,
+        0.027461171348953137,
+        0.0,
+        0.5569921220860439,
+        0.0,
+        0.0,
+        0.6309120493930773,
+        9.98954843872534,
+        21.412012706497705,
+        23.31237980684015,
+        9.32816693276705,
+        18.925259558011124,
+        25.797601271472757
+      ],
+      "optimal_tp_pct": 9.32816693276705,
+      "optimal_tp_atr_multiplier": 34.81248293865634,
+      "signal_performances": {},
+      "total_trades": 21,
+      "last_update_time": 1771275671.743311
+    },
+    "proto_LONG_152_弱多": {
+      "prototype_fingerprint": "proto_LONG_152_弱多",
+      "peak_profit_history": [
+        0.0
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 1,
+      "last_update_time": 1771140256.5086796
+    },
+    "proto_LONG_61_强多": {
+      "prototype_fingerprint": "proto_LONG_61_强多",
+      "peak_profit_history": [
+        0.7520040483826553,
+        1.405416857939899
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 2,
+      "last_update_time": 1771141510.9400954
+    },
+    "proto_SHORT_2_震荡": {
+      "prototype_fingerprint": "proto_SHORT_2_震荡",
+      "peak_profit_history": [
+        3.9663960860716316,
+        3.738971833572688,
+        0.432243408299656,
+        3.541033532852153,
+        1.0112910574012444,
+        0.81248120902342,
+        0.0,
+        1.6822968263074964,
+        2.2777688311273794,
+        0.440346186985361,
+        0.0,
+        2.0905568556121628,
+        0.0,
+        0.021761175451653195,
+        1.1041493992383558,
+        2.096217392375268
+      ],
+      "optimal_tp_pct": 2.1416052520632958,
+      "optimal_tp_atr_multiplier": 6.437521503804986,
+      "signal_performances": {},
+      "total_trades": 16,
+      "last_update_time": 1771175567.7114465
+    },
+    "proto_SHORT_82_强空": {
+      "prototype_fingerprint": "proto_SHORT_82_强空",
+      "peak_profit_history": [
+        0.7386056429617548,
+        0.8012431646823782,
+        4.602476163719907,
+        1.2461740233364242
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 4,
+      "last_update_time": 1771150913.6802838
+    },
+    "proto_SHORT_124_弱空": {
+      "prototype_fingerprint": "proto_SHORT_124_弱空",
+      "peak_profit_history": [
+        5.590320478647962,
+        0.6055189137744386
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 2,
+      "last_update_time": 1771170305.4735348
+    },
+    "proto_LONG_59_强多": {
+      "prototype_fingerprint": "proto_LONG_59_强多",
+      "peak_profit_history": [
+        1.25083074315594
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 1,
+      "last_update_time": 1771204263.696449
+    },
+    "proto_SHORT_80_强空": {
+      "prototype_fingerprint": "proto_SHORT_80_强空",
+      "peak_profit_history": [
+        2.3338426057708084,
+        0.9387513737920947,
+        0.0
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 3,
+      "last_update_time": 1771207626.5255203
+    },
+    "proto_SHORT_5_震荡": {
+      "prototype_fingerprint": "proto_SHORT_5_震荡",
+      "peak_profit_history": [
+        1.6675709493349682,
+        0.23202871902627,
+        1.5890284548072866,
+        1.7083674933761548,
+        0.6071689831748354,
+        0.0,
+        0.2677185091030188,
+        1.4851050499417227,
+        0.0008374794216896137,
+        0.715144388968477
+      ],
+      "optimal_tp_pct": 1.5630476035908956,
+      "optimal_tp_atr_multiplier": 4.114073659619733,
+      "signal_performances": {},
+      "total_trades": 10,
+      "last_update_time": 1771211944.130302
+    },
+    "proto_SHORT_100_强空": {
+      "prototype_fingerprint": "proto_SHORT_100_强空",
+      "peak_profit_history": [
+        0.16195040815888384,
+        0.0
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 2,
+      "last_update_time": 1771206664.9347854
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "fusion_threshold": 0.1389873690479259,
+  "cosine_threshold": 0.3,
+  "euclidean_threshold": 0.11582280753993823,
+  "dtw_threshold": 0.1,
+  "auto_relax_count": 15,
+  "last_trade_time": 1771286280.8329513,
+  "trades_today": 8,
+  "trades_today_date": "2026-02-17",
+  "graduated": false,
+  "graduation_time": null,
+  "trade_results": [],
+  "created_at": 1771146300.2566235,
+  "last_save_time": 1771286280.8342104,
+  "saved_at": "2026-02-17T07:58:00.834223"
+}

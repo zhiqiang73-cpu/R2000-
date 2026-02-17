@@ -630,6 +630,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # ============ Tab 2: 模拟交易 ============
         self.paper_trading_tab = PaperTradingTab()
         self.main_tabs.addTab(self.paper_trading_tab, "💹 模拟交易")
+        # 启动时加载历史交易记录（UI 端永久记忆）
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            history_file = os.path.join(project_root, "data", "live_trade_history.json")
+            history = load_trade_history_from_file(history_file)
+            if history:
+                self.paper_trading_tab.load_historical_trades(history)
+        except Exception as e:
+            print(f"[MainWindow] 启动时加载交易记录失败: {e}")
 
         # ============ Tab 3: 自适应学习 ============
         self.adaptive_learning_tab = AdaptiveLearningTab()
@@ -3352,6 +3361,17 @@ class MainWindow(QtWidgets.QMainWindow):
             # 获取代理设置
             http_proxy, socks_proxy = self._get_proxy_settings()
             
+            # 【自适应杠杆恢复】优先使用自适应控制器保存的杠杆值
+            effective_leverage = config["leverage"]
+            if self._adaptive_controller and hasattr(self._adaptive_controller, 'kelly_adapter'):
+                saved_leverage = getattr(self._adaptive_controller.kelly_adapter, 'leverage', None)
+                if saved_leverage and saved_leverage > 0:
+                    effective_leverage = int(saved_leverage)
+                    print(f"[MainWindow] 从自适应控制器恢复杠杆: {effective_leverage}x (UI默认={config['leverage']}x)")
+                    self.adaptive_learning_tab.append_adaptive_journal(
+                        f"从学习记忆恢复杠杆: {effective_leverage}x"
+                    )
+            
             self._live_engine = LiveTradingEngine(
                 trajectory_memory=self.trajectory_memory,
                 prototype_library=self._prototype_library if has_prototypes else None,
@@ -3359,7 +3379,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 interval=config["interval"],
                 initial_balance=config["initial_balance"],
                 adaptive_controller=self._adaptive_controller,  # NEW: 传入自适应控制器
-                leverage=config["leverage"],
+                leverage=effective_leverage,
                 use_qualified_only=(config.get("use_qualified_only", True) and (not has_prototypes)),
                 qualified_fingerprints=qualified_fingerprints,
                 qualified_prototype_fingerprints=(verified_proto_fps if use_verified_protos else set()),
@@ -3407,12 +3427,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.paper_trading_tab.control_panel.set_running(True)
                 using_evolved = getattr(self._live_engine, "_using_evolved_weights", False)
                 self.paper_trading_tab.control_panel.update_weight_mode(using_evolved)
-                # 先获取历史记录（避免 reset 清空后无数据恢复）
-                history = self._live_engine.paper_trader.order_history
+                # 优先从文件恢复历史记录（避免 trader._load_history 异常或路径问题导致丢失）
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                history_file = os.path.join(project_root, "data", "live_trade_history.json")
+                history = load_trade_history_from_file(history_file)
                 if not history:
-                    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                    history_file = os.path.join(project_root, "data", "live_trade_history.json")
-                    history = load_trade_history_from_file(history_file)
+                    history = getattr(self._live_engine.paper_trader, "order_history", None) or []
+                if history:
+                    self._live_engine.paper_trader.order_history = list(history)
                 self.paper_trading_tab.reset()
                 if history:
                     self.paper_trading_tab.load_historical_trades(history)
@@ -3442,6 +3464,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_paper_trading_stop(self):
         """停止模拟交易"""
         if self._live_engine:
+            # 停止前保存当前交易记录到文件，避免重启后丢失
+            trader = getattr(self._live_engine, "paper_trader", None)
+            if trader is not None and getattr(trader, "order_history", None) and getattr(trader, "save_history", None):
+                path = getattr(trader, "history_file", None)
+                if path:
+                    try:
+                        trader.save_history(path)
+                    except Exception as e:
+                        print(f"[MainWindow] 停止时保存交易记录失败: {e}")
             self._live_engine.stop()
             # 检查会话结束报告中的调整建议
             self._show_session_end_suggestions()
@@ -3471,6 +3502,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.paper_trading_tab.control_panel.set_running(False)
         self.paper_trading_tab.control_panel.update_weight_mode(None)
         self.statusBar().showMessage("模拟交易已停止")
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        """窗口关闭时兜底保存交易记录，避免重启丢失"""
+        try:
+            if self._live_engine:
+                trader = getattr(self._live_engine, "paper_trader", None)
+                if trader is not None and getattr(trader, "save_history", None):
+                    path = getattr(trader, "history_file", None)
+                    if path:
+                        trader.save_history(path)
+                # 关闭前停止引擎，避免后台线程残留
+                if getattr(self, "_live_running", False):
+                    try:
+                        self._live_engine.stop()
+                    except Exception as e:
+                        print(f"[MainWindow] 关闭时停止引擎失败: {e}")
+        except Exception as e:
+            print(f"[MainWindow] 关闭时保存交易记录失败: {e}")
+        super().closeEvent(event)
     
     def _show_session_end_suggestions(self):
         """
@@ -3627,7 +3677,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 last_id = getattr(self, "_last_adaptive_position_id", None)
                 if order.order_id != last_id:
                     self._last_adaptive_position_id = order.order_id
-                    lev = getattr(order, "leverage", None) or (self._live_engine.paper_trader.leverage if self._live_engine.paper_trader else 10)
+                    lev = getattr(order, "leverage", None) or (self._live_engine.paper_trader.leverage if self._live_engine.paper_trader else 20)
                     kp = getattr(order, "kelly_position_pct", None)
                     kp_str = f" 凯利{kp:.1%}" if kp and kp > 0 else ""
                     self.adaptive_learning_tab.append_adaptive_journal(
@@ -3750,6 +3800,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 prototype_confidence=getattr(state, "prototype_confidence", 0.0),
             )
             
+            # ── 更新开仓条件自适应列表（融合/余弦/欧氏/DTW）──
+            cos_sim = getattr(state, "cosine_similarity", 0.0)
+            euc_sim = getattr(state, "euclidean_similarity", 0.0)
+            dtw_sim = getattr(state, "dtw_similarity", 0.0)
+            fus_sim = getattr(state, "final_match_score", 0.0)  # 融合评分（含置信度）
+            cold_on = getattr(state, "cold_start_enabled", False)
+            if cold_on and self._live_engine:
+                try:
+                    cs = self._live_engine.get_cold_start_state()
+                    th = cs.get("thresholds", {})
+                    th_n = cs.get("normal_thresholds", {})
+                    fus_th = th.get("fusion", th_n.get("fusion", 0.40))
+                    cos_th = th.get("cosine", th_n.get("cosine", 0.70))
+                    euc_th = th.get("euclidean", th_n.get("euclidean", 0.35))
+                    dtw_th = th.get("dtw", th_n.get("dtw", 0.30))
+                except Exception:
+                    from config import SIMILARITY_CONFIG, COLD_START_CONFIG
+                    th_c = COLD_START_CONFIG.get("THRESHOLDS", {})
+                    fus_th = th_c.get("fusion", 0.30)
+                    cos_th = th_c.get("cosine", 0.50)
+                    euc_th = th_c.get("euclidean", 0.25)
+                    dtw_th = th_c.get("dtw", 0.10)
+            else:
+                from config import SIMILARITY_CONFIG, COLD_START_CONFIG
+                fus_th = SIMILARITY_CONFIG.get("FUSION_THRESHOLD", 0.40)
+                cos_th = SIMILARITY_CONFIG.get("COSINE_MIN_THRESHOLD", 0.70)
+                euc_th = 0.35
+                dtw_th = 0.30
+            self.adaptive_learning_tab.update_entry_conditions_adaptive(
+                fusion=fus_sim, cosine=cos_sim, euclidean=euc_sim, dtw=dtw_sim,
+                fusion_th=fus_th, cos_th=cos_th, euc_th=euc_th, dtw_th=dtw_th,
+            )
             # ── 更新自适应学习面板 ──
             rejection_history = getattr(state, "rejection_history", [])
             gate_scores = getattr(state, "gate_scores", {})
@@ -3791,8 +3873,12 @@ class MainWindow(QtWidgets.QMainWindow):
             nm_suggestions = []
             tracker = getattr(self._live_engine, "_near_miss_tracker", None)
             if tracker:
-                from config import PAPER_TRADING_CONFIG as _ptc_nm
-                nm_suggestions = tracker.get_suggestions(_ptc_nm)
+                from config import PAPER_TRADING_CONFIG as _ptc_nm, SIMILARITY_CONFIG
+                fusion_th = None
+                pm = getattr(self._live_engine, "_proto_matcher", None)
+                if pm:
+                    fusion_th = getattr(pm, "fusion_threshold", SIMILARITY_CONFIG.get("FUSION_THRESHOLD", 0.40))
+                nm_suggestions = tracker.get_suggestions(_ptc_nm, fusion_threshold=fusion_th)
             self.adaptive_learning_tab.update_near_miss(nm_records, nm_scores, nm_suggestions)
 
             # 市场状态拦截（来自 RejectionTracker 的 fail_code 过滤）
@@ -3919,6 +4005,21 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # 更新UI
             self.adaptive_learning_tab.update_adaptive_dashboard(dashboard_data)
+            
+            # 【实时更新】Kelly 和杠杆仪表盘
+            if hasattr(self._adaptive_controller, 'kelly_adapter'):
+                kelly_params = self._adaptive_controller.kelly_adapter.get_current_parameters()
+                kelly_fraction = kelly_params.get("KELLY_FRACTION", 0.25)
+                leverage = kelly_params.get("LEVERAGE", 20)
+                recent_perf = list(self._adaptive_controller.kelly_adapter.recent_performance) if hasattr(self._adaptive_controller.kelly_adapter, 'recent_performance') else []
+                
+                # 调用实时更新方法
+                if hasattr(self.adaptive_learning_tab, 'update_kelly_leverage_realtime'):
+                    self.adaptive_learning_tab.update_kelly_leverage_realtime(
+                        kelly_fraction=kelly_fraction,
+                        leverage=leverage,
+                        recent_performance=recent_perf
+                    )
         except Exception as e:
             print(f"[MainWindow] 刷新自适应仪表板失败: {e}")
     
@@ -4071,7 +4172,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # 更新模拟交易Tab的图表 (使用增量更新，避免重置信号标记)
             self.paper_trading_tab.chart_widget.update_kline(df)
             
-            # 视图随K线滚动更新（仅在 K 线增加时滚动，避免每秒抖动）
+            # 视图随K线滚动更新（仅在 K 线增加时滚动，避免交易标记被挤出视野）
             n = len(df)
             if not hasattr(self, "_last_live_n") or n > self._last_live_n:
                 self._last_live_n = n
@@ -4079,15 +4180,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 future_pad = 0
                 if hasattr(self.paper_trading_tab.chart_widget, "get_overlay_padding"):
                     future_pad = self.paper_trading_tab.chart_widget.get_overlay_padding()
+                x_left = n - visible
+                if hasattr(self.paper_trading_tab.chart_widget, "get_rightmost_signal_index"):
+                    rightmost = self.paper_trading_tab.chart_widget.get_rightmost_signal_index()
+                    if rightmost >= 0 and rightmost < x_left:
+                        x_left = max(0, rightmost - 10)
                 self.paper_trading_tab.chart_widget.candle_plot.setXRange(
-                    n - visible, n + max(5, max(0, future_pad)), padding=0
+                    x_left, n + max(5, max(0, future_pad)), padding=0
                 )
             
-            # 【关键】实时更新 TP/SL 虚线位置（追踪止损更新后自动跟随）
+            # 【关键】实时更新 TP/SL 虚线位置；有分段挂单时用委托单第一档价格，与「委托单」一致
             order = self._live_engine._paper_trader.current_position
             if order is not None:
                 tp = getattr(order, "take_profit", None)
                 sl = getattr(order, "stop_loss", None)
+                pending = getattr(self._live_engine._paper_trader, "get_pending_entry_orders_snapshot", lambda **kw: [])(current_bar_idx=len(df) - 1)
+                for o in pending:
+                    if o.get("order_type") == "tp" and "第1档" in str(o.get("template_fingerprint", "")):
+                        tp = o.get("trigger_price") or tp
+                        break
+                for o in pending:
+                    if o.get("order_type") == "sl" and "第1档" in str(o.get("template_fingerprint", "")):
+                        sl = o.get("trigger_price") or sl
+                        break
                 self.paper_trading_tab.chart_widget.set_tp_sl_lines(tp, sl)
                 
                 # 【实时偏离检测】持仓中检查价格是否偏离概率扇形置信带
@@ -4329,7 +4444,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 label = f"{direction} {regime_short}_{proto.prototype_id}"
                 label = self._append_kdj_macd_prediction_suffix(label, df)
                 current_price = float(df["close"].iloc[-1])
-                leverage = getattr(self._live_engine, "fixed_leverage", 10.0)
+                leverage = getattr(self._live_engine, "fixed_leverage", 20.0)
                 start_idx = len(df) - 1
                 chart.set_probability_fan(
                     entry_price=current_price,
@@ -4453,10 +4568,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _handle_live_trade_opened(self, order):
         """处理实时交易开仓（主线程）"""
         try:
-            # 添加图表标记
+            # 添加图表标记（缺省时用当前 K 线索引，避免标记不显示）
             side = order.side.value
+            bar_idx = getattr(order, "entry_bar_idx", None)
+            if bar_idx is None and self._live_engine:
+                df = getattr(self._live_engine, "get_history_df", lambda: None)()
+                if df is not None and not df.empty:
+                    bar_idx = len(df) - 1
+            if bar_idx is None:
+                bar_idx = getattr(self._live_engine, "_current_bar_idx", 0)
             self.paper_trading_tab.add_trade_marker(
-                bar_idx=getattr(order, "entry_bar_idx", None),
+                bar_idx=bar_idx,
                 price=order.entry_price,
                 side=side,
                 is_entry=True
@@ -4510,7 +4632,14 @@ class MainWindow(QtWidgets.QMainWindow):
             side = order.side.value
             exit_bar = getattr(order, "exit_bar_idx", None)
             exit_px = getattr(order, "exit_price", None)
-            
+            if (exit_bar is None or exit_px is None) and self._live_engine:
+                df = getattr(self._live_engine, "get_history_df", lambda: None)()
+                if df is not None and not df.empty:
+                    if exit_bar is None:
+                        exit_bar = len(df) - 1
+                    if exit_px is None:
+                        exit_px = float(df["close"].iloc[-1])
+
             # 根据真实平仓原因 + 追踪阶段 确定标记类型
             close_reason_str = None
             if order.close_reason:
@@ -4740,14 +4869,6 @@ class MainWindow(QtWidgets.QMainWindow):
             traceback.print_exc()
             return None
     
-    def _refresh_adaptive_dashboard(self):
-        """刷新自适应控制器仪表板"""
-        try:
-            if self._adaptive_controller:
-                dashboard_data = self._adaptive_controller.get_dashboard_data()
-                self.adaptive_learning_tab.update_adaptive_dashboard(dashboard_data)
-        except Exception as e:
-            print(f"[MainWindow] 刷新自适应仪表板失败: {e}")
     
     def _expand_adjustment_suggestions(self, raw_suggestions: list) -> list:
         """
