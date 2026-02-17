@@ -591,23 +591,30 @@ PAPER_TRADING_CONFIG = {
     # ── 弱化·震荡：先保本收紧（有浮盈才把止损挪到入场价，触发=保本出场）──
     "REGIME_WEAKEN_MIN_PROFIT_PCT": 0.2,   # 至少浮盈 0.2% 才收紧到 entry，否则不收紧
 
-    # ── 分段止盈 / 分段止损（三档阶梯式委托单）──
-    # 以下 % 均为「收益率%」（杠杆后），挂单价格按 价格变动% = 收益率% / 杠杆 换算（如 20x 下 5% 收益 ≈ 0.25% 价格）
-    # 止盈 7/14/21 = 止损 5/10/15 × 1.4，盈亏比 1.4:1
-    "STAGED_TP_1_PCT": 7.0,          # 分段止盈第1档：收益率 7%（= SL1 5%×1.4）
-    "STAGED_TP_2_PCT": 14.0,         # 分段止盈第2档：收益率 14%（= SL2 10%×1.4）
-    "STAGED_TP_3_PCT": 21.0,         # 分段止盈第3档（硬止盈）：收益率 21%（= SL3 15%×1.4）
-    "STAGED_TP_RATIO_1": 0.30,        # 第1档减仓比例（总仓位的30%）
-    "STAGED_TP_RATIO_2": 0.30,        # 第2档减仓比例（剩余仓位的30% = 总仓位21%）
-    "STAGED_TP_RATIO_3": 1.00,        # 第3档全平剩余仓位
-    "STAGED_SL_1_PCT": 5.0,           # 分段止损第1档：亏损收益率 5% 减仓30%
-    "STAGED_SL_2_PCT": 10.0,          # 分段止损第2档：亏损收益率 10%
-    "STAGED_SL_3_PCT": 15.0,          # 分段止损第3档（硬止损）：亏损收益率 15% 全平
-    "STAGED_SL_RATIO_1": 0.30,        # 第1档减仓比例
-    "STAGED_SL_RATIO_2": 0.30,        # 第2档减仓比例
-    "STAGED_SL_RATIO_3": 1.00,        # 第3档全平剩余仓位
+    # ── 阶梯基准止盈止损系统（三档止盈 + 动态止损）──
+    # 【核心理念】止盈分三档锁定利润，止损不分档（全平剩余），每档止损跟随止盈成交价动态上移
+    # 【阶梯基准】TP1基于入场价，TP2基于TP1成交价，TP3基于TP2成交价；SL始终基于当前阶梯基准
+    # 【仓位分配】TP1平50% → TP2平剩余50%(=25%) → TP3全平(=25%)；SL始终全平剩余
+    #
+    # 以下 % 均为「收益率%」（杠杆后），挂单价格按 价格变动% = 收益率% / 杠杆 换算
+    "STAGED_TP_PCT": 7.0,             # 每档止盈收益率 +7%（阶梯累计约 +21%）
+    "STAGED_SL_PCT": 5.0,             # 止损收益率 -5%（基于当前阶梯基准，全平剩余）
+    "STAGED_TP_RATIO_1": 0.50,        # 第1档减仓比例（50%）
+    "STAGED_TP_RATIO_2": 0.50,        # 第2档减仓比例（剩余的50% = 总仓位25%）
+    "STAGED_TP_RATIO_3": 1.00,        # 第3档全平剩余仓位（25%）
     "LIMIT_PRICE_BAND_PCT": 5.0,      # Binance 限价单价格带（相对 mark 偏离上限 %），超出则用 STOP_MARKET
-    "STAGED_ORDERS_SEQUENTIAL": True,  # 逐档挂单：第1档触发后再挂第2档，第2档触发再挂第3档；若已越过第2档则直接挂第3档
+    "STAGED_ORDERS_SEQUENTIAL": True,  # 阶梯基准模式必须为 True（逐档挂单）
+    
+    # 兼容旧配置（已废弃，保留以防其他模块引用）
+    "STAGED_TP_1_PCT": 7.0,           # [废弃] 使用 STAGED_TP_PCT
+    "STAGED_TP_2_PCT": 14.0,          # [废弃] TP2 = TP1成交价 + 7%
+    "STAGED_TP_3_PCT": 21.0,          # [废弃] TP3 = TP2成交价 + 7%
+    "STAGED_SL_1_PCT": 5.0,           # [废弃] 使用 STAGED_SL_PCT
+    "STAGED_SL_2_PCT": 5.0,           # [废弃] SL2 = TP1成交价 - 5%
+    "STAGED_SL_3_PCT": 5.0,           # [废弃] SL3 = TP2成交价 - 5%
+    "STAGED_SL_RATIO_1": 1.00,        # [废弃] 止损始终全平
+    "STAGED_SL_RATIO_2": 1.00,        # [废弃] 止损始终全平
+    "STAGED_SL_RATIO_3": 1.00,        # [废弃] 止损始终全平
 
     # ── 价格动量衰减离场（新增）──
     # 当价格接近峰值但动能衰减时主动离场
@@ -698,18 +705,18 @@ PAPER_TRADING_CONFIG = {
     # ── 凯利公式动态仓位管理 ──
     "KELLY_ENABLED": True,                 # 是否启用凯利公式动态仓位
     "KELLY_FRACTION": 1.0,                 # 凯利分数（1.0=完整凯利，直接使用公式计算值）
-    "KELLY_MAX_POSITION": 0.8,             # 凯利仓位上限（80% 本金）
+    "KELLY_MAX_POSITION": 0.3,             # 凯利仓位上限（30% 本金）
     "KELLY_MIN_POSITION": 0.05,            # 凯利仓位下限（5% 本金，样本不足/期望为负时保守试探学习）
     "KELLY_MIN_SAMPLES": 5,                # 凯利计算最少样本数（少于此值用最小仓位）
     
     # ── 凯利参数自适应学习 ──
     "KELLY_ADAPTATION_ENABLED": True,      # 是否启用凯利参数自适应学习
     "KELLY_FRACTION_RANGE": (0.8, 1.0),    # KELLY_FRACTION 自适应调整范围（保持接近完整凯利）
-    "KELLY_MAX_RANGE": (0.5, 0.9),         # KELLY_MAX 自适应调整范围
-    "KELLY_MIN_RANGE": (0.03, 0.10),       # KELLY_MIN 自适应调整范围（下限3%~10%）
+    "KELLY_MAX_RANGE": (0.15, 0.30),       # KELLY_MAX 自适应调整范围
+    "KELLY_MIN_RANGE": (0.05, 0.10),       # KELLY_MIN 自适应调整范围（下限5%~10%）
     
     # ── 杠杆自适应配置 ──
-    "LEVERAGE_ADAPTIVE": True,             # 是否启用杠杆自适应调整（每笔开平仓都调整）
+    "LEVERAGE_ADAPTIVE": False,            # 是否启用杠杆自适应调整（固定杠杆）
     "LEVERAGE_DEFAULT": 20,                # 默认杠杆倍数（程序启动与自适应基线）
     "LEVERAGE_MIN": 5,                     # 最小杠杆倍数
     "LEVERAGE_MAX": 100,                   # 最大杠杆倍数

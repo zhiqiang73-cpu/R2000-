@@ -100,6 +100,7 @@ class BinanceTestnetTrader:
         # ═══════════════════════════════════════════════════════════════
         self._staged_orders: List[Dict[str, Any]] = []     # 当前挂出的分段委托单
         self._staged_config: Optional[Dict[str, Any]] = None  # 逐档模式下预计算的全部档位配置
+        self._stage3_close_recorded: bool = False  # 标记第3档是否已按分段记账
         # 每个元素包含: {
         #   "order_id": int,          # 交易所订单ID
         #   "type": str,              # "TP" 或 "SL"
@@ -438,15 +439,11 @@ class BinanceTestnetTrader:
                 set_detail("挂单触发(止盈)")
                 return CloseReason.TAKE_PROFIT
 
-        # 检查是否触及止损（区分追踪止损和真正止损）
+        # 检查是否触及止损（追踪止损已关闭，统一视为止损）
         if order.stop_loss is not None:
             sl = order.stop_loss
-            is_profit_sl = (
-                (order.side == OrderSide.LONG and sl >= order.entry_price) or
-                (order.side == OrderSide.SHORT and sl <= order.entry_price)
-            )
-            sl_reason = CloseReason.TRAILING_STOP if is_profit_sl else CloseReason.STOP_LOSS
-            detail_sl = "追踪止损" if is_profit_sl else "挂单触发(止损)"
+            sl_reason = CloseReason.STOP_LOSS
+            detail_sl = "挂单触发(止损)"
 
             if abs(exit_price - sl) / sl < tolerance_tight:
                 set_detail(detail_sl)
@@ -466,13 +463,9 @@ class BinanceTestnetTrader:
                 return CloseReason.TAKE_PROFIT
         if order.stop_loss is not None:
             sl = order.stop_loss
-            is_profit_sl = (
-                (order.side == OrderSide.LONG and sl >= order.entry_price) or
-                (order.side == OrderSide.SHORT and sl <= order.entry_price)
-            )
-            sl_reason = CloseReason.TRAILING_STOP if is_profit_sl else CloseReason.STOP_LOSS
+            sl_reason = CloseReason.STOP_LOSS
             if abs(exit_price - sl) / sl < tolerance_loose:
-                set_detail("追踪止损" if is_profit_sl else f"挂单触发(止损,按价格推断; 出场{exit_price:.2f} vs SL{sl:.2f})")
+                set_detail(f"挂单触发(止损,按价格推断; 出场{exit_price:.2f} vs SL{sl:.2f})")
                 return sl_reason
 
         # 仍无法精确匹配：按“更接近 TP 还是 SL”推断，便于参与 TP/SL 学习；详情中写出出场价与设定价，避免误解
@@ -482,12 +475,8 @@ class BinanceTestnetTrader:
             if dist_tp <= dist_sl:
                 set_detail(f"挂单触发(止盈,按价格推断; 出场{exit_price:.2f} vs TP{order.take_profit:.2f})")
                 return CloseReason.TAKE_PROFIT
-            is_profit_sl = (
-                (order.side == OrderSide.LONG and order.stop_loss >= order.entry_price) or
-                (order.side == OrderSide.SHORT and order.stop_loss <= order.entry_price)
-            )
-            set_detail("追踪止损" if is_profit_sl else f"挂单触发(止损,按价格推断; 出场{exit_price:.2f} vs SL{order.stop_loss:.2f})")
-            return CloseReason.TRAILING_STOP if is_profit_sl else CloseReason.STOP_LOSS
+            set_detail(f"挂单触发(止损,按价格推断; 出场{exit_price:.2f} vs SL{order.stop_loss:.2f})")
+            return CloseReason.STOP_LOSS
 
         set_detail("交易所平仓(原因不明)")
         return CloseReason.EXCHANGE_CLOSE
@@ -588,6 +577,8 @@ class BinanceTestnetTrader:
             # 【修复】仓位已消失，清除可能残留的 _pending_close，
             # 防止旧的平仓重试指令误杀下一个新仓位
             self._pending_close = None
+            # 无仓位时本地阶梯单缓存必须清空，避免下一笔误判“已有保护单”
+            self._staged_config = None
             if prev_pos is not None and prev_pos.status != OrderStatus.CLOSED:
                 # 使用真实成交记录计算盈亏与费用
                 entry_time_ms = int(prev_pos.entry_time.timestamp() * 1000) - 1000
@@ -603,9 +594,17 @@ class BinanceTestnetTrader:
                 exit_time = datetime.fromtimestamp(agg["last_time_ms"] / 1000) if agg["last_time_ms"] > 0 else datetime.now()
 
                 # 【核心改进】优先检查交易所保护单是否成交来确定平仓原因
+                self._stage3_close_recorded = False
                 close_reason = self._detect_tp_sl_fill(order_for_detail=prev_pos)
                 if close_reason:
                     print(f"[BinanceTrader] 📍 仓位由交易所保护单平仓: {close_reason.value}")
+                    # 若第3档已按分段记账，跳过整笔重复记录
+                    if self._stage3_close_recorded:
+                        print(f"[BinanceTrader] 第3档已按分段记录，跳过整笔同步")
+                        # 关键：提前返回前必须清空本地阶梯缓存，避免遗留脏状态影响下一笔
+                        self._staged_orders.clear()
+                        self._staged_config = None
+                        return
                 else:
                     # 保护单未成交，走原有诊断流程
                     close_reason = self._fetch_real_close_reason(prev_pos)
@@ -661,6 +660,9 @@ class BinanceTestnetTrader:
                       f"{decision_detail}")
                 if self.on_trade_closed:
                     self.on_trade_closed(prev_pos)
+            else:
+                # 无前置持仓但交易所也无仓，兜底清理本地阶梯缓存
+                self._staged_orders.clear()
             return
 
         side = OrderSide.LONG if amt > 0 else OrderSide.SHORT
@@ -768,11 +770,7 @@ class BinanceTestnetTrader:
             
             # 【核心】新仓位同步后，如果有TP/SL，立即挂交易所保护单
             if (entry_tp is not None or entry_sl is not None):
-                # 检查是否已有保护单（避免重复挂）
-                has_staged = len(self._staged_orders) > 0
-                if not has_staged:
-                    print(f"[BinanceTrader] 同步检测到新仓位，挂交易所保护单...")
-                    self._place_exchange_tp_sl(self.current_position)
+                self._ensure_exchange_tp_sl_protection(self.current_position, source="sync_new_position")
         
         # 若交易所已有持仓，说明入场单已成交或不再有效
         # 【关键修复】不能只清本地列表！必须同时取消交易所上的挂单
@@ -795,6 +793,64 @@ class BinanceTestnetTrader:
             print(f"[BinanceTrader] 查询残留入场单失败: {e}")
         if self._entry_stop_orders:
             self._entry_stop_orders.clear()
+
+        # 已有持仓时，执行一次保护单自检，防止“本地有缓存但交易所无挂单”导致裸仓
+        if self.current_position is not None:
+            self._ensure_exchange_tp_sl_protection(self.current_position, source="sync_tail_check")
+
+    def _has_active_local_staged_orders(self) -> bool:
+        """本地是否存在未成交的阶梯保护单缓存"""
+        for so in self._staged_orders:
+            if so.get("filled"):
+                continue
+            if int(so.get("order_id", 0) or 0) > 0:
+                return True
+        return False
+
+    def _has_active_exchange_staged_orders(self) -> bool:
+        """交易所是否存在本系统的阶梯保护单"""
+        try:
+            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            for o in open_orders:
+                cid = str(o.get("clientOrderId", "") or "")
+                # 兼容旧前缀，避免历史单导致误判
+                if any(tag in cid for tag in ("R3000_TP", "R3000_SL", "R3K_TP", "R3K_SL")):
+                    return True
+            return False
+        except Exception as e:
+            print(f"[BinanceTrader] ⚠ 检查交易所保护单失败: {e}")
+            return False
+
+    def _ensure_exchange_tp_sl_protection(self, order: Optional[PaperOrder], source: str = "") -> None:
+        """
+        保护单一致性自检+自愈：
+        - 本地缓存与交易所状态不一致时给出诊断日志
+        - 两侧都没有保护单时自动补挂，避免裸仓
+        """
+        if order is None:
+            return
+        if order.take_profit is None and order.stop_loss is None:
+            return
+
+        # 先清理本地“幽灵单”
+        if self._staged_orders:
+            self._verify_staged_orders_on_exchange()
+
+        has_local = self._has_active_local_staged_orders()
+        has_exchange = self._has_active_exchange_staged_orders()
+
+        if has_local != has_exchange:
+            print(
+                f"[BinanceTrader] ⚠ 保护单状态不一致: local={has_local} exchange={has_exchange} | "
+                f"source={source or '-'}"
+            )
+
+        if not has_local and not has_exchange:
+            print(
+                f"[BinanceTrader] 🚑 检测到持仓无保护单，自动补挂阶梯止盈止损 | "
+                f"source={source or '-'}"
+            )
+            self._place_exchange_tp_sl(order)
 
     def has_position(self) -> bool:
         return self.current_position is not None
@@ -878,35 +934,36 @@ class BinanceTestnetTrader:
 
     def _place_exchange_tp_sl(self, order: PaperOrder) -> None:
         """
-        【三档阶梯式限价委托单系统】
-        支持两种模式：
-        1. 一次性挂6单（STAGED_ORDERS_SEQUENTIAL=False）
-        2. 逐档挂单（STAGED_ORDERS_SEQUENTIAL=True）：第1档触发→挂第2档；第2档触发→挂第3档；
-           若价格已越过第2档则直接挂第3档
+        【阶梯基准止盈止损系统】
+        
+        核心理念：
+        - 止盈分三档锁定利润（TP1→TP2→TP3），每档 +7%
+        - 止损不分档，始终全平剩余仓位，每档 -5%
+        - 阶梯基准：TP1基于入场价，TP2基于TP1成交价，TP3基于TP2成交价
+        - 止损跟随：SL1基于入场价，SL2基于TP1成交价，SL3基于TP2成交价
+        
+        开仓时只挂：
+        - TP1: +7%（基于入场价），平仓 50%
+        - SL:  -5%（基于入场价），全平 100%
+        
+        后续挂单由 _place_next_stage_orders 处理
         """
         if order is None:
             return
         
         from config import PAPER_TRADING_CONFIG as _ptc
         
-        # 委托单设计：止盈、止损均按下单时的杠杆换算
-        # 配置为「收益率%」：收益率 = 价格变动% × 杠杆 => 价格变动% = 收益率% / 杠杆
+        # 获取配置：统一的止盈/止损收益率
         lev = max(1, int(getattr(self, "leverage", 1)))
-        tp1_return = _ptc.get("STAGED_TP_1_PCT", 5.0) / 100   # 收益率小数
-        tp2_return = _ptc.get("STAGED_TP_2_PCT", 10.0) / 100
-        tp3_return = _ptc.get("STAGED_TP_3_PCT", 15.0) / 100
-        sl1_return = _ptc.get("STAGED_SL_1_PCT", 5.0) / 100
-        sl2_return = _ptc.get("STAGED_SL_2_PCT", 10.0) / 100
-        sl3_return = _ptc.get("STAGED_SL_3_PCT", 15.0) / 100
-        # 止盈/止损倍率：价格变动 = 收益率 / 杠杆（三档一致）
-        tp1_pct = tp1_return / lev
-        tp2_pct = tp2_return / lev
-        tp3_pct = tp3_return / lev
-        sl1_pct = sl1_return / lev
-        sl2_pct = sl2_return / lev
-        sl3_pct = sl3_return / lev
-        ratio1 = _ptc.get("STAGED_TP_RATIO_1", 0.30)
-        ratio2 = _ptc.get("STAGED_TP_RATIO_2", 0.30)
+        tp_return = _ptc.get("STAGED_TP_PCT", 7.0) / 100   # 每档止盈收益率 7%
+        sl_return = _ptc.get("STAGED_SL_PCT", 5.0) / 100   # 止损收益率 5%
+        
+        # 价格变动 = 收益率 / 杠杆
+        tp_pct = tp_return / lev
+        sl_pct = sl_return / lev
+        
+        # 仓位分配
+        ratio1 = _ptc.get("STAGED_TP_RATIO_1", 0.50)  # 第1档 50%
         
         entry_price = order.entry_price
         total_qty = order.quantity
@@ -915,55 +972,157 @@ class BinanceTestnetTrader:
         p_prec = len(str(self._price_tick).split('.')[-1]) if '.' in str(self._price_tick) else 0
         q_prec = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
         
+        # 清除旧的保护单
         self._cancel_exchange_tp_sl(silent=True)
         
-        # 止盈、止损挂单价格均按「收益率/杠杆」换算（如 20x 下 5% 收益 ≈ 0.25% 价格）
+        # 计算第1档价格（基于入场价）
         if is_long:
-            tp1_price = entry_price * (1 + tp1_pct)
-            tp2_price = entry_price * (1 + tp2_pct)
-            tp3_price = entry_price * (1 + tp3_pct)
-            sl1_price = entry_price * (1 - sl1_pct)
-            sl2_price = entry_price * (1 - sl2_pct)
-            sl3_price = entry_price * (1 - sl3_pct)
+            tp1_price = entry_price * (1 + tp_pct)
+            sl_price = entry_price * (1 - sl_pct)
         else:
-            tp1_price = entry_price * (1 - tp1_pct)
-            tp2_price = entry_price * (1 - tp2_pct)
-            tp3_price = entry_price * (1 - tp3_pct)
-            sl1_price = entry_price * (1 + sl1_pct)
-            sl2_price = entry_price * (1 + sl2_pct)
-            sl3_price = entry_price * (1 + sl3_pct)
+            tp1_price = entry_price * (1 - tp_pct)
+            sl_price = entry_price * (1 + sl_pct)
         
+        # 第1档仓位 = 总仓位 × 50%
         qty1 = self._round_step(total_qty * ratio1, self._qty_step)
-        qty2 = self._round_step((total_qty - qty1) * ratio2, self._qty_step)
-        qty3 = self._round_step(total_qty - qty1 - qty2, self._qty_step)
+        # 止损仓位 = 全部剩余（开仓时 = 100%）
+        sl_qty = self._round_step(total_qty, self._qty_step)
         
-        cfg = {
-            "entry_price": entry_price, "total_qty": total_qty, "is_long": is_long,
-            "exit_side": exit_side, "p_prec": p_prec, "q_prec": q_prec,
-            "tp1_price": tp1_price, "tp2_price": tp2_price, "tp3_price": tp3_price,
-            "sl1_price": sl1_price, "sl2_price": sl2_price, "sl3_price": sl3_price,
-            "qty1": qty1, "qty2": qty2, "qty3": qty3,
-            "tp1_pct": tp1_return * 100, "tp2_pct": tp2_return * 100, "tp3_pct": tp3_return * 100,
-            "sl1_pct": sl1_return * 100, "sl2_pct": sl2_return * 100, "sl3_pct": sl3_return * 100,
+        # 保存阶梯配置（用于后续挂单）
+        self._staged_config = {
+            "entry_price": entry_price,
+            "current_base_price": entry_price,  # 当前阶梯基准价（会随TP成交更新）
+            "total_qty": total_qty,
+            "is_long": is_long,
+            "exit_side": exit_side,
+            "p_prec": p_prec,
+            "q_prec": q_prec,
+            "tp_return": tp_return,
+            "sl_return": sl_return,
+            "tp_pct": tp_pct,
+            "sl_pct": sl_pct,
+            "current_tier": 1,  # 当前档位
+            "leverage": lev,
         }
-        print(f"[BinanceTrader] 委托单按杠杆 {lev}x 换算: 止盈/止损收益率→价格变动 "
-              f"TP1={tp1_return*100:.0f}%→{tp1_pct*100:.2f}% | SL1={sl1_return*100:.0f}%→{sl1_pct*100:.2f}%")
-        print(f"[BinanceTrader] 第1档价格/数量: TP1={tp1_price:.{p_prec}f} qty={qty1:.{q_prec}f} ({tp1_return*100:.0f}%) | "
-              f"SL1={sl1_price:.{p_prec}f} qty={qty1:.{q_prec}f} ({sl1_return*100:.0f}%)")
-        sequential = _ptc.get("STAGED_ORDERS_SEQUENTIAL", False)
-        if sequential:
-            self._staged_config = cfg
-            n = self._place_stage_orders(cfg, tiers=[1])
-            print(f"[BinanceTrader] 🎯 逐档模式: 第1档就位 ({n}/2)，触发后将挂第2档（越过则直接挂第3档）")
+        
+        print(f"[BinanceTrader] 【阶梯基准系统】杠杆={lev}x | 每档TP=+{tp_return*100:.0f}% | SL=-{sl_return*100:.0f}%")
+        print(f"[BinanceTrader] 开仓挂单: TP1={tp1_price:.{p_prec}f} (平{ratio1*100:.0f}%) | SL={sl_price:.{p_prec}f} (全平)")
+        
+        # 挂 TP1（限价单，平仓 50%）
+        n = self._place_tiered_tp_sl(
+            tp_price=tp1_price,
+            tp_qty=qty1,
+            sl_price=sl_price,
+            sl_qty=sl_qty,
+            tier=1,
+            tp_pct=tp_return * 100,
+            sl_pct=sl_return * 100,
+        )
+        
+        if n == 2:
+            print(f"[BinanceTrader] 🎯 第1档就位: TP1(平50%) + SL(全平) | TP成交后将基于成交价挂第2档")
+        elif n > 0:
+            print(f"[BinanceTrader] ⚠ 第1档部分挂单成功 ({n}/2)")
         else:
-            self._staged_config = None
-            n = self._place_stage_orders(cfg, tiers=[1, 2, 3])
-            if n == 6:
-                print(f"[BinanceTrader] 🎯 三档阶梯式委托单全部就位 (6/6)")
-            elif n > 0:
-                print(f"[BinanceTrader] ⚠ 部分委托单挂成功 ({n}/6)")
-            else:
-                print(f"[BinanceTrader] 🚨 所有委托单挂单失败！")
+            print(f"[BinanceTrader] 🚨 第1档挂单失败！")
+    
+    def _place_tiered_tp_sl(self, tp_price: float, tp_qty: float, sl_price: float, sl_qty: float,
+                            tier: int, tp_pct: float, sl_pct: float) -> int:
+        """挂指定档位的 TP + SL，返回成功数"""
+        from config import PAPER_TRADING_CONFIG as _ptc
+        
+        cfg = self._staged_config
+        if not cfg:
+            return 0
+        
+        is_long = cfg["is_long"]
+        exit_side = cfg["exit_side"]
+        p_prec = cfg["p_prec"]
+        q_prec = cfg["q_prec"]
+        mark_price = self._get_mark_price()
+        band_pct = _ptc.get("LIMIT_PRICE_BAND_PCT", 5.0) / 100
+        min_sell_limit = mark_price * (1 - band_pct) if mark_price > 0 else 0.0
+        max_buy_limit = mark_price * (1 + band_pct) if mark_price > 0 else float("inf")
+        
+        success_count = 0
+        
+        # 挂 TP（限价单）
+        if tp_qty > 0:
+            tp_price_rounded = self._round_step(tp_price, self._price_tick)
+            tp_price_str = f"{tp_price_rounded:.{p_prec}f}"
+            tp_qty_str = f"{tp_qty:.{q_prec}f}"
+            
+            # 判断是否需要用 STOP_MARKET（价格偏离过大）
+            use_stop_market = False
+            if is_long and tp_price_rounded < min_sell_limit and min_sell_limit > 0:
+                use_stop_market = True
+            elif not is_long and tp_price_rounded > max_buy_limit:
+                use_stop_market = True
+            
+            try:
+                if use_stop_market:
+                    params = {
+                        "symbol": self.symbol, "side": exit_side, "type": "STOP_MARKET",
+                        "stopPrice": tp_price_str, "quantity": tp_qty_str, "reduceOnly": "true",
+                        "workingType": "CONTRACT_PRICE", "newClientOrderId": self._new_client_order_id(f"TP{tier}"),
+                    }
+                else:
+                    params = {
+                        "symbol": self.symbol, "side": exit_side, "type": "LIMIT",
+                        "price": tp_price_str, "quantity": tp_qty_str, "reduceOnly": "true",
+                        "timeInForce": "GTC", "newClientOrderId": self._new_client_order_id(f"TP{tier}"),
+                    }
+                
+                print(f"[BinanceTrader] 📤 TP{tier} 下单请求: {params}")
+                resp = self._place_order(params)
+                oid = int(resp.get("orderId", 0) or 0)
+                status = str(resp.get("status", "")).upper()
+                print(f"[BinanceTrader] 📥 TP{tier} 响应: orderId={oid} status={status}")
+                
+                if oid > 0:
+                    self._staged_orders.append({
+                        "order_id": oid, "type": "TP", "stage": tier, "price": tp_price_rounded,
+                        "quantity": tp_qty, "pct": tp_pct, "filled": (status == "FILLED")
+                    })
+                    success_count += 1
+                    print(f"[BinanceTrader] ✅ 止盈第{tier}档: {exit_side} @ {tp_price_str} | 数量={tp_qty_str} (+{tp_pct:.0f}%)")
+            except Exception as e:
+                print(f"[BinanceTrader] ❌ 止盈第{tier}档挂单失败: {e}")
+        
+        # 挂 SL（STOP_MARKET，全平剩余）
+        if sl_qty > 0:
+            sl_price_rounded = self._round_step(sl_price, self._price_tick)
+            sl_price_str = f"{sl_price_rounded:.{p_prec}f}"
+            sl_qty_str = f"{sl_qty:.{q_prec}f}"
+            
+            try:
+                params = {
+                    "symbol": self.symbol, "side": exit_side, "type": "STOP_MARKET",
+                    "stopPrice": sl_price_str, "quantity": sl_qty_str, "reduceOnly": "true",
+                    "workingType": "CONTRACT_PRICE", "newClientOrderId": self._new_client_order_id(f"SL{tier}"),
+                }
+                
+                print(f"[BinanceTrader] 📤 SL{tier} 下单请求: {params}")
+                resp = self._place_order(params)
+                oid = int(resp.get("orderId", 0) or 0)
+                status = str(resp.get("status", "")).upper()
+                print(f"[BinanceTrader] 📥 SL{tier} 响应: orderId={oid} status={status}")
+                
+                if oid > 0:
+                    self._staged_orders.append({
+                        "order_id": oid, "type": "SL", "stage": tier, "price": sl_price_rounded,
+                        "quantity": sl_qty, "pct": sl_pct, "filled": (status == "FILLED"),
+                        "is_full_close": True  # 标记为全平止损
+                    })
+                    success_count += 1
+                    print(f"[BinanceTrader] ✅ 止损第{tier}档: {exit_side} STOP @ {sl_price_str} | 数量={sl_qty_str} (-{sl_pct:.0f}%) [全平]")
+            except Exception as e:
+                print(f"[BinanceTrader] ❌ 止损第{tier}档挂单失败: {e}")
+        
+        if success_count > 0:
+            self._verify_staged_orders_on_exchange()
+        
+        return success_count
 
     def _place_stage_orders(self, cfg: dict, tiers: List[int]) -> int:
         """挂指定档位的委托单，返回成功数"""
@@ -1100,42 +1259,110 @@ class BinanceTestnetTrader:
                     pass
             self._staged_orders.remove(other)
 
-    def _place_next_stage_orders(self, from_tier: int, filled_type: str) -> None:
-        """第1档或第2档成交后，挂下一档；若价格已越过第2档则直接挂第3档"""
+
+    def _place_next_stage_orders(self, from_tier: int, filled_type: str, tier_fill_price: Optional[float] = None) -> None:
+        """
+        【阶梯基准系统】TP成交后挂下一档
+        
+        核心逻辑：
+        - TP成交：基于TP成交价计算新的 TP + SL，挂下一档
+        - SL成交：全平剩余，交易结束，无需挂单
+        
+        阶梯基准：
+        - TP1成交后：TP2 = TP1成交价 + 7%，SL2 = TP1成交价 - 5%
+        - TP2成交后：TP3 = TP2成交价 + 7%，SL3 = TP2成交价 - 5%
+        """
         cfg = self._staged_config
         if not cfg or not self.current_position:
             return
         
+        # 取消同档的另一侧单（TP成交取消SL，SL成交取消TP）
         self._cancel_other_stage_order(filled_type, from_tier)
         
+        # 如果是 SL 成交，全平剩余，交易结束
+        if filled_type == "SL":
+            print(f"[BinanceTrader] 🛑 止损第{from_tier}档成交，全平剩余仓位，交易结束")
+            self._staged_config = None
+            self._staged_orders.clear()
+            return
+        
+        # TP 成交，准备挂下一档
         pos = self._get_position()
         amt = float(pos.get("positionAmt", 0.0)) if pos else 0.0
         if abs(amt) < 1e-12:
+            print(f"[BinanceTrader] ⚠ TP{from_tier}成交后仓位为0，无需挂下一档")
+            self._staged_config = None
             return
         
-        mark = self._get_mark_price()
-        is_long = cfg["is_long"]
+        # 下一档
+        next_tier = from_tier + 1
+        if next_tier > 3:
+            print(f"[BinanceTrader] ✅ 所有3档止盈已完成")
+            self._staged_config = None
+            return
         
-        if from_tier == 1:
-            # 检查是否已越过第2档：LONG+TP1→mark>=tp2；LONG+SL1→mark<=sl2；SHORT 反
-            skip_tier2 = False
-            if filled_type == "TP":
-                skip_tier2 = (is_long and mark >= cfg["tp2_price"]) or (not is_long and mark <= cfg["tp2_price"])
-            else:
-                skip_tier2 = (is_long and mark <= cfg["sl2_price"]) or (not is_long and mark >= cfg["sl2_price"])
-            
-            if skip_tier2:
-                qty_rest = self._round_step(abs(amt), self._qty_step)
-                if qty_rest <= 0:
-                    return
-                cfg3 = dict(cfg)
-                cfg3["qty3"] = qty_rest
-                self._place_stage_orders(cfg3, tiers=[3])
-                print(f"[BinanceTrader] ⏩ 价格已越过第2档，直接挂第3档 | 剩余={qty_rest}")
-            else:
-                self._place_stage_orders(cfg, tiers=[2])
+        # 获取配置参数
+        is_long = cfg["is_long"]
+        tp_pct = cfg["tp_pct"]
+        sl_pct = cfg["sl_pct"]
+        tp_return = cfg["tp_return"]
+        sl_return = cfg["sl_return"]
+        p_prec = cfg["p_prec"]
+        q_prec = cfg["q_prec"]
+        
+        # 新的阶梯基准价 = 上一档 TP 成交价
+        if tier_fill_price and tier_fill_price > 0:
+            new_base_price = tier_fill_price
         else:
-            self._place_stage_orders(cfg, tiers=[3])
+            # 如果没有成交价，用当前 mark price 估算
+            new_base_price = self._get_mark_price()
+        
+        # 更新阶梯基准
+        cfg["current_base_price"] = new_base_price
+        cfg["current_tier"] = next_tier
+        
+        # 计算新的 TP 和 SL 价格（基于新基准）
+        if is_long:
+            next_tp_price = new_base_price * (1 + tp_pct)
+            next_sl_price = new_base_price * (1 - sl_pct)
+        else:
+            next_tp_price = new_base_price * (1 - tp_pct)
+            next_sl_price = new_base_price * (1 + sl_pct)
+        
+        # 计算仓位
+        from config import PAPER_TRADING_CONFIG as _ptc
+        remaining_qty = self._round_step(abs(amt), self._qty_step)
+        
+        if next_tier == 2:
+            ratio2 = _ptc.get("STAGED_TP_RATIO_2", 0.50)  # 剩余的 50%
+            tp_qty = self._round_step(remaining_qty * ratio2, self._qty_step)
+        else:  # tier 3
+            tp_qty = remaining_qty  # 全平剩余
+        
+        sl_qty = remaining_qty  # 止损始终全平剩余
+        
+        print(f"[BinanceTrader] 📊 第{next_tier}档阶梯基准: TP{from_tier}成交价={new_base_price:.{p_prec}f}")
+        print(f"[BinanceTrader] 📊 计算: TP{next_tier}={next_tp_price:.{p_prec}f} (+{tp_return*100:.0f}%) | "
+              f"SL{next_tier}={next_sl_price:.{p_prec}f} (-{sl_return*100:.0f}%)")
+        print(f"[BinanceTrader] 📊 仓位: TP{next_tier}平{tp_qty:.{q_prec}f} | SL{next_tier}全平{sl_qty:.{q_prec}f}")
+        
+        # 挂新的 TP + SL
+        n = self._place_tiered_tp_sl(
+            tp_price=next_tp_price,
+            tp_qty=tp_qty,
+            sl_price=next_sl_price,
+            sl_qty=sl_qty,
+            tier=next_tier,
+            tp_pct=tp_return * 100,
+            sl_pct=sl_return * 100,
+        )
+        
+        if n == 2:
+            print(f"[BinanceTrader] 🎯 第{next_tier}档就位: TP(平{'全部' if next_tier == 3 else '50%'}) + SL(全平)")
+        elif n > 0:
+            print(f"[BinanceTrader] ⚠ 第{next_tier}档部分挂单成功 ({n}/2)")
+        else:
+            print(f"[BinanceTrader] 🚨 第{next_tier}档挂单失败！")
 
     def _cancel_exchange_tp_sl(self, silent: bool = False) -> None:
         """取消交易所上的所有阶梯式止盈止损委托单"""
@@ -1310,6 +1537,7 @@ class BinanceTestnetTrader:
                     label = "止盈" if stage_type == "TP" else "止损"
                     detail_msg = f"挂单触发({label}第{stage_num}档)"
                     print(f"[BinanceTrader] 📍 交易所{label}第{stage_num}档已成交: orderId={order_id} | 档位={pct:.0f}%")
+                    filled_price = float(info.get("avgPrice", 0.0) or 0.0) or float(stage_order.get("price", 0.0) or 0.0)
                     
                     if target_order:
                         if stage_type == "TP":
@@ -1319,16 +1547,39 @@ class BinanceTestnetTrader:
                         target_order.close_reason_detail = detail_msg
                     
                     from config import PAPER_TRADING_CONFIG as _ptc
+                    # 阶梯基准系统：TP成交后挂下一档（传递成交价），SL成交后全平结束
                     if stage_num == 3:
+                        # 第3档成交，交易完全结束
                         self._cancel_other_stage_order(stage_type, 3)
+                        self._staged_config = None
+                    elif stage_type == "SL":
+                        # 止损成交：全平剩余仓位，交易结束（由 _place_next_stage_orders 处理）
+                        self._place_next_stage_orders(
+                            from_tier=stage_num,
+                            filled_type=stage_type,
+                            tier_fill_price=filled_price
+                        )
                     elif _ptc.get("STAGED_ORDERS_SEQUENTIAL", False):
-                        self._place_next_stage_orders(from_tier=stage_num, filled_type=stage_type)
+                        # 止盈成交：挂下一档（传递TP成交价作为新基准）
+                        self._place_next_stage_orders(
+                            from_tier=stage_num,
+                            filled_type=stage_type,
+                            tier_fill_price=filled_price  # 所有TP档都传递成交价
+                        )
                     
-                    # 分段成交（第1/2档）写入交易记录，确保 UI 永久记忆
-                    if stage_num in (1, 2) and target_order is not None:
+                    # 分段成交（含第3档）写入交易记录，统计按「当前档」口径
+                    if stage_num in (1, 2, 3) and target_order is not None:
                         try:
                             closed_qty = float(stage_order.get("quantity", 0.0))
-                            original_qty = max(float(target_order.quantity), 1e-12)
+                            # 第3档时，closed_qty 就是全部剩余，从交易所同步确保精准
+                            if stage_num == 3:
+                                pos_final = self._get_position()
+                                qty_before_tier3 = abs(float(pos_final.get("positionAmt", 0.0))) if pos_final else 0.0
+                                closed_qty = max(closed_qty, qty_before_tier3)
+                            # 本档保证金按当前杠杆实际计算
+                            lev_now = max(float(getattr(self, "leverage", 1.0) or 1.0), 1.0)
+                            margin_portion = (closed_qty * float(target_order.entry_price)) / lev_now
+                            
                             entry_time_ms = int(target_order.entry_time.timestamp() * 1000) - 1000
                             entry_side = "BUY" if target_order.side == OrderSide.LONG else "SELL"
                             trades = []
@@ -1339,6 +1590,8 @@ class BinanceTestnetTrader:
                             agg = self._aggregate_trades(trades, entry_side=entry_side)
                             exit_price = agg["exit_price"] or float(stage_order.get("price", 0.0)) or self._get_mark_price()
                             exit_fee = agg["exit_fee"]
+                            # 本档手续费：按本档数量占比
+                            original_qty = max(float(target_order.quantity), 1e-12)
                             entry_fee_total = target_order.total_fee or agg["entry_fee"]
                             entry_fee = entry_fee_total * (closed_qty / original_qty)
                             realized_pnl = agg["realized_pnl"]
@@ -1348,9 +1601,14 @@ class BinanceTestnetTrader:
                                 else:
                                     realized_pnl = (target_order.entry_price - exit_price) * closed_qty
                             net_pnl = realized_pnl - exit_fee - entry_fee
-                            margin_portion = target_order.margin_used * (closed_qty / original_qty)
                             pnl_pct = (net_pnl / max(margin_portion, 1e-9)) * 100.0
                             exit_time = datetime.fromtimestamp(agg["last_time_ms"] / 1000) if agg["last_time_ms"] > 0 else datetime.now()
+                            # 阶梯基准系统：SL始终全平（不是PARTIAL），TP分档
+                            stage_reason = (
+                                CloseReason.TAKE_PROFIT if (stage_type == "TP" and stage_num == 3)
+                                else CloseReason.STOP_LOSS if stage_type == "SL"  # SL任何档都是全平
+                                else CloseReason.PARTIAL_TP  # TP1/TP2 是分段止盈
+                            )
                             closed_order = replace(
                                 target_order,
                                 quantity=closed_qty,
@@ -1359,7 +1617,7 @@ class BinanceTestnetTrader:
                                 exit_price=exit_price,
                                 exit_time=exit_time,
                                 exit_bar_idx=self.current_bar_idx,
-                                close_reason=CloseReason.PARTIAL_TP if stage_type == "TP" else CloseReason.PARTIAL_SL,
+                                close_reason=stage_reason,
                                 close_reason_detail=detail_msg,
                                 realized_pnl=net_pnl,
                                 unrealized_pnl=0.0,
@@ -1369,15 +1627,18 @@ class BinanceTestnetTrader:
                             )
                             self.order_history.append(closed_order)
                             self.save_history(self.history_file)
+                            if stage_num == 3:
+                                self._stage3_close_recorded = True
                             if self.on_trade_closed:
                                 self.on_trade_closed(closed_order)
                         except Exception as e:
                             print(f"[BinanceTrader] ⚠ 分段成交记录写入失败: {e}")
                     
+                    # 阶梯基准系统：SL任何档都是全平（返回STOP_LOSS），TP分档
                     if stage_type == "TP":
                         return CloseReason.TAKE_PROFIT if stage_num == 3 else CloseReason.PARTIAL_TP
                     else:
-                        return CloseReason.STOP_LOSS if stage_num == 3 else CloseReason.PARTIAL_SL
+                        return CloseReason.STOP_LOSS  # SL始终全平，不分档
                             
             except Exception as e:
                 # 忽略查询错误，继续检查下一个

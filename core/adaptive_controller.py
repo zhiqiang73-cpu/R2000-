@@ -368,7 +368,7 @@ class KellyAdapter:
             "trades": stats["trades"],
         }
     
-    def suggest_kelly_fraction_adjustment(self, min_trades: int = 20) -> Optional[float]:
+    def suggest_kelly_fraction_adjustment(self, min_trades: int = 1) -> Optional[float]:
         """
         建议 KELLY_FRACTION 调整
         
@@ -413,7 +413,7 @@ class KellyAdapter:
         Returns:
             建议的新 kelly_max 值，None 表示不建议调整
         """
-        if len(self.position_distribution) < 20:
+        if len(self.position_distribution) < 1:
             return None
         
         # 当前 kelly_max 和范围
@@ -427,7 +427,7 @@ class KellyAdapter:
             suggested = max(current_max - 0.1, max_range[0])
             return suggested
         
-        elif self.drawdown_tracker < 10.0 and len(self.recent_performance) >= 20:
+        elif self.drawdown_tracker < 10.0 and len(self.recent_performance) >= 1:
             # 回撤小且稳定，可以提升最大仓位
             avg_profit = np.mean(list(self.recent_performance))
             if avg_profit > 0.8:
@@ -444,7 +444,7 @@ class KellyAdapter:
         Returns:
             建议的新 kelly_min 值，None 表示不建议调整
         """
-        if len(self.position_distribution) < 20:
+        if len(self.position_distribution) < 1:
             return None
         
         # 当前 kelly_min 和范围

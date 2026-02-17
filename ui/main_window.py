@@ -630,13 +630,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # ============ Tab 2: 模拟交易 ============
         self.paper_trading_tab = PaperTradingTab()
         self.main_tabs.addTab(self.paper_trading_tab, "💹 模拟交易")
-        # 启动时加载历史交易记录（UI 端永久记忆）
+        # 启动时加载历史交易记录（UI 端永久记忆，仅显示最近10笔避免卡顿）
         try:
             project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             history_file = os.path.join(project_root, "data", "live_trade_history.json")
             history = load_trade_history_from_file(history_file)
             if history:
-                self.paper_trading_tab.load_historical_trades(history)
+                # 仅显示最近10笔，减少UI渲染负担（文件和统计仍保留全量）
+                self.paper_trading_tab.load_historical_trades(history[-10:])
+                print(f"[MainWindow] 已加载历史交易记录: 显示最近{min(10, len(history))}笔 / 共{len(history)}笔")
         except Exception as e:
             print(f"[MainWindow] 启动时加载交易记录失败: {e}")
 
@@ -3096,14 +3098,16 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"[MainWindow] 加载API配置失败: {e}")
     
     def _load_paper_trade_history_on_start(self):
-        """程序启动时从本地文件加载历史交易记录并显示"""
+        """程序启动时从本地文件加载历史交易记录并显示（仅显示最近10笔）"""
         try:
             project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             history_file = os.path.join(project_root, "data", "live_trade_history.json")
             history = load_trade_history_from_file(history_file)
             if history:
-                self.paper_trading_tab.load_historical_trades(history)
-                self.statusBar().showMessage(f"已加载 {len(history)} 条历史交易记录", 3000)
+                # 仅显示最近10笔，减少UI渲染负担
+                display_count = min(10, len(history))
+                self.paper_trading_tab.load_historical_trades(history[-10:])
+                self.statusBar().showMessage(f"已加载历史交易记录: 显示{display_count}笔 / 共{len(history)}笔", 3000)
         except Exception as e:
             print(f"[MainWindow] 加载历史交易记录失败: {e}")
     
@@ -3437,8 +3441,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._live_engine.paper_trader.order_history = list(history)
                 self.paper_trading_tab.reset()
                 if history:
-                    self.paper_trading_tab.load_historical_trades(history)
-                    self.paper_trading_tab.status_panel.append_event(f"成功恢复 {len(history)} 条历史交易记录")
+                    # 仅显示最近10笔，减少UI负担
+                    display_count = min(10, len(history))
+                    self.paper_trading_tab.load_historical_trades(history[-10:])
+                    self.paper_trading_tab.status_panel.append_event(f"成功恢复历史交易记录: 显示{display_count}笔 / 共{len(history)}笔")
                 
                 self._live_chart_timer.start()
                 self._adaptive_dashboard_timer.start()
