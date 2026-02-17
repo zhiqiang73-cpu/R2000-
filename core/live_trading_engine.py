@@ -284,10 +284,10 @@ class LiveTradingEngine:
             realtime_emit_interval=PAPER_TRADING_CONFIG.get("REALTIME_DECISION_SEC", 0.05),
         )
         
-        # 执行参数固定：每次开仓 50% 仓位，杠杆默认 20x（可被自适应每笔调整）
+        # 执行参数固定：每次开仓 50% 仓位，杠杆固定由配置控制（当前 20x）
         self.fixed_position_size_pct = 0.5
         default_lev = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
-        self.fixed_leverage = int(leverage) if leverage is not None and leverage > 0 else default_lev
+        self.fixed_leverage = default_lev
 
         # Binance 测试网真实执行器（不再使用本地虚拟模式）
         self._paper_trader = BinanceTestnetTrader(
@@ -4063,8 +4063,9 @@ class LiveTradingEngine:
                 
                 self._adaptive_controller.on_trade_closed_simple(order, market_regime)
                 
-                # 更新杠杆到交易器
-                if self._adaptive_controller.kelly_adapter:
+                # 更新杠杆到交易器（仅当 LEVERAGE_ADAPTIVE=True）
+                from config import PAPER_TRADING_CONFIG as _ptc
+                if _ptc.get("LEVERAGE_ADAPTIVE", False) and self._adaptive_controller.kelly_adapter:
                     new_leverage = self._adaptive_controller.kelly_adapter.leverage
                     if new_leverage and new_leverage != self._paper_trader.leverage:
                         old_leverage = self._paper_trader.leverage

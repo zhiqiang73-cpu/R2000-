@@ -477,7 +477,7 @@ class KellyAdapter:
             新杠杆值（若发生调整），否则 None
         """
         from config import PAPER_TRADING_CONFIG
-        if not PAPER_TRADING_CONFIG.get("LEVERAGE_ADAPTIVE", True):
+        if not PAPER_TRADING_CONFIG.get("LEVERAGE_ADAPTIVE", False):
             return None
         default_lev = PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20)
         min_lev = PAPER_TRADING_CONFIG.get("LEVERAGE_MIN", 5)
@@ -636,7 +636,7 @@ class KellyAdapter:
             "KELLY_FRACTION": self.kelly_fraction or PAPER_TRADING_CONFIG.get("KELLY_FRACTION", 0.25),
             "KELLY_MAX": self.kelly_max or PAPER_TRADING_CONFIG.get("KELLY_MAX_POSITION", 0.8),
             "KELLY_MIN": self.kelly_min or PAPER_TRADING_CONFIG.get("KELLY_MIN_POSITION", 0.05),
-            "LEVERAGE": self.leverage or PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20),
+            "LEVERAGE": PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20),
         }
     
     def to_dict(self) -> dict:
@@ -667,7 +667,8 @@ class KellyAdapter:
         self.kelly_fraction = data.get("kelly_fraction")
         self.kelly_max = data.get("kelly_max")
         self.kelly_min = data.get("kelly_min")
-        self.leverage = data.get("leverage")
+        # 杠杆固定模式：忽略历史状态中的杠杆，统一使用配置值
+        self.leverage = None
         self.adjustment_history = data.get("adjustment_history", [])
         
         recent_perf = data.get("recent_performance", [])
@@ -1106,10 +1107,7 @@ class AdaptiveController:
             self.stats["consecutive_losses"] += 1
             self.stats["consecutive_wins"] = 0
         
-        # 杠杆自适应：每笔平仓后都按盈亏调整（盈利放大、亏损缩小，5x~100x，默认20x）
-        from config import PAPER_TRADING_CONFIG
-        if self.kelly_adapter and PAPER_TRADING_CONFIG.get("LEVERAGE_ADAPTIVE", True):
-            self.kelly_adapter.adjust_leverage_after_trade(order.profit_pct)
+        # 杠杆固定模式：不再在平仓后按盈亏调整杠杆
         
         # 仓位自适应：每笔平仓后都调整凯利参数（KELLY_FRACTION / KELLY_MAX / KELLY_MIN），下一笔开仓即生效
         if self.kelly_adapter:

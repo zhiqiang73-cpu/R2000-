@@ -98,6 +98,7 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 side=OrderSide(t["side"]) if t.get("side") else OrderSide.LONG,
                 quantity=float(t.get("quantity", 0)),
                 margin_used=float(t.get("margin_used", 0)),
+                leverage=float(t.get("leverage", 0)),
                 entry_price=float(t.get("entry_price", 0)),
                 entry_time=entry_time,
                 entry_bar_idx=int(t.get("entry_bar_idx", 0)),
@@ -176,6 +177,7 @@ class PaperOrder:
     entry_price: float        # 入场价
     entry_time: datetime      # 入场时间
     entry_bar_idx: int        # 入场K线索引
+    leverage: float = 0.0     # 杠杆（用于UI显示/记录）
     
     # 止盈止损
     take_profit: Optional[float] = None
@@ -302,6 +304,7 @@ class PaperOrder:
             "side": self.side.value,
             "quantity": self.quantity,
             "margin_used": self.margin_used,
+            "leverage": self.leverage,
             "entry_price": self.entry_price,
             "entry_time": self.entry_time.isoformat() if self.entry_time else None,
             "entry_bar_idx": self.entry_bar_idx,
@@ -696,6 +699,7 @@ class PaperTrader:
             side=side,
             quantity=qty,
             margin_used=margin,
+            leverage=self.leverage,
             entry_price=price,
             entry_time=datetime.now(),
             entry_bar_idx=bar_idx,

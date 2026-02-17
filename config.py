@@ -708,9 +708,9 @@ PAPER_TRADING_CONFIG = {
     "KELLY_MAX_RANGE": (0.5, 0.9),         # KELLY_MAX 自适应调整范围
     "KELLY_MIN_RANGE": (0.03, 0.10),       # KELLY_MIN 自适应调整范围（下限3%~10%）
     
-    # ── 杠杆自适应配置 ──
-    "LEVERAGE_ADAPTIVE": True,             # 是否启用杠杆自适应调整（每笔开平仓都调整）
-    "LEVERAGE_DEFAULT": 20,                # 默认杠杆倍数（程序启动与自适应基线）
+    # ── 杠杆配置（固定 20x） ──
+    "LEVERAGE_ADAPTIVE": False,            # 关闭杠杆自适应（不再按历史盈亏调整）
+    "LEVERAGE_DEFAULT": 20,                # 固定杠杆倍数
     "LEVERAGE_MIN": 5,                     # 最小杠杆倍数
     "LEVERAGE_MAX": 100,                   # 最大杠杆倍数
     "LEVERAGE_ADJUST_STEP": 2,             # 每笔交易后杠杆调整步长（盈利+step/亏损-step）

@@ -3361,16 +3361,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # 获取代理设置
             http_proxy, socks_proxy = self._get_proxy_settings()
             
-            # 【自适应杠杆恢复】优先使用自适应控制器保存的杠杆值
-            effective_leverage = config["leverage"]
-            if self._adaptive_controller and hasattr(self._adaptive_controller, 'kelly_adapter'):
-                saved_leverage = getattr(self._adaptive_controller.kelly_adapter, 'leverage', None)
-                if saved_leverage and saved_leverage > 0:
-                    effective_leverage = int(saved_leverage)
-                    print(f"[MainWindow] 从自适应控制器恢复杠杆: {effective_leverage}x (UI默认={config['leverage']}x)")
-                    self.adaptive_learning_tab.append_adaptive_journal(
-                        f"从学习记忆恢复杠杆: {effective_leverage}x"
-                    )
+            # 杠杆固定 20x（不再从学习记忆恢复历史杠杆）
+            effective_leverage = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
             
             self._live_engine = LiveTradingEngine(
                 trajectory_memory=self.trajectory_memory,

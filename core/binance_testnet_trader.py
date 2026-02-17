@@ -297,6 +297,12 @@ class BinanceTestnetTrader:
         n = int(value / step)
         return max(step, n * step)
 
+    def _round_step_nearest(self, value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        n = int(round(value / step))
+        return max(step, n * step)
+
     def _load_history(self):
         """从 JSON 文件加载持久化的记录"""
         if not os.path.exists(self.history_file):
@@ -323,6 +329,7 @@ class BinanceTestnetTrader:
                         side=OrderSide(t["side"]),
                         quantity=t["quantity"],
                         margin_used=t["margin_used"],
+                        leverage=t.get("leverage", 0),
                         entry_price=t["entry_price"],
                         entry_time=datetime.fromisoformat(t["entry_time"]) if t.get("entry_time") else None,
                         entry_bar_idx=t.get("entry_bar_idx", 0),
@@ -720,7 +727,7 @@ class BinanceTestnetTrader:
             entry_fp = None
             entry_sim = 0.0
             entry_reason = ""
-            entry_kelly_pct = 0.0
+            entry_kelly_pct = self.position_size_pct
             if self._entry_stop_orders:
                 last_entry = self._entry_stop_orders[-1]
                 entry_tp = last_entry.get("take_profit")
@@ -763,6 +770,7 @@ class BinanceTestnetTrader:
                 template_fingerprint=entry_fp,
                 entry_similarity=entry_sim,
                 entry_reason=entry_reason,
+                leverage=leverage,
                 kelly_position_pct=entry_kelly_pct,
             )
             
@@ -774,6 +782,13 @@ class BinanceTestnetTrader:
                     print(f"[BinanceTrader] 同步检测到新仓位，挂交易所保护单...")
                     self._place_exchange_tp_sl(self.current_position)
         
+        # 第三档成交后若残仓过小，触发市价全平兜底
+        if abs(qty) > 1e-12 and abs(qty) < 2 * self._qty_step and self._staged_orders:
+            tier3_filled = any(so.get("stage") == 3 and so.get("filled") for so in self._staged_orders)
+            if tier3_filled:
+                self._pending_close = (self._get_mark_price(), self.current_bar_idx, CloseReason.EXCHANGE_CLOSE)
+                print(f"[BinanceTrader] 🧹 检测到第三档成交后残仓 {qty:.6f}，触发市价全平")
+
         # 若交易所已有持仓，说明入场单已成交或不再有效
         # 【关键修复】不能只清本地列表！必须同时取消交易所上的挂单
         # 否则旧的反方向入场单可能仍在交易所上，一旦成交就会平掉当前仓位
@@ -935,7 +950,10 @@ class BinanceTestnetTrader:
         
         qty1 = self._round_step(total_qty * ratio1, self._qty_step)
         qty2 = self._round_step((total_qty - qty1) * ratio2, self._qty_step)
-        qty3 = self._round_step(total_qty - qty1 - qty2, self._qty_step)
+        rest_qty = max(0.0, total_qty - qty1 - qty2)
+        qty3 = self._round_step_nearest(rest_qty, self._qty_step)
+        if qty3 > rest_qty:
+            qty3 = self._round_step(rest_qty, self._qty_step)
         
         cfg = {
             "entry_price": entry_price, "total_qty": total_qty, "is_long": is_long,
@@ -1100,7 +1118,7 @@ class BinanceTestnetTrader:
                     pass
             self._staged_orders.remove(other)
 
-    def _place_next_stage_orders(self, from_tier: int, filled_type: str) -> None:
+    def _place_next_stage_orders(self, from_tier: int, filled_type: str, fill_price: Optional[float] = None) -> None:
         """第1档或第2档成交后，挂下一档；若价格已越过第2档则直接挂第3档"""
         cfg = self._staged_config
         if not cfg or not self.current_position:
@@ -1125,7 +1143,10 @@ class BinanceTestnetTrader:
                 skip_tier2 = (is_long and mark <= cfg["sl2_price"]) or (not is_long and mark >= cfg["sl2_price"])
             
             if skip_tier2:
-                qty_rest = self._round_step(abs(amt), self._qty_step)
+                rest_qty = abs(amt)
+                qty_rest = self._round_step_nearest(rest_qty, self._qty_step)
+                if qty_rest > rest_qty:
+                    qty_rest = self._round_step(rest_qty, self._qty_step)
                 if qty_rest <= 0:
                     return
                 cfg3 = dict(cfg)
@@ -1135,7 +1156,22 @@ class BinanceTestnetTrader:
             else:
                 self._place_stage_orders(cfg, tiers=[2])
         else:
-            self._place_stage_orders(cfg, tiers=[3])
+            rest_qty = abs(amt)
+            qty_rest = self._round_step_nearest(rest_qty, self._qty_step)
+            if qty_rest > rest_qty:
+                qty_rest = self._round_step(rest_qty, self._qty_step)
+            if qty_rest <= 0:
+                return
+            cfg3 = dict(cfg)
+            cfg3["qty3"] = qty_rest
+            # 第2档成交后，按成交价重算第3档价格（保持同倍率）
+            if fill_price and cfg.get("entry_price", 0) > 0:
+                entry_price = float(cfg["entry_price"])
+                tp3_ratio = float(cfg.get("tp3_price", entry_price)) / entry_price
+                sl3_ratio = float(cfg.get("sl3_price", entry_price)) / entry_price
+                cfg3["tp3_price"] = fill_price * tp3_ratio
+                cfg3["sl3_price"] = fill_price * sl3_ratio
+            self._place_stage_orders(cfg3, tiers=[3])
 
     def _cancel_exchange_tp_sl(self, silent: bool = False) -> None:
         """取消交易所上的所有阶梯式止盈止损委托单"""
@@ -1322,7 +1358,8 @@ class BinanceTestnetTrader:
                     if stage_num == 3:
                         self._cancel_other_stage_order(stage_type, 3)
                     elif _ptc.get("STAGED_ORDERS_SEQUENTIAL", False):
-                        self._place_next_stage_orders(from_tier=stage_num, filled_type=stage_type)
+                        fill_price = float(info.get("avgPrice", 0.0) or info.get("price", 0.0) or stage_order.get("price", 0.0) or 0.0)
+                        self._place_next_stage_orders(from_tier=stage_num, filled_type=stage_type, fill_price=fill_price)
                     
                     # 分段成交（第1/2档）写入交易记录，确保 UI 永久记忆
                     if stage_num in (1, 2) and target_order is not None:
@@ -1333,9 +1370,7 @@ class BinanceTestnetTrader:
                             entry_side = "BUY" if target_order.side == OrderSide.LONG else "SELL"
                             trades = []
                             if order_id > 0:
-                                trades = self._get_user_trades(order_id=order_id, start_time_ms=entry_time_ms)
-                            if not trades:
-                                trades = self._get_user_trades(start_time_ms=entry_time_ms)
+                                trades = self._get_user_trades(order_id=order_id)
                             agg = self._aggregate_trades(trades, entry_side=entry_side)
                             exit_price = agg["exit_price"] or float(stage_order.get("price", 0.0)) or self._get_mark_price()
                             exit_fee = agg["exit_fee"]
@@ -1350,7 +1385,11 @@ class BinanceTestnetTrader:
                             net_pnl = realized_pnl - exit_fee - entry_fee
                             margin_portion = target_order.margin_used * (closed_qty / original_qty)
                             pnl_pct = (net_pnl / max(margin_portion, 1e-9)) * 100.0
-                            exit_time = datetime.fromtimestamp(agg["last_time_ms"] / 1000) if agg["last_time_ms"] > 0 else datetime.now()
+                            if agg["last_time_ms"] > 0:
+                                exit_time = datetime.fromtimestamp(agg["last_time_ms"] / 1000)
+                            else:
+                                info_time = int(info.get("updateTime", 0) or info.get("time", 0) or 0)
+                                exit_time = datetime.fromtimestamp(info_time / 1000) if info_time > 0 else datetime.now()
                             closed_order = replace(
                                 target_order,
                                 quantity=closed_qty,
@@ -1494,7 +1533,7 @@ class BinanceTestnetTrader:
                 "template_fingerprint": template_fingerprint,
                 "entry_similarity": entry_similarity,
                 "entry_reason": entry_reason,
-                "position_size_pct": position_size_pct,  # 凯利仓位，同步建仓时回填到 order 供学习
+                "position_size_pct": pct_used,  # 实际使用仓位，同步建仓时回填到 order 供学习/UI显示
             })
             # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
             self._last_entry_tp = take_profit
@@ -1505,90 +1544,78 @@ class BinanceTestnetTrader:
         return order_id
 
     def get_pending_entry_orders_snapshot(self, current_bar_idx: int = None) -> List[dict]:
-        """返回所有挂单快照（入场单 + 保护单，用于UI展示）"""
+        """直接从交易所拉取 openOrders，确保与交易所一致"""
         snapshots: List[dict] = []
-        
-        # ── 入场挂单 ──
-        for o in self._entry_stop_orders:
-            expire_bar = int(o.get("expire_bar", -1))
-            remaining_bars = None
-            if current_bar_idx is not None and expire_bar >= 0:
-                remaining_bars = max(0, expire_bar - int(current_bar_idx))
-            snapshots.append({
-                "order_id": o.get("order_id"),
-                "client_id": o.get("client_id", ""),
-                "side": o.get("side", "-"),
-                "trigger_price": float(o.get("trigger_price", 0.0) or 0.0),
-                "quantity": float(o.get("quantity", 0.0) or 0.0),
-                "start_bar": int(o.get("start_bar", -1)),
-                "expire_bar": expire_bar,
-                "remaining_bars": remaining_bars,
-                "template_fingerprint": o.get("template_fingerprint") or "-",
-                "entry_similarity": float(o.get("entry_similarity", 0.0) or 0.0),
-                "status": "入场挂单",
-                "take_profit": o.get("take_profit"),
-                "stop_loss": o.get("stop_loss"),
-            })
-        
-        # ── 阶梯式止盈/止损保护单（_staged_orders，交易所实际挂单）──
+        try:
+            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+        except Exception as e:
+            print(f"[BinanceTrader] ⚠ 拉取委托单失败: {e}")
+            return snapshots
+
         pos = self.current_position
-        if pos and self._staged_orders:
-            exit_side = "SELL" if pos.side == OrderSide.LONG else "BUY"
-            for so in self._staged_orders:
-                if so.get("filled"):
-                    continue
-                stype = so.get("type", "")
-                snum = so.get("stage", 0)
-                lbl = "止盈" if stype == "TP" else "止损"
+        for o in open_orders:
+            status = str(o.get("status", "")).upper()
+            if status not in ("NEW", "PARTIALLY_FILLED"):
+                continue
+            oid = int(o.get("orderId", 0) or 0)
+            cid = str(o.get("clientOrderId", ""))
+            otype = str(o.get("type", ""))
+            side = str(o.get("side", ""))
+            qty = float(o.get("origQty", 0.0) or 0.0)
+            price = float(o.get("price", 0.0) or 0.0)
+            stop_price = float(o.get("stopPrice", 0.0) or 0.0)
+            trigger_price = stop_price if stop_price > 0 else price
+            reduce_only = str(o.get("reduceOnly", "false")).lower() == "true"
+
+            # 入场单
+            if ("ENTRY" in cid) and not reduce_only:
                 snapshots.append({
-                    "order_id": so.get("order_id"),
-                    "client_id": f"R3000_{stype}{snum}",
-                    "side": exit_side,
-                    "trigger_price": float(so.get("price", 0.0) or 0.0),
-                    "quantity": float(so.get("quantity", 0.0) or 0.0),
+                    "order_id": oid,
+                    "client_id": cid,
+                    "side": side,
+                    "trigger_price": trigger_price,
+                    "quantity": qty,
                     "start_bar": -1,
                     "expire_bar": -1,
                     "remaining_bars": None,
-                    "template_fingerprint": f"{lbl}第{snum}档",
+                    "template_fingerprint": "-",
                     "entry_similarity": 0.0,
-                    "status": f"🎯{lbl}" if stype == "TP" else f"🛡️{lbl}",
-                    "entry_price": pos.entry_price,
-                    "order_type": "tp" if stype == "TP" else "sl",
+                    "status": "入场挂单",
+                    "take_profit": None,
+                    "stop_loss": None,
                 })
-        else:
-            # ── 旧版单档保护单（兼容）──
-            pos = self.current_position
-            if self._exchange_sl_order_id and self._exchange_sl_order_id > 0:
-                exit_side = "BUY" if (pos and pos.side == OrderSide.SHORT) else "SELL"
+                continue
+
+            # 止盈/止损保护单（reduceOnly 或 clientId 含 TP/SL）
+            if reduce_only or "TP" in cid or "SL" in cid or ("R3000" in cid and "ENTRY" not in cid):
+                is_tp = "TP" in cid or otype == "TAKE_PROFIT_MARKET"
+                if not is_tp and pos and trigger_price > 0:
+                    if pos.side == OrderSide.LONG:
+                        is_tp = trigger_price > pos.entry_price
+                    else:
+                        is_tp = trigger_price < pos.entry_price
+                lbl = "止盈" if is_tp else "止损"
+                stage = 0
+                for s in ("1", "2", "3"):
+                    if f"TP{s}" in cid or f"SL{s}" in cid:
+                        stage = int(s)
+                        break
+                template = f"{lbl}第{stage}档" if stage > 0 else f"{lbl}保护"
                 snapshots.append({
-                    "order_id": self._exchange_sl_order_id,
-                    "client_id": "R3000_SL",
-                    "side": exit_side,
-                    "trigger_price": self._exchange_sl_price,
-                    "quantity": pos.quantity if pos else 0.0,
-                    "start_bar": -1, "expire_bar": -1, "remaining_bars": None,
-                    "template_fingerprint": "止损保护",
+                    "order_id": oid,
+                    "client_id": cid,
+                    "side": side,
+                    "trigger_price": trigger_price,
+                    "quantity": qty,
+                    "start_bar": -1,
+                    "expire_bar": -1,
+                    "remaining_bars": None,
+                    "template_fingerprint": template,
                     "entry_similarity": 0.0,
-                    "status": "🛡️止损",
+                    "status": f"🎯{lbl}" if is_tp else f"🛡️{lbl}",
                     "entry_price": pos.entry_price if pos else None,
-                    "order_type": "sl",
+                    "order_type": "tp" if is_tp else "sl",
                 })
-            if self._exchange_tp_order_id and self._exchange_tp_order_id > 0:
-                exit_side = "BUY" if (pos and pos.side == OrderSide.SHORT) else "SELL"
-                snapshots.append({
-                    "order_id": self._exchange_tp_order_id,
-                    "client_id": "R3000_TP",
-                    "side": exit_side,
-                    "trigger_price": self._exchange_tp_price,
-                    "quantity": pos.quantity if pos else 0.0,
-                    "start_bar": -1, "expire_bar": -1, "remaining_bars": None,
-                    "template_fingerprint": "止盈保护",
-                    "entry_similarity": 0.0,
-                    "status": "🎯止盈",
-                    "entry_price": pos.entry_price if pos else None,
-                    "order_type": "tp",
-                })
-        
         return snapshots
 
     def open_position(self,
@@ -1661,13 +1688,14 @@ class BinanceTestnetTrader:
             else:
                 entry_fee = (executed_qty * avg_price) * 0.0005  # Taker费率
 
-        kelly_pct = position_size_pct if position_size_pct is not None else 0.0
+        kelly_pct = position_size_pct if position_size_pct is not None else self.position_size_pct
         order = PaperOrder(
             order_id=str(resp.get("orderId", self._new_client_order_id("ENTRY_LOCAL"))),
             symbol=self.symbol,
             side=side,
             quantity=executed_qty,
             margin_used=margin_used,
+            leverage=self.leverage,
             entry_price=avg_price,
             entry_time=datetime.now(),
             entry_bar_idx=bar_idx,
