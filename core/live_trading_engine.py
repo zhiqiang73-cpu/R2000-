@@ -284,8 +284,8 @@ class LiveTradingEngine:
             realtime_emit_interval=PAPER_TRADING_CONFIG.get("REALTIME_DECISION_SEC", 0.05),
         )
         
-        # 执行参数固定：每次开仓 50% 仓位，杠杆固定由配置控制（当前 20x）
-        self.fixed_position_size_pct = 0.5
+        # 执行参数固定：默认仓位比例（凯利启用时会覆盖为动态仓位）
+        self.fixed_position_size_pct = float(PAPER_TRADING_CONFIG.get("POSITION_SIZE_PCT", 0.1)) (绋宠禋鐗堟湰: 闃舵鍩哄噯姝㈢泩姝㈡崯绯荤粺)
         default_lev = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
         self.fixed_leverage = default_lev
 
@@ -4063,17 +4063,27 @@ class LiveTradingEngine:
                 
                 self._adaptive_controller.on_trade_closed_simple(order, market_regime)
                 
-                # 更新杠杆到交易器（仅当 LEVERAGE_ADAPTIVE=True）
-                from config import PAPER_TRADING_CONFIG as _ptc
-                if _ptc.get("LEVERAGE_ADAPTIVE", False) and self._adaptive_controller.kelly_adapter:
-                    new_leverage = self._adaptive_controller.kelly_adapter.leverage
-                    if new_leverage and new_leverage != self._paper_trader.leverage:
-                        old_leverage = self._paper_trader.leverage
+                # 更新杠杆到交易器（仅 LEVERAGE_ADAPTIVE=True 时）
+                from config import PAPER_TRADING_CONFIG as _ptc_lev
+                if _ptc_lev.get("LEVERAGE_ADAPTIVE", False):
+                    if self._adaptive_controller.kelly_adapter:
+                        new_leverage = self._adaptive_controller.kelly_adapter.leverage
+                        if new_leverage and new_leverage != self._paper_trader.leverage:
+                            old_leverage = self._paper_trader.leverage
+                            try:
+                                self._paper_trader.set_leverage(int(new_leverage))
+                                print(f"[LiveEngine] 杠杆已调整: {old_leverage}x -> {new_leverage}x")
+                            except Exception as e:
+                                print(f"[LiveEngine] 更新杠杆失败: {e}")
+                else:
+                    # 固定杠杆模式：确保交易所与配置一致，平仓后重新同步
+                    cfg_leverage = int(_ptc_lev.get("LEVERAGE_DEFAULT", 20))
+                    if self._paper_trader.leverage != cfg_leverage:
                         try:
-                            self._paper_trader.set_leverage(int(new_leverage))
-                            print(f"[LiveEngine] 杠杆已调整: {old_leverage}x -> {new_leverage}x")
+                            self._paper_trader.set_leverage(cfg_leverage)
+                            print(f"[LiveEngine] 固定杠杆同步: {cfg_leverage}x")
                         except Exception as e:
-                            print(f"[LiveEngine] 更新杠杆失败: {e}")
+                            print(f"[LiveEngine] 同步固定杠杆失败: {e}")
             except Exception as e:
                 print(f"[LiveEngine] 自适应控制器记录失败: {e}")
         
