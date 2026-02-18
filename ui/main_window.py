@@ -26,6 +26,7 @@ from ui.analysis_panel import AnalysisPanel
 from ui.optimizer_panel import OptimizerPanel
 from ui.paper_trading_tab import PaperTradingTab
 from ui.adaptive_learning_tab import AdaptiveLearningTab
+from ui.signal_analysis_tab import SignalAnalysisTab
 from core.adaptive_controller import AdaptiveController, TradeContext as AdaptiveTradeContext
 from core.deepseek_reviewer import DeepSeekReviewer, TradeContext as DeepSeekTradeContext
 
@@ -688,6 +689,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             print(f"[UI] 初始化冷启动面板失败: {e}")
         
+        # ============ Tab 4: 信号分析 ============
+        self.signal_analysis_tab = SignalAnalysisTab()
+        self.main_tabs.addTab(self.signal_analysis_tab, "🔍 信号分析")
+        # "换新数据再验证"按钮 → 触发重新加载不同时间段的数据
+        self.signal_analysis_tab.request_new_data.connect(self._on_signal_request_new_data)
+
         # 连接删除交易记录信号
         self.paper_trading_tab.trade_log.delete_trade_signal.connect(self._on_trade_delete_requested)
         
@@ -912,6 +919,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.control_panel.set_status(f"已加载 {len(self.df):,} 根 K 线")
             self.control_panel.set_buttons_enabled(True)
             self.statusBar().showMessage(f"数据加载完成: {len(self.df):,} 根 K 线 | {start_time} 至 {end_time}")
+            # 将历史K线数据传入信号分析页签
+            try:
+                self.signal_analysis_tab.set_data(self.df)
+            except Exception as e:
+                print(f"[MainWindow] 传递数据到信号分析页签失败: {e}")
             self._sampling_in_progress = False
         except Exception as e:
             self._on_worker_error(str(e) + "\n" + traceback.format_exc())
@@ -923,6 +935,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.control_panel.set_buttons_enabled(True)
             self.control_panel.set_status("数据加载中断，请重试")
             self.statusBar().showMessage("数据加载中断：未收到完成回调")
+
+    def _on_signal_request_new_data(self):
+        """
+        信号分析页签请求加载新一批历史数据（不同时间段的 50000 根 K 线）。
+        以随机种子触发重新采样，完成后 _on_sample_finished 会自动调用
+        signal_analysis_tab.set_data()，再由 set_data() 自动启动分析。
+        """
+        import random as _random
+        sample_size = DATA_CONFIG.get("SAMPLE_SIZE", 50000)
+        random_seed = _random.randint(0, 999999)
+        self.statusBar().showMessage(f"正在加载新一批历史数据（种子={random_seed}）...")
+        self._on_sample_requested(sample_size, random_seed)
 
     def _on_worker_error(self, error_msg: str):
         """通用后台任务错误处理"""

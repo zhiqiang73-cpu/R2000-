@@ -139,6 +139,8 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 indicator_snapshots_during_hold=t.get("indicator_snapshots_during_hold", []),
                 # 凯利动态仓位
                 kelly_position_pct=float(t.get("kelly_position_pct", 0)),
+                # 信号组合跟踪
+                signal_combo_keys=t.get("signal_combo_keys", []) or [],
             )
             loaded.append(order)
         return loaded
@@ -249,7 +251,10 @@ class PaperOrder:
     
     # 凯利动态仓位（用于自适应学习）
     kelly_position_pct: float = 0.0  # 凯利公式计算的仓位比例（0-1）
-    
+
+    # 信号组合跟踪（用于实盘命中率统计）
+    signal_combo_keys: List[str] = field(default_factory=list)  # 开仓时触发的组合key列表
+
     def update_pnl(self, current_price: float, leverage: float = 10):
         """更新未实现盈亏 + 追踪峰值"""
         if self.status != OrderStatus.FILLED:
@@ -342,6 +347,8 @@ class PaperOrder:
             "indicator_snapshots_during_hold": self.indicator_snapshots_during_hold,
             # 凯利动态仓位
             "kelly_position_pct": self.kelly_position_pct,
+            # 信号组合跟踪
+            "signal_combo_keys": self.signal_combo_keys,
         }
 
 

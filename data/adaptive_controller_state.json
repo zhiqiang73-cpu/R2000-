@@ -1,13 +1,13 @@
 {
-  "created_at": 1771150913.6776943,
-  "last_save_time": 1771275135.6307979,
+  "created_at": 1771400629.3998418,
+  "last_save_time": 1771400629.3998418,
   "parameters": {},
   "parameter_history": [],
   "stats": {
-    "total_trades": 40,
+    "total_trades": 5,
     "consecutive_losses": 0,
-    "consecutive_wins": 5,
-    "last_trade_time": "2026-02-17T04:52:15.630762",
+    "consecutive_wins": 1,
+    "last_trade_time": "2026-02-18T15:43:49.399695",
     "per_regime_stats": {}
   },
   "feature_db": {
@@ -16,25 +16,9 @@
   },
   "regime_adapter": {
     "regime_accuracy": {
-      "强空头": {
-        "correct": 2,
-        "wrong": 3
-      },
-      "震荡偏空": {
-        "correct": 19,
-        "wrong": 0
-      },
       "震荡偏多": {
-        "correct": 8,
-        "wrong": 1
-      },
-      "弱空头": {
-        "correct": 0,
-        "wrong": 1
-      },
-      "强多头": {
-        "correct": 0,
-        "wrong": 1
+        "correct": 5,
+        "wrong": 0
       }
     },
     "misclassification_patterns": [],
@@ -45,12 +29,33 @@
   },
   "kelly_adapter": {
     "kelly_fraction_stats": {
-      "1.0": {
-        "trades": 10,
-        "total_profit": 60.642683828037015,
-        "wins": 6,
-        "losses": 4,
-        "max_drawdown": 13.80451893954538
+      "0.5": {
+        "trades": 2,
+        "total_profit": -12.417602539228305,
+        "wins": 0,
+        "losses": 2,
+        "max_drawdown": 0.0
+      },
+      "0.4975": {
+        "trades": 1,
+        "total_profit": -5.8327926049419885,
+        "wins": 0,
+        "losses": 1,
+        "max_drawdown": 0.0
+      },
+      "0.4950125": {
+        "trades": 1,
+        "total_profit": -5.8327926049419885,
+        "wins": 0,
+        "losses": 1,
+        "max_drawdown": 0.0
+      },
+      "0.4925374375": {
+        "trades": 1,
+        "total_profit": 6.597112855077023,
+        "wins": 1,
+        "losses": 0,
+        "max_drawdown": 0.0
       }
     },
     "position_distribution": [
@@ -58,73 +63,104 @@
       0.05,
       0.05,
       0.05,
-      0.05,
-      0.05,
-      0.05,
-      0.05,
-      0.20456209731680558,
-      0.20456209731680558
+      0.054000000000000006
     ],
-    "kelly_fraction": null,
+    "kelly_fraction": 0.49007475031250003,
     "kelly_max": null,
-    "kelly_min": null,
-    "leverage": 30,
+    "kelly_min": 0.05500000000000001,
+    "leverage": null,
     "adjustment_history": [
       {
-        "timestamp": "2026-02-17T00:45:44.862528",
-        "parameter": "LEVERAGE",
-        "old_value": 20.0,
-        "new_value": 22.0,
-        "delta": 2.0,
-        "reason": "每笔调整: 本笔盈亏+6.60% → 放大"
+        "timestamp": "2026-02-18T11:27:05.667504",
+        "parameter": "KELLY_MIN",
+        "old_value": 0.05,
+        "new_value": 0.051000000000000004,
+        "delta": 0.0010000000000000009,
+        "delta_pct": 2.0000000000000018,
+        "reason": "基于仓位分布调整 (平均仓位: 5.0%)"
       },
       {
-        "timestamp": "2026-02-17T01:16:44.490647",
-        "parameter": "LEVERAGE",
-        "old_value": 22.0,
-        "new_value": 24.0,
-        "delta": 2.0,
-        "reason": "每笔调整: 本笔盈亏+14.95% → 放大"
+        "timestamp": "2026-02-18T11:27:05.974800",
+        "parameter": "KELLY_FRACTION",
+        "old_value": 0.5,
+        "new_value": 0.4975,
+        "delta": -0.0025000000000000022,
+        "delta_pct": -0.5000000000000004,
+        "reason": "基于表现调整 (平均收益: -6.21%, 回撤: 0.0%)"
       },
       {
-        "timestamp": "2026-02-17T03:54:03.891614",
-        "parameter": "LEVERAGE",
-        "old_value": 24.0,
-        "new_value": 26.0,
-        "delta": 2.0,
-        "reason": "每笔调整: 本笔盈亏+23.53% → 放大"
+        "timestamp": "2026-02-18T11:27:05.974831",
+        "parameter": "KELLY_MIN",
+        "old_value": 0.051000000000000004,
+        "new_value": 0.052000000000000005,
+        "delta": 0.0010000000000000009,
+        "delta_pct": 1.960784313725492,
+        "reason": "基于仓位分布调整 (平均仓位: 5.0%)"
       },
       {
-        "timestamp": "2026-02-17T04:28:28.597653",
-        "parameter": "LEVERAGE",
-        "old_value": 26.0,
-        "new_value": 28.0,
-        "delta": 2.0,
-        "reason": "每笔调整: 本笔盈亏+6.48% → 放大"
+        "timestamp": "2026-02-18T12:32:59.811274",
+        "parameter": "KELLY_FRACTION",
+        "old_value": 0.4975,
+        "new_value": 0.4950125,
+        "delta": -0.002487499999999976,
+        "delta_pct": -0.49999999999999517,
+        "reason": "基于表现调整 (平均收益: -6.08%, 回撤: 0.0%)"
       },
       {
-        "timestamp": "2026-02-17T04:52:15.630773",
-        "parameter": "LEVERAGE",
-        "old_value": 28.0,
-        "new_value": 30.0,
-        "delta": 2.0,
-        "reason": "每笔调整: 本笔盈亏+14.51% → 放大"
+        "timestamp": "2026-02-18T12:32:59.811303",
+        "parameter": "KELLY_MIN",
+        "old_value": 0.052000000000000005,
+        "new_value": 0.053000000000000005,
+        "delta": 0.0010000000000000009,
+        "delta_pct": 1.9230769230769247,
+        "reason": "基于仓位分布调整 (平均仓位: 5.0%)"
+      },
+      {
+        "timestamp": "2026-02-18T12:32:59.979652",
+        "parameter": "KELLY_FRACTION",
+        "old_value": 0.4950125,
+        "new_value": 0.4925374375,
+        "delta": -0.0024750625000000137,
+        "delta_pct": -0.5000000000000028,
+        "reason": "基于表现调整 (平均收益: -6.02%, 回撤: 0.0%)"
+      },
+      {
+        "timestamp": "2026-02-18T12:32:59.979826",
+        "parameter": "KELLY_MIN",
+        "old_value": 0.053000000000000005,
+        "new_value": 0.054000000000000006,
+        "delta": 0.0010000000000000009,
+        "delta_pct": 1.88679245283019,
+        "reason": "基于仓位分布调整 (平均仓位: 5.0%)"
+      },
+      {
+        "timestamp": "2026-02-18T15:43:49.399790",
+        "parameter": "KELLY_FRACTION",
+        "old_value": 0.4925374375,
+        "new_value": 0.49007475031250003,
+        "delta": -0.002462687187499979,
+        "delta_pct": -0.4999999999999958,
+        "reason": "基于表现调整 (平均收益: -3.50%, 回撤: 0.0%)"
+      },
+      {
+        "timestamp": "2026-02-18T15:43:49.399827",
+        "parameter": "KELLY_MIN",
+        "old_value": 0.054000000000000006,
+        "new_value": 0.05500000000000001,
+        "delta": 0.0010000000000000009,
+        "delta_pct": 1.8518518518518532,
+        "reason": "基于仓位分布调整 (平均仓位: 5.1%)"
       }
     ],
     "recent_performance": [
-      0.4669803198926016,
-      -0.9117386853380707,
-      -1.4010779992544349,
-      -0.7447747785542824,
-      -2.8380365678933375,
-      6.598558795652341,
-      14.954644095046504,
-      23.52998370164444,
-      6.477263705533633,
-      14.510881241307622
+      -6.208801269614153,
+      -6.208801269614153,
+      -5.8327926049419885,
+      -5.8327926049419885,
+      6.597112855077023
     ],
-    "drawdown_tracker": 7.301144378129447,
-    "peak_capital": 6176.4991850822225
+    "drawdown_tracker": 0.0,
+    "peak_capital": 5329.8556427538515
   },
   "diagnosis_history": [],
   "current_learning_rate": 0.05,

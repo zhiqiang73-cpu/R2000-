@@ -333,6 +333,10 @@ class LiveTradingEngine:
         self._last_raw_regime: Optional[str] = None  # 最近一次原始（未确认）市场状态，供反转检测使用
         self._last_tpsl_atr: Optional[float] = None   # 上次重算 TP/SL 时的 ATR，用于 ATR 变化时重算
         
+        # 信号组合实盘监控（懒加载）
+        self._signal_live_monitor = None   # type: Optional[object]
+        self._pending_signal_combos: List[str] = []
+
         # 线程控制
         self._running = False
         self._lock = threading.Lock()
@@ -1350,6 +1354,18 @@ class LiveTradingEngine:
         
         # 特征更新后刷新指标灯状态，确保 UI 与后续门控使用相同数据
         self._update_indicator_state()
+
+        # 信号组合实盘监控：检测当前K线触发哪些已知组合
+        try:
+            if self._signal_live_monitor is None:
+                from core.signal_live_monitor import SignalLiveMonitor
+                self._signal_live_monitor = SignalLiveMonitor()
+            if self._df_buffer is not None and len(self._df_buffer) > 0:
+                self._pending_signal_combos = self._signal_live_monitor.on_bar(
+                    self._df_buffer, self._current_bar_idx
+                )
+        except Exception as _e:
+            self._pending_signal_combos = []
         
         # 事后评估被拒绝的交易（门控自适应学习）
         if self._rejection_tracker:
@@ -4056,12 +4072,26 @@ class LiveTradingEngine:
                     current_regime = self._confirm_market_regime()
                     if current_regime and current_regime != "未知":
                         order.regime_at_entry = current_regime
+                # 首次成交时打标信号组合（仅在列表为空时写入，避免重复）
+                if not getattr(order, 'signal_combo_keys', None):
+                    order.signal_combo_keys = list(self._pending_signal_combos)
         except Exception as e:
             print(f"[LiveEngine] 入场状态回填失败: {e}")
     
     def _on_trade_closed_internal(self, order: PaperOrder):
         """交易关闭内部回调 — 安全网，确保任何平仓路径都能清理状态"""
-        
+
+        # 【信号组合实盘命中率】记录本次交易结果到 signal_store
+        try:
+            combo_keys = getattr(order, 'signal_combo_keys', None) or []
+            if combo_keys:
+                from core import signal_store
+                hit = (getattr(order, 'profit_pct', 0.0) or 0.0) > 0
+                for _key in combo_keys:
+                    signal_store.record_live_result(_key, hit)
+        except Exception as _e:
+            print(f"[LiveEngine] signal_store.record_live_result 失败: {_e}")
+
         # 【自适应学习】捕获出场决策快照
         if self._adaptive_controller and self._df_buffer is not None and len(self._df_buffer) > 0:
             try:
