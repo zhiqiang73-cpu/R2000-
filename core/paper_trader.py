@@ -550,7 +550,8 @@ class PaperTrader:
                       template_fingerprint: Optional[str] = None,
                       entry_similarity: float = 0.0,
                       entry_reason: str = "",
-                      entry_trajectory: Optional[np.ndarray] = None) -> Optional[PaperOrder]:
+                      entry_trajectory: Optional[np.ndarray] = None,
+                      regime_at_entry: str = "未知") -> Optional[PaperOrder]:
         """
         开仓 (市价/直接成交)
         
@@ -576,7 +577,8 @@ class PaperTrader:
             side=side, price=actual_price, qty=quantity, margin=margin,
             bar_idx=bar_idx, tp=take_profit, sl=stop_loss,
             fp=template_fingerprint, sim=entry_similarity, reason=entry_reason,
-            trajectory=entry_trajectory
+            trajectory=entry_trajectory,
+            regime_at_entry=regime_at_entry,
         )
 
     def place_stop_order(self,
@@ -590,7 +592,8 @@ class PaperTrader:
                         entry_reason: str = "",
                         timeout_bars: int = 5,
                         entry_trajectory: Optional[np.ndarray] = None,
-                        position_size_pct: Optional[float] = None) -> str:
+                        position_size_pct: Optional[float] = None,
+                        regime_at_entry: str = "未知") -> str:
         """
         放置条件触发单 (Stop Order)
         
@@ -614,6 +617,7 @@ class PaperTrader:
             "reason": entry_reason,
             "trajectory": entry_trajectory,  # 【指纹3D图】轨迹矩阵
             "position_size_pct": position_size_pct,  # 凯利动态仓位
+            "regime_at_entry": regime_at_entry,
         }
         
         self.pending_stop_orders.append(stop_order)
@@ -685,7 +689,8 @@ class PaperTrader:
 
     def _create_filled_order(self, side, price, qty, margin, bar_idx, tp, sl, fp, sim, reason,
                               trajectory: Optional[np.ndarray] = None,
-                              kelly_position_pct: float = 0.0) -> PaperOrder:
+                              kelly_position_pct: float = 0.0,
+                              regime_at_entry: str = "未知") -> PaperOrder:
         """辅助方法：创建已成交订单对象
         
         Args:
@@ -712,6 +717,7 @@ class PaperTrader:
             peak_price=price,  # 初始峰值 = 入场价
             entry_trajectory=trajectory,  # 【指纹3D图】轨迹矩阵
             kelly_position_pct=kelly_position_pct,  # 凯利动态仓位
+            regime_at_entry=regime_at_entry,
         )
         self.current_position = order
         self.current_bar_idx = bar_idx
@@ -845,7 +851,8 @@ class PaperTrader:
                 bar_idx=effective_bar_idx, tp=o["tp"], sl=o["sl"],
                 fp=o["fp"], sim=o["sim"], reason=o["reason"],
                 trajectory=o.get("trajectory"),  # 【指纹3D图】传递轨迹矩阵
-                kelly_position_pct=kelly_pct or 0.0  # 凯利仓位（用于学习）
+                kelly_position_pct=kelly_pct or 0.0,  # 凯利仓位（用于学习）
+                regime_at_entry=o.get("regime_at_entry", "未知"),
             )
     
     def update_tracking_status(self, similarity: float,

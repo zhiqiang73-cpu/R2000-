@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.live_data_feed import LiveDataFeed, KlineData
 from config import PAPER_TRADING_CONFIG, COLD_START_CONFIG
-from core.paper_trader import PaperOrder, OrderSide, CloseReason
+from core.paper_trader import PaperOrder, OrderSide, CloseReason, OrderStatus
 from core.binance_testnet_trader import BinanceTestnetTrader
 from core.market_regime import MarketRegimeClassifier, MarketRegime
 from core.labeler import SwingPoint
@@ -1721,7 +1721,8 @@ class LiveTradingEngine:
             template_fingerprint="REVERSE",
             entry_similarity=0.0,
             entry_reason=reason,
-            timeout_bars=timeout
+            timeout_bars=timeout,
+            regime_at_entry=self.state.market_regime,
         )
         
         if order_id:
@@ -1801,7 +1802,8 @@ class LiveTradingEngine:
             template_fingerprint=flip_fp or "FLIP",
             entry_similarity=flip_sim,
             entry_reason=reason,
-            timeout_bars=timeout
+            timeout_bars=timeout,
+            regime_at_entry=self.state.market_regime,
         )
         
         if order_id:
@@ -2535,6 +2537,9 @@ class LiveTradingEngine:
                     kw in str(self.state.market_regime) for kw in ["强多头", "弱多头", "强空头", "弱空头"]
                 )
                 bayes_gate_enabled = PAPER_TRADING_CONFIG.get("BAYESIAN_GATE_ENABLED", True)
+                bayes_probe_enabled = PAPER_TRADING_CONFIG.get("BAYESIAN_PROBE_ENABLED", False)
+                bayes_probe_position = PAPER_TRADING_CONFIG.get("BAYESIAN_PROBE_POSITION_PCT", 0.05)
+                forced_position_pct = None
                 if (
                     bayes_gate_enabled
                     and self._bayesian_enabled
@@ -2546,42 +2551,52 @@ class LiveTradingEngine:
                         market_regime=self.state.market_regime,
                     )
                     if not should_trade:
-                        reject_diag = self._fmt_reject_diag(
-                            candidate_dir=direction,
-                            pos_score=self.state.position_score if self.state.position_score != 0 else None,
-                            threshold=None,
-                            regime=self.state.market_regime,
-                            gate_stage="bayesian_gate",
-                            fail_code="BLOCK_BAYES",
-                        )
-                        self.state.last_event = f"[贝叶斯拒绝] {bay_reason} | {reject_diag}"
-                        self.state.decision_reason = (
-                            f"[贝叶斯过滤] 原型={chosen_fp} 市场={self.state.market_regime} | "
-                            f"{bay_reason} | {reject_diag}"
-                        )
-                        # 【指纹3D图】更新多维相似度状态
-                        self._update_similarity_state(
-                            similarity, chosen_fp, chosen_match_result, chosen_proto
-                        )
-                        print(f"[LiveEngine] ⛔ 贝叶斯拒绝: {chosen_fp} | {bay_reason} | {reject_diag}")
-                        # 记录拒绝（门控自适应学习）
-                        if self._rejection_tracker:
-                            self._rejection_tracker.record_rejection(
-                                price=price,
-                                direction=direction,
-                                fail_code="BLOCK_BAYES",
-                                gate_stage="bayesian_gate",
-                                market_regime=self.state.market_regime,
-                                bar_idx=self._current_bar_idx,
-                                detail={
-                                    "predicted_wr": predicted_wr,
-                                    "bay_reason": bay_reason,
-                                    "pos_score": self.state.position_score,
-                                    "similarity": similarity,
-                                    "fingerprint": chosen_fp,
-                                },
+                        if bayes_probe_enabled:
+                            forced_position_pct = float(bayes_probe_position or 0.0)
+                            self.state.bayesian_win_rate = predicted_wr
+                            self.state.last_event = f"[贝叶斯试探] {bay_reason} | 试探仓位 {forced_position_pct:.1%}"
+                            self.state.decision_reason = (
+                                f"[贝叶斯试探] 原型={chosen_fp} 市场={self.state.market_regime} | "
+                                f"{bay_reason} | 试探仓位 {forced_position_pct:.1%}"
                             )
-                        return
+                            print(f"[LiveEngine] ⚠️ 贝叶斯试探放行: {chosen_fp} | {bay_reason} | 仓位={forced_position_pct:.1%}")
+                        else:
+                            reject_diag = self._fmt_reject_diag(
+                                candidate_dir=direction,
+                                pos_score=self.state.position_score if self.state.position_score != 0 else None,
+                                threshold=None,
+                                regime=self.state.market_regime,
+                                gate_stage="bayesian_gate",
+                                fail_code="BLOCK_BAYES",
+                            )
+                            self.state.last_event = f"[贝叶斯拒绝] {bay_reason} | {reject_diag}"
+                            self.state.decision_reason = (
+                                f"[贝叶斯过滤] 原型={chosen_fp} 市场={self.state.market_regime} | "
+                                f"{bay_reason} | {reject_diag}"
+                            )
+                            # 【指纹3D图】更新多维相似度状态
+                            self._update_similarity_state(
+                                similarity, chosen_fp, chosen_match_result, chosen_proto
+                            )
+                            print(f"[LiveEngine] ⛔ 贝叶斯拒绝: {chosen_fp} | {bay_reason} | {reject_diag}")
+                            # 记录拒绝（门控自适应学习）
+                            if self._rejection_tracker:
+                                self._rejection_tracker.record_rejection(
+                                    price=price,
+                                    direction=direction,
+                                    fail_code="BLOCK_BAYES",
+                                    gate_stage="bayesian_gate",
+                                    market_regime=self.state.market_regime,
+                                    bar_idx=self._current_bar_idx,
+                                    detail={
+                                        "predicted_wr": predicted_wr,
+                                        "bay_reason": bay_reason,
+                                        "pos_score": self.state.position_score,
+                                        "similarity": similarity,
+                                        "fingerprint": chosen_fp,
+                                    },
+                                )
+                            return
                     else:
                         # 更新 state 中的贝叶斯胜率
                         self.state.bayesian_win_rate = predicted_wr
@@ -2628,6 +2643,12 @@ class LiveTradingEngine:
                         print(f"[LiveEngine] 📊 凯利仓位: {kelly_position_pct:.1%} | {kelly_reason}")
                     
                     # 更新 state 中的凯利仓位
+                    self.state.kelly_position_pct = kelly_position_pct
+
+                # 贝叶斯低胜率试探：强制使用小仓位
+                if forced_position_pct is not None:
+                    kelly_position_pct = forced_position_pct
+                    kelly_reason = f"贝叶斯低胜率试探，强制仓位 {kelly_position_pct:.1%}"
                     self.state.kelly_position_pct = kelly_position_pct
 
                 # D. 所有门控通过后，再决定是否替换已有挂单，避免链路中途换轨
@@ -2697,6 +2718,7 @@ class LiveTradingEngine:
                     ),  # 凯利动态仓位 / 翻转降级仓位上限
                     # 【指纹3D图】从匹配结果中提取轨迹矩阵用于后续增量训练
                     entry_trajectory=chosen_match_result.get("entry_trajectory") if chosen_match_result else None,
+                    regime_at_entry=self.state.market_regime,
                 )
                 
                 print(f"[LiveEngine] 🎯 挂限价单入场: {direction} @ {limit_price:.2f} "
@@ -3637,7 +3659,7 @@ class LiveTradingEngine:
         if self.state.holding_regime_change == "反转" and profit_pct >= -0.5:
             self.state.holding_exit_suggestion = "准备离场"
         elif sim < 0.3:
-            self.state.holding_exit_suggestion = "立即离场"
+            self.state.holding_exit_suggestion = "仅收紧止损"
         elif self.state.holding_regime_change in ("弱化·震荡", "反转") and profit_pct >= 1.0:
             self.state.holding_exit_suggestion = "部分止盈"
         elif self.state.holding_regime_change in ("弱化·震荡", "反转"):
@@ -3876,12 +3898,9 @@ class LiveTradingEngine:
             # 如果没有更具体的出场预估，使用默认
             if not self.state.exit_reason or similarity < self.hold_safe_threshold:
                 if similarity < self.hold_safe_threshold:
-                    self.state.exit_reason = f"相似度下降 ({similarity:.1%})，若跌破 {self.hold_derail_threshold:.1%} 触发【脱轨】。"
+                    self.state.exit_reason = f"相似度下降 ({similarity:.1%})，持仓进入警戒区，TP/SL硬保护继续生效。"
                 else:
                     self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
-            
-            if close_reason:
-                self._reset_position_state(self._build_exit_reason("脱轨", order))
             
         except Exception as e:
             import traceback
@@ -4030,7 +4049,15 @@ class LiveTradingEngine:
     
     def _on_order_update(self, order: PaperOrder):
         """订单更新回调"""
-        pass  # 由状态更新回调处理
+        try:
+            # 入场后再次确认市场状态并回填（避免 entry 时状态漂移）
+            if getattr(order, "status", None) == OrderStatus.FILLED:
+                if getattr(order, "regime_at_entry", "") in ("", "未知", None):
+                    current_regime = self._confirm_market_regime()
+                    if current_regime and current_regime != "未知":
+                        order.regime_at_entry = current_regime
+        except Exception as e:
+            print(f"[LiveEngine] 入场状态回填失败: {e}")
     
     def _on_trade_closed_internal(self, order: PaperOrder):
         """交易关闭内部回调 — 安全网，确保任何平仓路径都能清理状态"""
@@ -4135,15 +4162,16 @@ class LiveTradingEngine:
         if self._bayesian_enabled and self._bayesian_filter:
             # 提取原型指纹和市场状态
             proto_fp = getattr(order, 'template_fingerprint', None)
-            # 从开仓时的 entry_reason 提取市场状态（如果有）
-            entry_reason = getattr(order, 'entry_reason', '')
-            market_regime = "未知"
-            if "市场=" in entry_reason:
-                # 从 "[开仓] 市场=强空头 | SHORT | ..." 中提取
-                try:
-                    market_regime = entry_reason.split("市场=")[1].split("|")[0].strip()
-                except:
-                    pass
+            # 优先使用订单记录的入场市场状态，其次从 entry_reason 回退解析
+            market_regime = getattr(order, "regime_at_entry", "") or "未知"
+            if market_regime == "未知":
+                entry_reason = getattr(order, 'entry_reason', '')
+                if "市场=" in entry_reason:
+                    # 从 "[开仓] 市场=强空头 | SHORT | ..." 中提取
+                    try:
+                        market_regime = entry_reason.split("市场=")[1].split("|")[0].strip()
+                    except Exception:
+                        pass
             
             # 只更新有原型指纹的交易（反手单的 fingerprint="REVERSE" 不更新）
             # 翻转单(FLIP)也参与贝叶斯学习，且权重更高
@@ -4264,9 +4292,9 @@ class LiveTradingEngine:
                     detail={"reason": decision_reason},
                 )
         
-        # 冷启动系统 - 记录交易（用于频率统计）
+        # 冷启动系统 - 记录交易（频率统计 + 结果反馈，供自动毕业判断）
         if self._cold_start_manager:
-            self._cold_start_manager.record_trade()
+            self._cold_start_manager.record_trade(profit_pct=order.profit_pct)
             self._sync_cold_start_state()
         
         if self.on_trade_closed:
@@ -4482,9 +4510,9 @@ class LiveTradingEngine:
         peak_pct = getattr(order, "peak_profit_pct", 0.0)
         status = getattr(order, "tracking_status", "安全")
 
-        # 脱轨或相似度极低 → 立即离场（执行由 update_tracking_status 触发，这里仅建议）
+        # 相似度极低（脱轨区）→ 仅显示警告，平仓由阶梯TP/SL硬保护负责，不强制软件平仓
         if status == "脱轨" or sim < self.hold_derail_threshold:
-            return "立即离场", "建议减仓"
+            return "仅收紧止损", "建议减仓"
 
         # 反转 + 有盈利 → 部分止盈或准备离场
         if regime_change == "反转":

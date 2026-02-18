@@ -467,6 +467,15 @@ class MainWindow(QtWidgets.QMainWindow):
         refresh_ms = int(PAPER_TRADING_CONFIG.get("REALTIME_UI_REFRESH_MS", 1000))
         self._live_chart_timer.setInterval(max(50, refresh_ms))  # UI刷新频率
         self._live_chart_timer.timeout.connect(self._on_live_chart_tick)
+        # 高频数据流下的UI保护：把图表和重型状态更新限制在可控频率
+        self._live_chart_min_interval_sec = max(0.15, refresh_ms / 1000.0)
+        self._last_live_chart_refresh_ts = 0.0
+        self._live_chart_dirty = False
+        self._live_state_ui_interval_sec = max(0.20, refresh_ms / 1000.0)
+        self._last_live_state_ui_ts = 0.0
+        self._last_live_state_bar_count = -1
+        self._last_live_state_order_id = None
+        self._last_ui_state_event = ""
 
         # 自适应控制器和DeepSeek复盘
         self._adaptive_controller = AdaptiveController()
@@ -3438,6 +3447,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.paper_trading_tab.load_historical_trades(history[-10:])
                     self.paper_trading_tab.status_panel.append_event(f"成功恢复历史交易记录: 显示{display_count}笔 / 共{len(history)}笔")
                 
+                self._live_chart_dirty = True
+                self._last_live_chart_refresh_ts = 0.0
+                self._last_live_state_ui_ts = 0.0
+                self._last_live_state_bar_count = -1
+                self._last_live_state_order_id = None
+                self._last_ui_state_event = ""
                 self._live_chart_timer.start()
                 self._adaptive_dashboard_timer.start()
                 self._deepseek_poll_timer.start()
@@ -3477,6 +3492,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self._live_running = False
         self._live_chart_timer.stop()
+        self._live_chart_dirty = False
         
         # NEW: 停止自适应仪表板刷新
         self._adaptive_dashboard_timer.stop()
@@ -3660,6 +3676,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.paper_trading_tab.control_panel.update_price(state.current_price)
         self.paper_trading_tab.control_panel.update_bar_count(state.total_bars)
         self.paper_trading_tab.control_panel.update_position_direction(state.position_side)
+        # 重型UI分支节流：状态高频推送时，避免每次都刷新整套复杂面板
+        now = time.time()
+        current_order_id = None
+        if self._live_engine:
+            order_for_gate = self._live_engine.paper_trader.current_position
+            if order_for_gate is not None:
+                current_order_id = getattr(order_for_gate, "order_id", None)
+        bar_changed = (state.total_bars != self._last_live_state_bar_count)
+        order_changed = (current_order_id != self._last_live_state_order_id)
+        event_changed = ((getattr(state, "last_event", "") or "") != self._last_ui_state_event)
+        if (not bar_changed and not order_changed and not event_changed and
+                now - self._last_live_state_ui_ts < self._live_state_ui_interval_sec):
+            return
+        self._last_live_state_ui_ts = now
+        self._last_live_state_bar_count = state.total_bars
+        self._last_live_state_order_id = current_order_id
+        self._last_ui_state_event = (getattr(state, "last_event", "") or "")
         
         # 更新持仓
         if self._live_engine:
@@ -3974,14 +4007,15 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(object)
     def _update_live_chart(self, kline):
         """更新实时K线图表（主线程）"""
-        self._refresh_live_chart()
+        self._live_chart_dirty = True
+        self._refresh_live_chart(force=False)
 
     @QtCore.pyqtSlot()
     def _on_live_chart_tick(self):
         """1秒定时刷新K线图，保证时间流动感"""
         if not self._live_running:
             return
-        self._refresh_live_chart()
+        self._refresh_live_chart(force=True)
         
         # 冷启动面板定时刷新（节流：每5秒刷新一次）
         import time
@@ -4156,10 +4190,20 @@ class MainWindow(QtWidgets.QMainWindow):
             import traceback
             traceback.print_exc()
 
-    def _refresh_live_chart(self):
+    def _refresh_live_chart(self, force: bool = False):
         """统一刷新实时图表"""
         if not self._live_engine:
             return
+        now = time.time()
+        if not force:
+            if now - self._last_live_chart_refresh_ts < self._live_chart_min_interval_sec:
+                return
+        else:
+            # 定时器只在有新数据时刷新，避免空转重绘
+            if not self._live_chart_dirty:
+                return
+            if now - self._last_live_chart_refresh_ts < self._live_chart_min_interval_sec:
+                return
         
         try:
             # 获取历史K线数据
@@ -4208,7 +4252,8 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 # 无持仓时清除虚线
                 self.paper_trading_tab.chart_widget.set_tp_sl_lines(None, None)
-                
+            self._last_live_chart_refresh_ts = now
+            self._live_chart_dirty = False
         except Exception as e:
             print(f"[MainWindow] 更新实时图表失败: {e}")
     

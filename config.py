@@ -619,7 +619,7 @@ PAPER_TRADING_CONFIG = {
     # ── 价格动量衰减离场（新增）──
     # 当价格接近峰值但动能衰减时主动离场
     "MOMENTUM_EXIT_ENABLED": True,     # 是否启用动量衰减离场
-    "MOMENTUM_MIN_PROFIT_PCT": 1.5,    # 最低利润阈值（至少盈利1.5%才检测）
+    "MOMENTUM_MIN_PROFIT_PCT": 5.0,    # 最低利润阈值（至少盈利5%才检测，与TP1对齐，避免过早截断赢家）
     "MOMENTUM_LOOKBACK_BARS": 3,       # 动量检测回看K线数
     "MOMENTUM_DECAY_THRESHOLD": 0.5,   # K线实体缩小阈值（当前<峰值的50%视为衰减）
     "MOMENTUM_PEAK_RETRACEMENT": 0.8,  # 从峰值回撤阈值（回撤80%的利润触发）
@@ -663,13 +663,13 @@ PAPER_TRADING_CONFIG = {
     "EARLY_EXIT_STATE_FILE": "data/early_exit_state.json",
 
     # 实时决策频率（秒）
-    "REALTIME_DECISION_SEC": 0.05,
+    "REALTIME_DECISION_SEC": 0.30,
     # 是否允许在未收线K线中进行入场决策
     "REALTIME_ENTRY_ENABLED": True,
     # REST轮询频率（秒，过高可能被限流）
-    "REALTIME_REST_POLL_SEC": 0.05,
+    "REALTIME_REST_POLL_SEC": 0.80,
     # UI刷新频率（毫秒）
-    "REALTIME_UI_REFRESH_MS": 50,
+    "REALTIME_UI_REFRESH_MS": 300,
     
     # 数据目录
     "HISTORY_DIR": "data/paper_trading",
@@ -681,14 +681,17 @@ PAPER_TRADING_CONFIG = {
     
     # ── 贝叶斯数据收集（仅供凯利公式使用）──
     "BAYESIAN_ENABLED": True,              # 启用数据收集（凯利公式需要胜率和盈亏比数据）
-    "BAYESIAN_GATE_ENABLED": False,        # 禁用贝叶斯门控（不拦截交易）
+    "BAYESIAN_GATE_ENABLED": True,         # 启用贝叶斯门控（拦截实盘胜率过低的原型）
     "BAYESIAN_PRIOR_STRENGTH": 10.0,       # 先验强度（历史回测数据相当于多少笔实盘交易）
-    "BAYESIAN_MIN_WIN_RATE": 0.0,          # 门控已禁用（设为0=不拦截任何交易）
-    "BAYESIAN_THOMPSON_SAMPLING": False,   # 禁用 Thompson Sampling（不做门控）
+    "BAYESIAN_MIN_WIN_RATE": 0.40,         # 门控阈值：实盘后验胜率低于40%则拒绝入场
+    "BAYESIAN_THOMPSON_SAMPLING": False,   # 禁用 Thompson Sampling（使用后验均值做门控）
     "BAYESIAN_DECAY_ENABLED": True,        # 启用时间衰减（适应市场变化）
     "BAYESIAN_DECAY_HOURS": 24.0,          # 衰减间隔（小时）
     "BAYESIAN_DECAY_FACTOR": 0.95,         # 衰减因子（0-1，越小遗忘越快）
     "BAYESIAN_STATE_FILE": "data/bayesian_state.json",  # 持久化文件路径
+    # ── 低胜率试探（不关闭贝叶斯门控）──
+    "BAYESIAN_PROBE_ENABLED": True,        # 低于门控阈值仍允许小仓位试探
+    "BAYESIAN_PROBE_POSITION_PCT": 0.05,   # 试探仓位比例（建议=KELLY_MIN）
     
     # ── 位置评分阈值（方向化）──
     "POS_THRESHOLD_LONG": -30,         # LONG 位置评分阈值（低于此拒绝/翻转，-20太严→-30）

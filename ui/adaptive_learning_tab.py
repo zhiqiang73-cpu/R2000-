@@ -710,6 +710,7 @@ class AdaptiveLearningTab(QtWidgets.QWidget):
         con_layout.setSpacing(2)
         self.log_text = QtWidgets.QPlainTextEdit()
         self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(800)
         self.log_text.setStyleSheet("""
             QPlainTextEdit {
                 background-color: #0F1419;

@@ -368,7 +368,7 @@ class KellyAdapter:
             "trades": stats["trades"],
         }
     
-    def suggest_kelly_fraction_adjustment(self, min_trades: int = 1) -> Optional[float]:
+    def suggest_kelly_fraction_adjustment(self, min_trades: int = 2) -> Optional[float]:
         """
         建议 KELLY_FRACTION 调整
         
@@ -1048,9 +1048,8 @@ class AdaptiveController:
         # 8. 防死亡螺旋检查
         self._check_death_spiral()
         
-        # 9. 凯利参数自适应调整
-        if self.stats["total_trades"] % 10 == 0:
-            self.kelly_adapter.auto_adjust_parameters(self.current_learning_rate)
+        # 9. 凯利参数自适应调整（每笔交易后）
+        self.kelly_adapter.auto_adjust_parameters(self.current_learning_rate)
         
         # 10. 定期保存状态
         if self.stats["total_trades"] % 5 == 0:

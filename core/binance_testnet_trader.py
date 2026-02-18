@@ -90,6 +90,7 @@ class BinanceTestnetTrader:
         self._last_entry_side: Optional[OrderSide] = None
         self._last_entry_price: Optional[float] = None
         self._last_entry_ts: float = 0.0
+        self._last_entry_regime: str = "未知"
         # 交易所成交同步游标
         self._last_user_trade_id: int = 0
         self._last_user_trade_time_ms: int = 0
@@ -729,7 +730,8 @@ class BinanceTestnetTrader:
             entry_fp = None
             entry_sim = 0.0
             entry_reason = ""
-            entry_kelly_pct = self.position_size_pct
+            entry_kelly_pct = 0.0
+            entry_regime = "未知"
             if self._entry_stop_orders:
                 last_entry = self._entry_stop_orders[-1]
                 entry_tp = last_entry.get("take_profit")
@@ -738,6 +740,7 @@ class BinanceTestnetTrader:
                 entry_fp = last_entry.get("template_fingerprint")
                 entry_sim = float(last_entry.get("entry_similarity", 0.0) or 0.0)
                 entry_reason = last_entry.get("entry_reason", "")
+                entry_regime = last_entry.get("regime_at_entry", "未知") or "未知"
                 psp = last_entry.get("position_size_pct")
                 if psp is not None:
                     entry_kelly_pct = float(psp)
@@ -753,6 +756,7 @@ class BinanceTestnetTrader:
                     entry_tp = self._last_entry_tp
                     entry_sl = self._last_entry_sl
                     entry_bar_idx = self.current_bar_idx
+                    entry_regime = self._last_entry_regime or "未知"
 
             self.current_position = PaperOrder(
                 order_id="EXCHANGE_SYNC",
@@ -774,6 +778,7 @@ class BinanceTestnetTrader:
                 entry_reason=entry_reason,
                 leverage=leverage,
                 kelly_position_pct=entry_kelly_pct,
+                regime_at_entry=entry_regime,
             )
             
             # 【核心】新仓位同步后，如果有TP/SL，立即挂交易所保护单
@@ -1301,6 +1306,8 @@ class BinanceTestnetTrader:
         # 如果是 SL 成交，全平剩余，交易结束
         if filled_type == "SL":
             print(f"[BinanceTrader] 🛑 止损第{from_tier}档成交，全平剩余仓位，交易结束")
+            # 兜底：若交易所止损成交后仍残留小数点仓位，强制市价清理
+            self._force_close_remaining_position_if_any(reason=f"SL{from_tier}")
             self._staged_config = None
             self._staged_orders.clear()
             return
@@ -1727,7 +1734,8 @@ class BinanceTestnetTrader:
                          entry_reason: str = "",
                          timeout_bars: int = 5,
                          position_size_pct: Optional[float] = None,
-                         entry_trajectory=None) -> Optional[str]:
+                         entry_trajectory=None,
+                         regime_at_entry: str = "未知") -> Optional[str]:
         """
         放置限价开仓单 (LIMIT + GTC)
         在 trigger_price 挂限价单，等待价格触及成交（争取 Maker 0.02%）
@@ -1778,7 +1786,8 @@ class BinanceTestnetTrader:
                 "template_fingerprint": template_fingerprint,
                 "entry_similarity": entry_similarity,
                 "entry_reason": entry_reason,
-                "position_size_pct": pct_used,  # 实际使用仓位，同步建仓时回填到 order 供学习/UI显示
+                "position_size_pct": position_size_pct,  # 凯利仓位，同步建仓时回填到 order 供学习
+                "regime_at_entry": regime_at_entry,
             })
             # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
             self._last_entry_tp = take_profit
@@ -1786,6 +1795,7 @@ class BinanceTestnetTrader:
             self._last_entry_side = side
             self._last_entry_price = trigger_price
             self._last_entry_ts = time.time()
+            self._last_entry_regime = regime_at_entry or "未知"
         return order_id
 
     def get_pending_entry_orders_snapshot(self, current_bar_idx: int = None) -> List[dict]:
@@ -1872,7 +1882,8 @@ class BinanceTestnetTrader:
                       template_fingerprint: Optional[str] = None,
                       entry_similarity: float = 0.0,
                       entry_reason: str = "",
-                      position_size_pct: Optional[float] = None) -> Optional[PaperOrder]:
+                      position_size_pct: Optional[float] = None,
+                      regime_at_entry: str = "未知") -> Optional[PaperOrder]:
         self._sync_from_exchange(force=True)
         if self.current_position is not None:
             print("[BinanceTrader] 交易所已有持仓，跳过开仓")
@@ -1953,6 +1964,7 @@ class BinanceTestnetTrader:
             peak_price=avg_price,  # 初始峰值 = 入场价
             total_fee=entry_fee,
             kelly_position_pct=kelly_pct,
+            regime_at_entry=regime_at_entry,
         )
         # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
         self._last_entry_tp = take_profit
@@ -1960,6 +1972,7 @@ class BinanceTestnetTrader:
         self._last_entry_side = side
         self._last_entry_price = avg_price
         self._last_entry_ts = time.time()
+        self._last_entry_regime = regime_at_entry or "未知"
         self.current_position = order
         
         # 【核心】开仓后立即在交易所挂止盈止损保护单
@@ -2002,6 +2015,35 @@ class BinanceTestnetTrader:
             "newClientOrderId": self._new_client_order_id("FORCE"),
         })
         return resp
+
+    def _force_close_remaining_position_if_any(self, reason: str = "") -> None:
+        """止损触发后兜底清理残余小仓位（dust），避免剩余小数点持仓"""
+        try:
+            pos = self._get_position()
+            amt = float(pos.get("positionAmt", 0.0)) if pos else 0.0
+        except Exception:
+            amt = 0.0
+        if abs(amt) < max(self._qty_step, 1e-12):
+            return
+        close_qty = self._round_step(abs(amt), self._qty_step)
+        if close_qty <= 0:
+            return
+        exit_side = "SELL" if amt > 0 else "BUY"
+        q_prec = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
+        qty_str = f"{close_qty:.{q_prec}f}"
+        tag = f" ({reason})" if reason else ""
+        try:
+            print(f"[BinanceTrader] 🧹 触发兜底清仓{tag}: remaining={amt:.6f} -> close={qty_str}")
+            self._place_order({
+                "symbol": self.symbol,
+                "side": exit_side,
+                "type": "MARKET",
+                "reduceOnly": "true",
+                "quantity": qty_str,
+                "newClientOrderId": self._new_client_order_id("DUST_CLOSE"),
+            })
+        except Exception as e:
+            print(f"[BinanceTrader] ❌ 兜底清仓失败{tag}: {e}")
 
     def close_position(self,
                        price: float,

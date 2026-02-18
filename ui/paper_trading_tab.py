@@ -1486,8 +1486,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             ("分段止盈",      f"峰值 ≥ {tp1:.0f}% 减仓{r1:.0%}，≥ {tp2:.0f}% 再减{r1:.0%}"),
             ("分段止损",      f"亏损 ≥ {sl1:.0f}% 减仓{r1:.0%}，≥ {sl2:.0f}% 再减{r1:.0%}（与开仓硬止损并存）"),
             ("安全持仓",      f"相似度 ≥ {safe_th:.0%}"),
-            ("警戒",          f"相似度 {alert_th:.0%}~{safe_th:.0%}"),
-            ("脱轨平仓",      f"相似度 < {derail_th:.0%}"),
+            ("警戒",          f"相似度 {alert_th:.0%}~{safe_th:.0%}（收紧止损，不平仓）"),
             ("动能衰竭",      f"盈利 ≥ {mom_min:.1f}% 且 K线缩量{mom_decay:.0%}"),
             ("最大持仓",      f"{max_hold}根K线"),
         ]
@@ -2205,6 +2204,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # 实时日志（使用等宽字体，美化边框）
         self.event_log = QtWidgets.QPlainTextEdit()
         self.event_log.setReadOnly(True)
+        self.event_log.setMaximumBlockCount(800)
         self.event_log.setStyleSheet(f"""
             QPlainTextEdit {{
                 background-color: #1e1e1e;
@@ -2532,6 +2532,23 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
 
     def update_pending_orders(self, pending_orders: List[dict]):
         """更新委托单监控表（挂单中）"""
+        # 高频状态回调下避免重复全量重绘表格
+        signature = tuple(
+            (
+                str(o.get("order_type", "")),
+                str(o.get("side", "")),
+                round(float(o.get("trigger_price", 0.0) or 0.0), 4),
+                round(float(o.get("quantity", 0.0) or 0.0), 6),
+                str(o.get("status", "")),
+                str(o.get("template_fingerprint", "")),
+                round(float(o.get("take_profit", o.get("tp", 0.0)) or 0.0), 4),
+                round(float(o.get("stop_loss", o.get("sl", 0.0)) or 0.0), 4),
+            )
+            for o in (pending_orders or [])
+        )
+        if signature == getattr(self, "_last_pending_orders_signature", None):
+            return
+        self._last_pending_orders_signature = signature
         rows = len(pending_orders or [])
         self.pending_orders_table.setRowCount(rows)
         if rows == 0:

@@ -480,7 +480,9 @@ class ColdStartManager:
             with open(self._state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
-            self._state.enabled = data.get("enabled", False)
+            # 启动时始终遵从配置的 ENABLED_BY_DEFAULT，不恢复上次的 enabled 状态。
+            # 这样程序重启后冷启动总是"关闭"（除非用户在 UI 中手动开启）。
+            self._state.enabled = self._cold_config.get("ENABLED_BY_DEFAULT", False)
             self._state.last_trade_time = data.get("last_trade_time")
             self._state.trades_today = data.get("trades_today", 0)
             self._state.trades_today_date = data.get("trades_today_date")
