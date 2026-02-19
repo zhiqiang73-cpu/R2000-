@@ -60,13 +60,13 @@ class BinanceTestnetTrader:
         self.session = requests.Session()
         self._open_orders_cache = None
         self._open_orders_cache_ts = 0.0
-        self._open_orders_cache_ttl = 2.0
+        self._open_orders_cache_ttl = 10.0
         self._balance_cache_rows = None
         self._balance_cache_ts = 0.0
-        self._balance_cache_ttl = 5.0
+        self._balance_cache_ttl = 10.0
         self._position_cache_row = None
         self._position_cache_ts = 0.0
-        self._position_cache_ttl = 5.0
+        self._position_cache_ttl = 10.0
         self.session.headers.update({"X-MBX-APIKEY": self.api_key})
 
         self.stats = AccountStats(
@@ -89,7 +89,9 @@ class BinanceTestnetTrader:
         self._price_tick = 0.1
         self._min_notional = 5.0
         self._last_sync_ts = 0.0
-        self._sync_interval_sec = 2.0
+        self._sync_interval_sec = 10.0
+        self._rate_limit_until = 0.0
+        self._rate_limit_backoff_sec = 30.0
         self._pending_close = None  # (price, bar_idx, reason) 若离场失败则记录待重试
         # [{order_id, client_id, expire_bar, take_profit, stop_loss}]
         self._entry_stop_orders: List[dict] = []
@@ -148,6 +150,8 @@ class BinanceTestnetTrader:
         return hmac.new(self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def _signed_request(self, method: str, path: str, params: Optional[dict] = None) -> dict:
+        if time.time() < self._rate_limit_until:
+            raise Exception("Binance API rate limit cooldown active")
         params = dict(params or {})
         params["timestamp"] = self._timestamp()
         params["recvWindow"] = 5000
@@ -172,6 +176,8 @@ class BinanceTestnetTrader:
                 print(f"[BinanceAPI] ❌ {method} {path} 失败")
                 print(f"[BinanceAPI] 错误码: {error_code} | 消息: {error_msg}")
                 print(f"[BinanceAPI] 请求参数: {safe_params}")
+                if str(error_code) == "-1003" or "Too many requests" in str(error_msg):
+                    self._rate_limit_until = time.time() + self._rate_limit_backoff_sec
                 raise Exception(f"Binance API {error_code}: {error_msg}")
             except Exception as e:
                 if "Binance API" in str(e):
@@ -185,12 +191,16 @@ class BinanceTestnetTrader:
             print(f"[BinanceAPI] ❌ {method} {path} 业务错误(HTTP 200)")
             print(f"[BinanceAPI] 错误码: {error_code} | 消息: {error_msg}")
             print(f"[BinanceAPI] 请求参数: {safe_params}")
+            if str(error_code) == "-1003" or "Too many requests" in str(error_msg):
+                self._rate_limit_until = time.time() + self._rate_limit_backoff_sec
             raise Exception(f"Binance API {error_code}: {error_msg}")
         
         return data
 
     def _get_open_orders_cached(self, force: bool = False, source: str = "") -> List[dict]:
         now = time.time()
+        if now < self._rate_limit_until:
+            return self._open_orders_cache or []
         if (not force) and self._open_orders_cache is not None:
             if (now - self._open_orders_cache_ts) < self._open_orders_cache_ttl:
                 return self._open_orders_cache
@@ -201,6 +211,8 @@ class BinanceTestnetTrader:
 
     def _get_balance_rows_cached(self, force: bool = False) -> List[dict]:
         now = time.time()
+        if now < self._rate_limit_until:
+            return self._balance_cache_rows or []
         if (not force) and self._balance_cache_rows is not None:
             if (now - self._balance_cache_ts) < self._balance_cache_ttl:
                 return self._balance_cache_rows
@@ -211,6 +223,8 @@ class BinanceTestnetTrader:
 
     def _get_position_cached(self, force: bool = False) -> dict:
         now = time.time()
+        if now < self._rate_limit_until:
+            return self._position_cache_row or {}
         if (not force) and self._position_cache_row is not None:
             if (now - self._position_cache_ts) < self._position_cache_ttl:
                 return self._position_cache_row
@@ -603,18 +617,25 @@ class BinanceTestnetTrader:
     def _sync_from_exchange(self, force: bool = False):
         """从交易所同步余额/持仓，确保UI与币安账户一致"""
         now = time.time()
+        if now < self._rate_limit_until:
+            return
         delta = now - self._last_sync_ts
         if (not force) and (delta < self._sync_interval_sec):
             return
         self._last_sync_ts = now
+        try:
+            bal = self._get_usdt_balance()
+            self.stats.current_balance = bal
+            self.stats.total_pnl = bal - self.stats.initial_balance
+            if self.stats.initial_balance > 0:
+                self.stats.total_pnl_pct = (bal / self.stats.initial_balance - 1.0) * 100.0
 
-        bal = self._get_usdt_balance()
-        self.stats.current_balance = bal
-        self.stats.total_pnl = bal - self.stats.initial_balance
-        if self.stats.initial_balance > 0:
-            self.stats.total_pnl_pct = (bal / self.stats.initial_balance - 1.0) * 100.0
-
-        pos = self._get_position()
+            pos = self._get_position()
+        except Exception as e:
+            msg = str(e)
+            if "Too many requests" in msg or "Binance API -1003" in msg or "rate limit" in msg:
+                return
+            raise
         amt = float(pos.get("positionAmt", 0.0)) if pos else 0.0
         if abs(amt) < 1e-12:
             # 检测"之前有仓 -> 交易所已无仓"的转变，兜底触发平仓回调

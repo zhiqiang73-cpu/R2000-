@@ -999,105 +999,247 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         triggered_keys: set,
     ) -> str:
         """
-        生成三个市场状态的精品池 HTML。
-        - 当前状态区块高亮边框
-        - 当前状态的条件：绿=满足、红=不满足
-        - 非当前状态的条件：灰色（无引擎注解）
+        方案1增强版：指标×状态 表格视图。
+        - 行 = 指标类别（布林位置、偏离MA5、ATR波动率…）
+        - 列 = 3状态 × 做多/做空 = 6列
+        - 单元格 = (1/2/3) + 亮灯/灭灯
+          其中 1/2/3 表示该状态+方向下哪几条精品策略用到了这个指标
+          亮灯=当前K线满足，灭灯=不满足
+        - 当前状态列高亮边框
+        - 表格下方：全亮策略摘要
         """
-        try:
-            from core.signal_utils import _cond_label
-        except Exception:
-            _cond_label = None
-
-        STATE_CFG = {
-            "多头趋势": {"label": "📈 多头趋势", "color": "#089981"},
-            "空头趋势": {"label": "📉 空头趋势", "color": "#f23645"},
-            "震荡市":   {"label": "↔ 震荡市",   "color": "#FFB74D"},
+        # ── 指标顺序与标签 ──────────────────────────────────────────
+        INDICATOR_ORDER = [
+            "boll_pos", "close_vs_ma5", "atr_ratio", "vol_ratio",
+            "rsi", "k", "j", "lower_shd", "upper_shd",
+            "consec_bear", "consec_bull",
+        ]
+        INDICATOR_LABELS = {
+            "boll_pos":     "布林位置",
+            "close_vs_ma5": "偏离MA5",
+            "atr_ratio":    "ATR波动率",
+            "vol_ratio":    "量比",
+            "rsi":          "RSI",
+            "k":            "KDJ-K",
+            "j":            "KDJ-J",
+            "lower_shd":    "下影线/实体",
+            "upper_shd":    "上影线/实体",
+            "consec_bear":  "连续阴线",
+            "consec_bull":  "连续阳线",
         }
-        html_parts = []
+        STATES = ["多头趋势", "空头趋势", "震荡市"]
+        STATE_LABELS = {"多头趋势": "📈多头趋势", "空头趋势": "📉空头趋势", "震荡市": "↔震荡市"}
+        STATE_COLORS = {"多头趋势": "#089981", "空头趋势": "#f23645", "震荡市": "#FFB74D"}
+        COLS = [
+            ("多头趋势", "long"), ("多头趋势", "short"),
+            ("空头趋势", "long"), ("空头趋势", "short"),
+            ("震荡市",   "long"), ("震荡市",   "short"),
+        ]
 
-        for state, cfg in STATE_CFG.items():
-            pools = all_state_pools.get(state, {"long": [], "short": []})
-            long_pool  = pools.get("long", [])
-            short_pool = pools.get("short", [])
-            is_current = (state == current_state)
+        def _get_base(cond: str) -> str:
+            for s in ("_loose", "_strict"):
+                if cond.endswith(s):
+                    return cond[:-len(s)]
+            return cond
 
-            border_style = (
-                f"border:2px solid {cfg['color']}; border-radius:6px; margin:6px 2px; padding:6px;"
-                if is_current
-                else "border:1px solid #333; border-radius:6px; margin:6px 2px; padding:6px;"
-            )
-            active_tag = (
-                f"<span style='background:{cfg['color']};color:#000;font-size:10px;"
-                f"padding:1px 5px;border-radius:3px;margin-left:6px;'>▶ 当前</span>"
-                if is_current else ""
-            )
-            html_parts.append(
-                f"<div style='{border_style}'>"
-                f"<div style='color:{cfg['color']};font-weight:bold;font-size:13px;"
-                f"margin-bottom:6px;'>{cfg['label']}{active_tag}</div>"
-            )
+        # ── 构建每列的指标倒排索引 ──────────────────────────────────
+        # col_map[(state, dir)] = {base: [(strategy_idx, is_matched_or_None), ...]}
+        col_map: dict = {}
+        for state, direction in COLS:
+            pools = all_state_pools.get(state, {})
+            pool  = pools.get(direction, [])
+            is_cur = (state == current_state)
+            idx_map: dict = {}
+            for idx, item in enumerate(pool, 1):
+                conditions = item.get("conditions", []) or []
+                matched    = set(item.get("matched_conditions",   []) or [])
+                unmatched  = set(item.get("unmatched_conditions", []) or [])
+                has_ann    = bool(matched or unmatched)
+                for cond in conditions:
+                    base = _get_base(cond)
+                    if base not in idx_map:
+                        idx_map[base] = []
+                    if is_cur and has_ann:
+                        is_matched = cond in matched
+                    else:
+                        is_matched = None   # 无注解
+                    idx_map[base].append((idx, is_matched))
+            col_map[(state, direction)] = idx_map
 
+        # ── 收集所有出现过的指标 ──────────────────────────────────
+        all_used: set = set()
+        for v in col_map.values():
+            all_used.update(v.keys())
+        if not all_used:
+            return ("<div style='color:#555;padding:20px;text-align:center;'>"
+                    "无精品策略，请先完成信号分析</div>")
+
+        ordered = [b for b in INDICATOR_ORDER if b in all_used]
+        ordered += sorted(all_used - set(INDICATOR_ORDER))
+
+        # ── 表格样式常量 ────────────────────────────────────────────
+        TH  = ("padding:4px 6px;text-align:center;font-weight:bold;"
+               "border:1px solid #2a2a2a;font-size:11px;")
+        TD  = ("padding:3px 5px;text-align:left;"
+               "border:1px solid #2a2a2a;font-size:11px;vertical-align:middle;")
+        TDL = ("padding:3px 6px;text-align:left;"
+               "border:1px solid #2a2a2a;font-size:11px;font-weight:bold;"
+               "white-space:nowrap;background:#1c1c1c;color:#aaa;")
+
+        h = ["<table style='width:100%;border-collapse:collapse;'>"]
+
+        # ── 表头行1：状态（每2列合并） ────────────────────────────
+        h.append("<tr>")
+        h.append(f"<th style='{TH}background:#111;color:#444;'>指标</th>")
+        for state in STATES:
+            color   = STATE_COLORS[state]
+            is_cur  = (state == current_state)
+            bdr     = f"border-bottom:2px solid {color};" if is_cur else ""
+            bg      = "#1d2424" if is_cur else "#181818"
+            active  = "▶ " if is_cur else ""
+            h.append(f"<th colspan='2' style='{TH}{bdr}background:{bg};"
+                     f"color:{color};'>{active}{STATE_LABELS[state]}</th>")
+        h.append("</tr>")
+
+        # ── 表头行2：做多/做空 ────────────────────────────────────
+        h.append("<tr>")
+        h.append(f"<th style='{TH}background:#111;color:#444;'></th>")
+        for state in STATES:
+            is_cur = (state == current_state)
+            for direction, dir_label in [("long", "做多"), ("short", "做空")]:
+                dir_color = "#089981" if direction == "long" else "#f23645"
+                bg = "#1a221a" if (is_cur and direction == "long") else \
+                     "#221a1a" if (is_cur and direction == "short") else "#181818"
+                h.append(f"<th style='{TH}background:{bg};color:{dir_color};'>"
+                         f"{dir_label}</th>")
+        h.append("</tr>")
+
+        # ── 数据行：每个指标一行 ──────────────────────────────────
+        for base in ordered:
+            ind_label = INDICATOR_LABELS.get(base, base)
+            h.append("<tr>")
+            h.append(f"<td style='{TDL}'>{ind_label}</td>")
+
+            for state, direction in COLS:
+                entries = col_map.get((state, direction), {}).get(base, [])
+                is_cur  = (state == current_state)
+
+                if not entries:
+                    h.append(f"<td style='{TD}background:#151515;'></td>")
+                    continue
+
+                nums   = [str(i) for i, _ in entries]
+                ms     = [m for _, m in entries if m is not None]
+                num_str = "/".join(nums)
+
+                if not ms:            # 引擎未启动 / 非当前列
+                    cell_color = "#444"
+                    bg         = "#181818"
+                    suffix     = ""
+                elif all(ms):         # 全亮
+                    cell_color = "#4CAF50"
+                    bg         = "#1a2a1a"
+                    suffix     = " <b>亮灯</b>"
+                elif any(ms):         # 部分亮
+                    cell_color = "#FFB74D"
+                    bg         = "#252015"
+                    suffix     = " <b>部分</b>"
+                else:                 # 全灭
+                    cell_color = "#f23645"
+                    bg         = "#261717"
+                    suffix     = " <b>未满足</b>"
+
+                nums_html = (f"<span style='color:#666;'>({num_str})</span>"
+                             if not ms else
+                             f"<span style='color:{cell_color};'>({num_str})</span>")
+                h.append(f"<td style='{TD}background:{bg};'>"
+                         f"{nums_html}"
+                         f"<span style='color:{cell_color};'>{suffix}</span>"
+                         f"</td>")
+            h.append("</tr>")
+
+        h.append("</table>")
+
+        # ── 全亮策略摘要 ──────────────────────────────────────────
+        summary_parts = []
+        if current_state in STATES:
             for direction, dir_label, dir_color in [
                 ("long",  "做多", "#089981"),
                 ("short", "做空", "#f23645"),
             ]:
-                pool = long_pool if direction == "long" else short_pool
-                html_parts.append(
-                    f"<div style='color:{dir_color};font-weight:bold;"
-                    f"font-size:11px;margin:4px 0 2px 0;'>{dir_label} Top6</div>"
-                )
-                if not pool:
-                    html_parts.append("<div style='color:#555;font-size:11px;'>暂无</div>")
-                    continue
-
-                for idx, item in enumerate(pool, start=1):
+                pool = all_state_pools.get(current_state, {}).get(direction, [])
+                for idx, item in enumerate(pool, 1):
                     conditions = item.get("conditions", []) or []
-                    matched    = set(item.get("matched_conditions",   []) or [])
+                    matched    = set(item.get("matched_conditions", []) or [])
                     unmatched  = set(item.get("unmatched_conditions", []) or [])
-                    has_annotation = bool(matched or unmatched)
-
-                    cond_parts = []
-                    for cond in conditions:
-                        label = _cond_label(cond, direction) if _cond_label else cond
-                        if is_current and has_annotation:
-                            if cond in matched:
-                                color = "#4CAF50"   # 绿
-                            elif cond in unmatched:
-                                color = "#f23645"   # 红
-                            else:
-                                color = "#9aa0a6"
-                        else:
-                            color = "#666"          # 灰（非当前状态或引擎未启动）
-                        cond_parts.append(
-                            f"<span style='color:{color};'>{label}</span>"
+                    if not conditions:
+                        continue
+                    is_triggered = item.get("combo_key") in triggered_keys
+                    all_lit = bool(matched) and len(matched) == len(conditions)
+                    if is_triggered:
+                        badge = ("<span style='background:#00C8D4;color:#000;font-size:10px;"
+                                 "padding:1px 5px;border-radius:3px;font-weight:bold;'>●开仓</span>")
+                        summary_parts.append(
+                            f"<div style='margin:2px 0;padding:3px 8px;"
+                            f"background:#0d2a2a;border-left:3px solid #00C8D4;"
+                            f"border-radius:2px;font-size:11px;'>"
+                            f"<span style='color:{dir_color};font-weight:bold;'>"
+                            f"[{dir_label}策略{idx}]</span>&nbsp;{badge}&nbsp;"
+                            f"<span style='color:#00C8D4;'>已触发开仓</span>"
+                            f"</div>"
                         )
-                    cond_html = " & ".join(cond_parts) if cond_parts else "-"
+                    elif all_lit:
+                        match_cnt = len(matched)
+                        summary_parts.append(
+                            f"<div style='margin:2px 0;padding:3px 8px;"
+                            f"background:#1a2a1a;border-left:3px solid #4CAF50;"
+                            f"border-radius:2px;font-size:11px;'>"
+                            f"<span style='color:{dir_color};font-weight:bold;'>"
+                            f"[{dir_label}策略{idx}]</span>&nbsp;"
+                            f"<span style='color:#4CAF50;font-weight:bold;'>全亮 {match_cnt}/{len(conditions)}</span>"
+                            f"&nbsp;<span style='color:#666;'>胜率{item.get('state_rate',0):.0%}"
+                            f" 评分{item.get('score',0):.1f}</span>"
+                            f"</div>"
+                        )
+                    else:
+                        match_cnt = len(matched)
+                        if match_cnt > 0:
+                            summary_parts.append(
+                                f"<div style='margin:2px 0;padding:3px 8px;"
+                                f"background:#1a1a1a;border-left:3px solid #333;"
+                                f"border-radius:2px;font-size:11px;'>"
+                                f"<span style='color:#555;'>[{dir_label}策略{idx}]</span>&nbsp;"
+                                f"<span style='color:#FFB74D;'>{match_cnt}/{len(conditions)} 条件满足</span>"
+                                f"</div>"
+                            )
+                        else:
+                            summary_parts.append(
+                                f"<div style='margin:2px 0;padding:3px 8px;"
+                                f"background:#1f1515;border-left:3px solid #f23645;"
+                                f"border-radius:2px;font-size:11px;'>"
+                                f"<span style='color:#777;'>[{dir_label}策略{idx}]</span>&nbsp;"
+                                f"<span style='color:#f23645;'>0/{len(conditions)} 条件满足</span>"
+                                f"</div>"
+                            )
 
-                    state_rate     = item.get("state_rate", 0.0)
-                    state_triggers = item.get("state_triggers", 0)
-                    score          = item.get("score", 0.0)
-                    is_triggered   = item.get("combo_key") in triggered_keys
-                    hot_tag = (
-                        "<span style='color:#00C8D4;font-weight:bold;'> ●触发</span>"
-                        if is_triggered else ""
-                    )
-                    match_cnt = len(matched) if has_annotation else "?"
-                    total_cnt = len(conditions)
-                    match_badge = (
-                        f"<span style='color:#9aa0a6;'>[{match_cnt}/{total_cnt}]</span> "
-                        if is_current else ""
-                    )
-                    html_parts.append(
-                        f"<div style='margin:1px 0 4px 8px;font-size:11px;'>"
-                        f"<b style='color:#aaa;'>{idx}.</b> {match_badge}{cond_html}{hot_tag}<br>"
-                        f"<span style='color:#555;'>胜率 {state_rate:.0%} · 触发 {state_triggers} · 评分 {score:.1f}</span>"
-                        f"</div>"
-                    )
+        if summary_parts:
+            cur_color = STATE_COLORS.get(current_state, "#888")
+            h.append(
+                f"<div style='margin-top:10px;padding:6px;border:1px solid #2a2a2a;"
+                f"border-radius:4px;background:#181818;'>"
+                f"<div style='color:{cur_color};font-weight:bold;font-size:11px;"
+                f"margin-bottom:4px;'>▶ {current_state} 当前触发情况</div>"
+            )
+            h.extend(summary_parts)
+            h.append("</div>")
+        else:
+            h.append(
+                "<div style='margin-top:10px;padding:8px;border:1px solid #2a2a2a;"
+                "border-radius:4px;background:#181818;color:#666;font-size:11px;'>"
+                "当前状态暂无可统计的触发明细</div>"
+            )
 
-            html_parts.append("</div>")
-
-        return "".join(html_parts) if html_parts else "<span style='color:#555;'>无精品策略，请先完成信号分析</span>"
+        return "".join(h)
 
     def _create_position_tab(self):
         """创建持仓标签页"""

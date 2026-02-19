@@ -249,12 +249,15 @@ class LiveTradingEngine:
         self.use_qualified_prototypes = bool(self.qualified_prototype_fingerprints)
         
         # 回调
-        self.on_state_update = on_state_update
+        self._raw_on_state_update = on_state_update
+        self.on_state_update = self._throttled_state_update
         self.on_kline = on_kline
         self.on_price_tick = on_price_tick
         self.on_trade_opened = on_trade_opened
         self.on_trade_closed = on_trade_closed
         self.on_error = on_error
+        self._last_state_push_ts = 0.0
+        self._state_push_min_interval = 0.5
         
         # 自适应控制器
         self.adaptive_controller = adaptive_controller
@@ -715,6 +718,40 @@ class LiveTradingEngine:
         """测试连接"""
         return self._data_feed.test_connection()
     
+    def _throttled_state_update(self, state):
+        """节流版 on_state_update：非关键 tick 跳过推送，降低主线程压力"""
+        now = time.time()
+        is_bar_change = getattr(self, '_last_pushed_bars', -1) != state.total_bars
+        is_event_change = getattr(self, '_last_pushed_event', '') != (getattr(state, 'last_event', '') or '')
+        if is_bar_change or is_event_change or (now - self._last_state_push_ts >= self._state_push_min_interval):
+            self._last_state_push_ts = now
+            self._last_pushed_bars = state.total_bars
+            self._last_pushed_event = getattr(state, 'last_event', '') or ''
+            if self._raw_on_state_update:
+                self._raw_on_state_update(state)
+
+    def _bg_sync_loop(self):
+        """后台线程：周期性同步交易所持仓/余额，及时检测 TP/SL 成交"""
+        _BG_SYNC_INTERVAL = 10.0
+        while self._running:
+            try:
+                with self._lock:
+                    prev_had_pos = self._paper_trader.has_position()
+                    self._paper_trader.sync_from_exchange(force=False)
+                    now_has_pos = self._paper_trader.has_position()
+                    # 同步后检测"有仓→无仓"状态转变，触发 UI 刷新
+                    if prev_had_pos and not now_has_pos:
+                        self._reset_position_state()
+                        self.state.last_event = "📡 后台同步检测到平仓"
+                    elif not prev_had_pos and now_has_pos:
+                        self._ensure_position_tp_sl()
+                        self.state.last_event = "📡 后台同步检测到开仓"
+                    if self.on_state_update:
+                        self.on_state_update(self.state)
+            except Exception as e:
+                print(f"[LiveEngine] 后台同步异常: {e}")
+            time.sleep(_BG_SYNC_INTERVAL)
+
     def start(self) -> bool:
         """启动引擎"""
         if self._running:
@@ -749,6 +786,13 @@ class LiveTradingEngine:
             self._running = False
             self.state.is_running = False
             return False
+        
+        # 后台定期同步交易所状态，及时捕获 TP/SL 成交
+        if hasattr(self._paper_trader, "sync_from_exchange"):
+            self._bg_sync_thread = threading.Thread(
+                target=self._bg_sync_loop, daemon=True, name="bg-exchange-sync"
+            )
+            self._bg_sync_thread.start()
         
         return True
     
@@ -2078,14 +2122,38 @@ class LiveTradingEngine:
             return []
         cond_arrays = self._get_signal_condition_arrays(direction, self._current_bar_idx)
         annotated: List[dict] = []
+        alias_map = {
+            "boll_position": "boll_pos",
+            "volume_ratio": "vol_ratio",
+        }
+
+        def _candidate_keys(cond_name: str) -> List[str]:
+            base = cond_name
+            for suf in ("_loose", "_strict"):
+                if base.endswith(suf):
+                    base = base[: -len(suf)]
+                    break
+            base = alias_map.get(base, base)
+            keys = [cond_name]
+            if cond_name.endswith("_loose") or cond_name.endswith("_strict"):
+                keys.append(base)
+            else:
+                keys.extend([f"{base}_loose", f"{base}_strict"])
+            return keys
+
         for item in pool_items:
             conditions = item.get("conditions", []) or []
             matched: List[str] = []
             unmatched: List[str] = []
             if conditions and cond_arrays:
                 for cond in conditions:
-                    arr = cond_arrays.get(cond)
-                    if arr is not None and self._current_bar_idx < len(arr) and bool(arr[self._current_bar_idx]):
+                    hit = False
+                    for key in _candidate_keys(cond):
+                        arr = cond_arrays.get(key)
+                        if arr is not None and self._current_bar_idx < len(arr) and bool(arr[self._current_bar_idx]):
+                            hit = True
+                            break
+                    if hit:
                         matched.append(cond)
                     else:
                         unmatched.append(cond)
@@ -5250,10 +5318,7 @@ class LiveTradingEngine:
             return df
     
     def get_stats(self) -> dict:
-        """获取统计信息"""
-        if hasattr(self._paper_trader, "sync_from_exchange"):
-            # 节流同步，避免高频请求
-            self._paper_trader.sync_from_exchange(force=False)
+        """获取统计信息（仅读取缓存，不触发 HTTP 同步）"""
         stats = self._paper_trader.stats
         return {
             "initial_balance": stats.initial_balance,

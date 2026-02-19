@@ -84,12 +84,23 @@ def _empty_state() -> dict:
 
 
 def _save_raw(data: dict) -> None:
-    """保存 JSON 文件（原子写：先写临时文件再重命名）。"""
+    """保存 JSON 文件（原子写：先写临时文件再重命名，Windows 文件锁重试）。"""
+    import time
     os.makedirs(_DATA_DIR, exist_ok=True)
     tmp = STATE_FILE + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
+    # Windows 上 os.replace 在目标文件被其他线程占用时会抛 PermissionError(WinError 5)
+    # 重试最多 5 次，每次等待 100ms
+    for attempt in range(5):
+        try:
+            os.replace(tmp, STATE_FILE)
+            return
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(0.1)
+            else:
+                raise
 
 
 def _next_round_id(data: dict) -> int:
@@ -341,30 +352,194 @@ def get_cumulative(direction: Optional[str] = None) -> Dict[str, dict]:
     return {k: v for k, v in cumulative.items() if v.get('direction') == direction}
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 智能合并 & 多样性筛选辅助函数
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_condition_family(cond: str) -> str:
+    """提取条件的指标族，如 'boll_pos_loose' → 'boll_pos'"""
+    for suffix in ('_loose', '_strict'):
+        if cond.endswith(suffix):
+            return cond[:-len(suffix)]
+    return cond
+
+
+def _get_family_set(conditions: List[str]) -> frozenset:
+    """获取条件组合涉及的指标族集合"""
+    return frozenset(_get_condition_family(c) for c in conditions)
+
+
+def _family_overlap_ratio(families_a: frozenset, families_b: frozenset) -> float:
+    """计算两个指标族集合的重叠度（Jaccard）"""
+    if not families_a or not families_b:
+        return 0.0
+    intersection = len(families_a & families_b)
+    union = len(families_a | families_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def _is_loose_version(cond: str) -> bool:
+    """判断是否为宽松版条件"""
+    return cond.endswith('_loose')
+
+
+def _merge_similar_combos(combos: List[dict]) -> List[dict]:
+    """
+    合并相似组合：
+    1. 按指标族集合分组
+    2. 同一组内，选取评分最高 + 宽松版条件多的作为代表
+    3. 返回合并后的代表组合列表
+    """
+    from collections import defaultdict
+
+    family_groups: Dict[frozenset, List[dict]] = defaultdict(list)
+    for c in combos:
+        families = _get_family_set(c.get("conditions", []))
+        family_groups[families].append(c)
+
+    merged: List[dict] = []
+    for families, group in family_groups.items():
+        if len(group) == 1:
+            merged.append(group[0])
+        else:
+            # 多个组合共用相同指标族，选择最优代表
+            # 优先选：综合评分最高 + 使用宽松版条件多的
+            def score_combo(c):
+                conds = c.get("conditions", [])
+                loose_count = sum(1 for cd in conds if _is_loose_version(cd))
+                return c.get("综合评分", 0.0) + loose_count * 0.5
+            best = max(group, key=score_combo)
+            merged_entry = dict(best)
+            merged_entry["appear_rounds"] = max(g.get("appear_rounds", 0) for g in group)
+            merged_entry["total_triggers"] = sum(int(g.get("total_triggers", 0) or 0) for g in group)
+            merged_entry["total_hits"] = sum(int(g.get("total_hits", 0) or 0) for g in group)
+            if merged_entry["total_triggers"] > 0:
+                merged_entry["overall_rate"] = merged_entry["total_hits"] / merged_entry["total_triggers"]
+            merged_entry["_merged_count"] = len(group)
+            merged.append(merged_entry)
+
+    return merged
+
+
+def _select_high_freq_top(combos: List[dict], top_n: int = 6,
+                          min_triggers: int = 20,
+                          min_score: float = 70.0,
+                          max_conditions: int = 3,
+                          max_overlap: float = 0.5) -> List[dict]:
+    """
+    高频策略筛选：
+    1. 条件数量 2-3 个（简单策略，易于执行）
+    2. 触发次数 >= 20（高频触发，样本充足）
+    3. 评分 >= 70（基本质量门槛）
+    4. 排序：命中率 > 触发次数（强调胜率优先）
+    5. 多样性约束放宽至 50%
+    """
+    # 过滤：条件数 2-3，触发次数 >= min_triggers，评分 >= min_score
+    qualified = [
+        c for c in combos
+        if 2 <= len(c.get("conditions", [])) <= max_conditions
+        and c.get("total_triggers", 0) >= min_triggers
+        and c.get("综合评分", 0.0) >= min_score
+    ]
+
+    # 排序：命中率优先，触发次数次之
+    sorted_combos = sorted(
+        qualified,
+        key=lambda c: (c.get("state_rate", c.get("overall_rate", 0.0)),
+                       c.get("state_triggers", c.get("total_triggers", 0))),
+        reverse=True
+    )
+
+    # 多样性筛选（放宽至 50%）
+    selected: List[dict] = []
+    selected_families: List[frozenset] = []
+
+    for c in sorted_combos:
+        if len(selected) >= top_n:
+            break
+        families = _get_family_set(c.get("conditions", []))
+        max_current_overlap = 0.0
+        for sf in selected_families:
+            overlap = _family_overlap_ratio(families, sf)
+            max_current_overlap = max(max_current_overlap, overlap)
+
+        if max_current_overlap < max_overlap:
+            selected.append(c)
+            selected_families.append(families)
+
+    return selected
+
+
+def _select_diverse_top(combos: List[dict], top_n: int = 6,
+                        max_overlap: float = 0.3,
+                        min_score: float = 80.0) -> List[dict]:
+    """
+    多样性选择（质量优先 + 多样性保障）：
+    1. 只考虑综合评分 >= min_score 的策略
+    2. 按综合评分降序
+    3. 逐个加入，如果与已选组合重叠度 < max_overlap 才加入
+    4. 宁缺毋滥：不足 top_n 时不补充低质量策略
+    """
+    # 质量门槛：只考虑高分策略
+    qualified = [c for c in combos if c.get("综合评分", 0.0) >= min_score]
+    sorted_combos = sorted(qualified, key=lambda c: c.get("综合评分", 0.0), reverse=True)
+
+    selected: List[dict] = []
+    selected_families: List[frozenset] = []
+
+    for c in sorted_combos:
+        if len(selected) >= top_n:
+            break
+        families = _get_family_set(c.get("conditions", []))
+        max_current_overlap = 0.0
+        for sf in selected_families:
+            overlap = _family_overlap_ratio(families, sf)
+            max_current_overlap = max(max_current_overlap, overlap)
+
+        # 严格多样性：重叠度必须 < 阈值才能入选
+        if max_current_overlap < max_overlap:
+            selected.append(c)
+            selected_families.append(families)
+
+    # 宁缺毋滥：不再补充低质量/高重叠策略
+    return selected
+
+
 def get_premium_pool(
     state: Optional[str] = None,
     direction: Optional[str] = None,
     top_n: int = 6,
     min_state_triggers: int = 5,
+    include_high_freq: bool = True,
 ) -> List[dict]:
     """
-    按市场状态与方向挑选精品池（每组 TOP N）。
+    按市场状态与方向挑选精品池（双层：精品层 + 高频层）。
 
     规则：
-      - 过滤该状态触发次数 < min_state_triggers 的组合
-      - 主排序：该状态命中率（降序）
-      - 次排序：综合评分（降序）
+      精品层（tier="精品"）：
+        1. 评分 >= 80，多样性 < 30%
+        2. 排序：评分 > 命中率
+        3. 每组 Top N
+
+      高频层（tier="高频"，可选）：
+        1. 条件数 2-3 个
+        2. 触发次数 >= 20
+        3. 评分 >= 70
+        4. 排序：命中率 > 触发次数
+        5. 多样性放宽至 50%
+        6. 去重：排除已在精品层的组合
 
     Args:
         state:             目标市场状态（None 表示三状态都取）
         direction:         'long' / 'short' / None（两个方向都取）
         top_n:             每个状态+方向的数量上限
         min_state_triggers: 该状态最少触发次数
+        include_high_freq:  是否包含高频层（默认 True）
 
     Returns:
         List[dict]，元素包含：
           combo_key, direction, conditions, market_state,
-          score, state_rate, state_triggers
+          score, state_rate, state_triggers, tier
     """
     cumulative = get_cumulative(direction)
     if not cumulative:
@@ -376,7 +551,8 @@ def get_premium_pool(
 
     for market_state in states:
         for dir_val in directions:
-            candidates: List[Tuple[str, dict, float, int]] = []
+            # 1. 收集该状态+方向的候选组合
+            candidates: List[dict] = []
             for key, entry in cumulative.items():
                 if entry.get("direction") != dir_val:
                     continue
@@ -385,29 +561,69 @@ def get_premium_pool(
                 )
                 if triggers < min_state_triggers:
                     continue
-                candidates.append((key, entry, rate, triggers))
-
-            if not candidates:
-                continue
-
-            candidates.sort(
-                key=lambda item: (
-                    item[2],  # state_rate
-                    item[1].get("综合评分", 0.0),
-                ),
-                reverse=True,
-            )
-
-            for key, entry, rate, triggers in candidates[:top_n]:
-                results.append({
+                # 构建完整候选条目
+                candidates.append({
                     "combo_key":      key,
                     "direction":      entry.get("direction"),
                     "conditions":     entry.get("conditions", []),
                     "market_state":   market_state,
+                    "综合评分":        entry.get("综合评分", 0.0),
                     "score":          entry.get("综合评分", 0.0),
                     "state_rate":     rate,
                     "state_triggers": triggers,
+                    "appear_rounds":  entry.get("appear_rounds", 0),
+                    "total_triggers": entry.get("total_triggers", 0),
+                    "total_hits":     entry.get("total_hits", 0),
+                    "overall_rate":   entry.get("overall_rate", 0.0),
+                    "market_state_breakdown": entry.get("market_state_breakdown", {}),
                 })
+
+            if not candidates:
+                continue
+
+            # 2. 智能合并（同指标族选宽松版代表）
+            merged = _merge_similar_combos(candidates)
+
+            # 3. 按该状态命中率排序（用于精品层筛选）
+            merged.sort(
+                key=lambda c: (
+                    c.get("state_rate", 0.0),
+                    c.get("综合评分", 0.0),
+                ),
+                reverse=True,
+            )
+
+            # ══════════════════════════════════════════════════════════════════
+            # 精品层：质量门槛80分 + 重叠度<30%
+            # ══════════════════════════════════════════════════════════════════
+            premium_list = _select_diverse_top(merged, top_n=top_n)
+            premium_keys = {c.get("combo_key") for c in premium_list}
+
+            for c in premium_list:
+                c["tier"] = "精品"
+            results.extend(premium_list)
+
+            # ══════════════════════════════════════════════════════════════════
+            # 高频层：条件2-3个，触发>=20，评分>=70，重叠度<50%
+            # ══════════════════════════════════════════════════════════════════
+            if include_high_freq:
+                # 排除已在精品层的组合
+                high_freq_candidates = [
+                    c for c in merged if c.get("combo_key") not in premium_keys
+                ]
+
+                high_freq_list = _select_high_freq_top(
+                    high_freq_candidates,
+                    top_n=top_n,
+                    min_triggers=20,
+                    min_score=70.0,
+                    max_conditions=3,
+                    max_overlap=0.5,
+                )
+
+                for c in high_freq_list:
+                    c["tier"] = "高频"
+                results.extend(high_freq_list)
 
     return results
 

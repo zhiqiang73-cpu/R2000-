@@ -480,9 +480,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 自适应控制器和DeepSeek复盘
         self._adaptive_controller = AdaptiveController()
-        self._deepseek_reviewer = DeepSeekReviewer(DEEPSEEK_CONFIG)
-        if DEEPSEEK_CONFIG.get("ENABLED", False):
-            self._deepseek_reviewer.start_background_worker()
+        # DeepSeek 功能已禁用（按需求移除轮询/后台任务）
+        self._deepseek_enabled = False
+        self._deepseek_reviewer = None
         
         # 自适应仪表板刷新定时器（每10秒）
         self._adaptive_dashboard_timer = QtCore.QTimer(self)
@@ -3434,18 +3434,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 print(f"[MainWindow] 冷启动状态应用失败: {e}")
 
             # ── 初始化 DeepSeek 复盘分析器（为本次交易会话创建新实例） ──
-            try:
-                self._deepseek_reviewer = DeepSeekReviewer(DEEPSEEK_CONFIG)
-                if self._deepseek_reviewer.enabled:
-                    self._deepseek_reviewer.start_background_worker()
-                    self._live_engine._deepseek_reviewer = self._deepseek_reviewer
-                    print("[MainWindow] DeepSeek 复盘分析器已启动")
-                else:
-                    self._deepseek_reviewer = None
-                    print("[MainWindow] DeepSeek 未启用（需配置 API Key）")
-            except Exception as e:
-                print(f"[MainWindow] DeepSeek 初始化失败: {e}")
-                self._deepseek_reviewer = None
+            # DeepSeek 功能已禁用（按需求移除轮询/后台任务）
+            self._deepseek_reviewer = None
+            if hasattr(self._live_engine, "_deepseek_reviewer"):
+                self._live_engine._deepseek_reviewer = None
             
             # ── 注入进化后的特征权重（如果有） ──
             self._inject_evolved_weights_to_engine()
@@ -3479,8 +3471,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._last_ui_state_event = ""
                 self._live_chart_timer.start()
                 self._adaptive_dashboard_timer.start()
-                self._deepseek_poll_timer.start()
-                self._deepseek_interval_timer.start()
+                # DeepSeek 功能已禁用（不启动轮询/定时器）
                 
                 # 初始化冷启动面板状态
                 self._init_cold_start_panel_from_engine()
@@ -3679,29 +3670,16 @@ class MainWindow(QtWidgets.QMainWindow):
     
     @QtCore.pyqtSlot(object)
     def _update_live_state(self, state):
-        """更新实时状态（主线程）"""
-        # 注入最新 DeepSeek 复盘到 state，供综合决策卡片显示
-        reviewer = getattr(self._live_engine, '_deepseek_reviewer', None) if self._live_engine else None
-        if reviewer and getattr(reviewer, 'enabled', False):
-            try:
-                recent = reviewer.get_all_reviews(limit=1)
-                if recent:
-                    r = recent[0]
-                    analysis = (r.get("analysis") or "").strip()
-                    if analysis:
-                        state.deepseek_holding_advice = analysis
-                        state.deepseek_judgement = (r.get("judgement") or "").strip()
-                        state.deepseek_heartbeat = True
-            except Exception:
-                pass
-        
-        # 更新控制面板
+        """更新实时状态（主线程）— 拆分轻量/重量更新，避免主线程阻塞"""
+        now = time.time()
+
+        # ── 轻量更新：价格/连接状态/持仓方向（每次都执行，开销极低） ──
         self.paper_trading_tab.control_panel.update_ws_status(state.is_connected)
         self.paper_trading_tab.control_panel.update_price(state.current_price)
         self.paper_trading_tab.control_panel.update_bar_count(state.total_bars)
         self.paper_trading_tab.control_panel.update_position_direction(state.position_side)
-        # 重型UI分支节流：状态高频推送时，避免每次都刷新整套复杂面板
-        now = time.time()
+
+        # ── 节流门控：判断是否需要执行重量更新 ──
         current_order_id = None
         if self._live_engine:
             order_for_gate = self._live_engine.paper_trader.current_position
@@ -3710,8 +3688,11 @@ class MainWindow(QtWidgets.QMainWindow):
         bar_changed = (state.total_bars != self._last_live_state_bar_count)
         order_changed = (current_order_id != self._last_live_state_order_id)
         event_changed = ((getattr(state, "last_event", "") or "") != self._last_ui_state_event)
+
+        # 重量更新至少间隔 2 秒；仅在 bar/order/event 变化时触发
+        min_heavy_interval = 2.0
         if (not bar_changed and not order_changed and not event_changed and
-                now - self._last_live_state_ui_ts < self._live_state_ui_interval_sec):
+                now - self._last_live_state_ui_ts < min_heavy_interval):
             return
         self._last_live_state_ui_ts = now
         self._last_live_state_bar_count = state.total_bars
@@ -3860,11 +3841,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 prototype_confidence=getattr(state, "prototype_confidence", 0.0),
             )
             
-            # ── 更新开仓条件自适应列表（融合/余弦/欧氏/DTW）──
+            # ── 自适应学习面板仅在 bar 变化时更新（1 分钟级别），避免 tick 级重复刷新 ──
+            if not bar_changed:
+                # 非 bar 变化：跳过所有重量级自适应学习面板更新，仅更新事件日志和指纹轨迹
+                if order is not None:
+                    entry_key = (
+                        getattr(order, "order_id", ""),
+                        getattr(order, "entry_time", None),
+                        getattr(order, "entry_bar_idx", None),
+                        getattr(order, "entry_price", None),
+                    )
+                    if getattr(self, "_last_logged_open_key", None) != entry_key:
+                        self.paper_trading_tab.trade_log.add_trade(order)
+                        self._last_logged_open_key = entry_key
+                last_event = getattr(state, "last_event", "")
+                if last_event and last_event != getattr(self, "_last_logged_event", ""):
+                    self._last_logged_event = last_event
+                    self.paper_trading_tab.status_panel.append_event(last_event)
+                self._update_fingerprint_trajectory_overlay(state)
+                return
+
+            # ── 以下为 bar 变化时的完整重量更新 ──
             cos_sim = getattr(state, "cosine_similarity", 0.0)
             euc_sim = getattr(state, "euclidean_similarity", 0.0)
             dtw_sim = getattr(state, "dtw_similarity", 0.0)
-            fus_sim = getattr(state, "final_match_score", 0.0)  # 融合评分（含置信度）
+            fus_sim = getattr(state, "final_match_score", 0.0)
             cold_on = getattr(state, "cold_start_enabled", False)
             if cold_on and self._live_engine:
                 try:
@@ -4047,14 +4048,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_live_chart(force=True)
         
         # 冷启动面板定时刷新（节流：每5秒刷新一次）
-        import time
         now = time.time()
         if not hasattr(self, "_last_cold_start_refresh"):
             self._last_cold_start_refresh = 0
         if now - self._last_cold_start_refresh >= 5.0:
             self._last_cold_start_refresh = now
             self._refresh_cold_start_panel()
-    
+
     def _refresh_adaptive_dashboard(self):
         """刷新自适应控制器仪表板"""
         if not self._adaptive_controller:
@@ -4094,21 +4094,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         try:
-            # 获取最近完成的复盘结果（最多20条）
             recent_reviews = reviewer.get_all_reviews(limit=20)
             
-            # 更新时间线中对应交易的DeepSeek复盘
             for review in recent_reviews:
                 trade_ctx = review.get('trade_context', {})
                 order_id = trade_ctx.get('order_id')
                 
                 if order_id:
-                    # 检查这个review是否已经被应用到UI
                     if not self.adaptive_learning_tab.get_deepseek_review(order_id):
-                        # 保存到adaptive_learning_tab的字典
                         self.adaptive_learning_tab.add_deepseek_review(order_id, review)
                         
-                        # 更新时间线UI
                         if hasattr(self.adaptive_learning_tab, 'trade_timeline'):
                             self.adaptive_learning_tab.trade_timeline.update_deepseek_review(order_id, review)
         except Exception as e:
@@ -4260,20 +4255,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     x_left, n + max(5, max(0, future_pad)), padding=0
                 )
             
-            # 【关键】实时更新 TP/SL 虚线位置；有分段挂单时用委托单第一档价格，与「委托单」一致
+            # 实时更新 TP/SL 虚线位置（仅使用本地缓存，不触发 HTTP 请求）
             order = self._live_engine._paper_trader.current_position
             if order is not None:
                 tp = getattr(order, "take_profit", None)
                 sl = getattr(order, "stop_loss", None)
-                pending = getattr(self._live_engine._paper_trader, "get_pending_entry_orders_snapshot", lambda **kw: [])(current_bar_idx=len(df) - 1)
-                for o in pending:
-                    if o.get("order_type") == "tp" and "第1档" in str(o.get("template_fingerprint", "")):
-                        tp = o.get("trigger_price") or tp
-                        break
-                for o in pending:
-                    if o.get("order_type") == "sl" and "第1档" in str(o.get("template_fingerprint", "")):
-                        sl = o.get("trigger_price") or sl
-                        break
                 self.paper_trading_tab.chart_widget.set_tp_sl_lines(tp, sl)
                 
                 # 【实时偏离检测】持仓中检查价格是否偏离概率扇形置信带
