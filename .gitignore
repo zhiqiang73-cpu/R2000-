@@ -43,3 +43,5 @@ data/evaluation/
 data/prototypes/
 *.log
 *.parquet.bak
+data/signal_analysis_state.json
+data/signal_analysis_state.json.tmp

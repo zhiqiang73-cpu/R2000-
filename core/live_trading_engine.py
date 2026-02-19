@@ -1979,7 +1979,7 @@ class LiveTradingEngine:
                 self.state.last_event = "⚠ [精品信号] 策略池为空"
                 return
 
-            # 构建 tier_map：combo_key -> "精品" 或 "高频"
+            # 构建 tier_map：combo_key -> "精品" 或 "高频"（两层）
             _premium_pool = _sig_store.get_premium_pool()
             _tier_map = {item["combo_key"]: item.get("tier", "精品") for item in _premium_pool}
 

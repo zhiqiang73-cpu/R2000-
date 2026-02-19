@@ -138,18 +138,20 @@ def _precompute_outcomes(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 策略 2：预计算 18 个条件 bool 数组
+# 策略 2：预计算 30 个条件 bool 数组
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _build_condition_arrays(df: pd.DataFrame, direction: str) -> Dict[str, np.ndarray]:
     """
-    根据 df 中已计算好的技术指标，构建该方向的 18 个条件 bool 数组。
+    根据 df 中已计算好的技术指标，构建该方向的 30 个条件 bool 数组。
 
-    每方向 9 指标 × 2 阈值（宽松/严格）= 18 个条件，shape=(n,)。
+    极端条件：每方向 9 指标 × 2 阈值（宽松/严格）= 18 个条件
+    温和条件：12 个（见下方温和型指标块），shape=(n,)。
     NaN 值（滚动窗口初始段）自动视为条件不满足（False）。
 
     依赖列：rsi, k, j, boll_position, volume_ratio, close_vs_ma5, atr,
-            high, low, open, close
+            high, low, open, close,
+            macd_hist, ma5_slope, obv, obv_ma
     """
     n = len(df)
 
@@ -182,6 +184,13 @@ def _build_condition_arrays(df: pd.DataFrame, direction: str) -> Dict[str, np.nd
     vratio = _col('volume_ratio',  1.0)
     cvma5  = _col('close_vs_ma5',  0.0)
 
+    # 温和型指标
+    macd_hist      = _col('macd_hist',  0.0)
+    macd_hist_prev = np.roll(macd_hist, 1); macd_hist_prev[0] = 0.0
+    ma5_slope      = _col('ma5_slope',  0.0)
+    obv_vals       = _col('obv',        0.0)
+    obv_ma_vals    = _col('obv_ma',     0.0)
+
     conds: Dict[str, np.ndarray] = {}
 
     if direction == 'long':
@@ -203,6 +212,19 @@ def _build_condition_arrays(df: pd.DataFrame, direction: str) -> Dict[str, np.nd
         conds['consec_bear_strict']  = bear_roll3
         conds['atr_ratio_loose']     = atr_ratio   > 1.2
         conds['atr_ratio_strict']    = atr_ratio   > 1.8
+        # 温和型条件
+        conds['rsi_mod_loose']           = rsi       < 50
+        conds['rsi_mod_strict']          = rsi       < 45
+        conds['boll_pos_mod_loose']      = bpos      < 0.40
+        conds['boll_pos_mod_strict']     = bpos      < 0.35
+        conds['macd_hist_turn_loose']    = macd_hist > 0
+        conds['macd_hist_turn_strict']   = (macd_hist > 0) & (macd_hist_prev <= 0)
+        conds['close_vs_ma5_mod_loose']  = cvma5     < -0.3
+        conds['close_vs_ma5_mod_strict'] = cvma5     < -0.5
+        conds['ma5_slope_dir_loose']     = ma5_slope < 0
+        conds['ma5_slope_dir_strict']    = ma5_slope < -0.05
+        conds['obv_trend_loose']         = obv_vals  > obv_ma_vals
+        conds['vol_ratio_mod_loose']     = vratio    > 1.1
     else:
         conds['rsi_loose']           = rsi    > 60
         conds['rsi_strict']          = rsi    > 70
@@ -222,6 +244,19 @@ def _build_condition_arrays(df: pd.DataFrame, direction: str) -> Dict[str, np.nd
         conds['consec_bull_strict']  = bull_roll3
         conds['atr_ratio_loose']     = atr_ratio   > 1.2
         conds['atr_ratio_strict']    = atr_ratio   > 1.8
+        # 温和型条件
+        conds['rsi_mod_loose']           = rsi       > 50
+        conds['rsi_mod_strict']          = rsi       > 55
+        conds['boll_pos_mod_loose']      = bpos      > 0.60
+        conds['boll_pos_mod_strict']     = bpos      > 0.65
+        conds['macd_hist_turn_loose']    = macd_hist < 0
+        conds['macd_hist_turn_strict']   = (macd_hist < 0) & (macd_hist_prev >= 0)
+        conds['close_vs_ma5_mod_loose']  = cvma5     > 0.3
+        conds['close_vs_ma5_mod_strict'] = cvma5     > 0.5
+        conds['ma5_slope_dir_loose']     = ma5_slope > 0
+        conds['ma5_slope_dir_strict']    = ma5_slope > 0.05
+        conds['obv_trend_loose']         = obv_vals  < obv_ma_vals
+        conds['vol_ratio_mod_loose']     = vratio    > 1.1
 
     return {name: np.asarray(arr, dtype=bool) for name, arr in conds.items()}
 
@@ -364,7 +399,7 @@ def analyze(
     if progress_cb:
         progress_cb(5, "正在构建条件数组...")
 
-    # ── 3. 策略2：构建 18 个条件 bool 数组 ──────────────────────────────────
+    # ── 3. 策略2：构建 30 个条件 bool 数组 ──────────────────────────────────
     all_conds = _build_condition_arrays(df, direction)
 
     if progress_cb:

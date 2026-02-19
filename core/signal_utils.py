@@ -60,6 +60,41 @@ _COND_LABELS = {
         "long":  {"loose": ">1.2", "strict": ">1.8"},
         "short": {"loose": ">1.2", "strict": ">1.8"},
     },
+    "rsi_mod": {
+        "label": "RSI温和",
+        "long":  {"loose": "<50", "strict": "<45"},
+        "short": {"loose": ">50", "strict": ">55"},
+    },
+    "boll_pos_mod": {
+        "label": "布林中区",
+        "long":  {"loose": "<0.40", "strict": "<0.35"},
+        "short": {"loose": ">0.60", "strict": ">0.65"},
+    },
+    "macd_hist_turn": {
+        "label": "MACD柱",
+        "long":  {"loose": ">0(多头)", "strict": "翻正"},
+        "short": {"loose": "<0(空头)", "strict": "翻负"},
+    },
+    "close_vs_ma5_mod": {
+        "label": "偏离MA5温和",
+        "long":  {"loose": "<-0.3%", "strict": "<-0.5%"},
+        "short": {"loose": ">0.3%",  "strict": ">0.5%"},
+    },
+    "ma5_slope_dir": {
+        "label": "MA5斜率",
+        "long":  {"loose": "向下", "strict": "<-0.05%"},
+        "short": {"loose": "向上", "strict": ">0.05%"},
+    },
+    "obv_trend": {
+        "label": "OBV方向",
+        "long":  {"loose": "买压", "strict": "买压"},
+        "short": {"loose": "卖压", "strict": "卖压"},
+    },
+    "vol_ratio_mod": {
+        "label": "量比温和",
+        "long":  {"loose": ">1.1", "strict": ">1.1"},
+        "short": {"loose": ">1.1", "strict": ">1.1"},
+    },
 }
 
 

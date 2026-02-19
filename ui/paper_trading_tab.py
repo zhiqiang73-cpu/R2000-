@@ -1144,7 +1144,8 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         TIER_BG_FREQ     = "#1E2A2A"
 
         def _tier_color(tier: str) -> str:
-            return TIER_COLOR_FREQ if tier == "高频" else TIER_COLOR_ELITE
+            if tier == "高频": return TIER_COLOR_FREQ
+            return TIER_COLOR_ELITE
 
         # ── 指标顺序与标签 ──────────────────────────────────────────
         INDICATOR_ORDER = [

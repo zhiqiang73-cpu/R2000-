@@ -52,6 +52,7 @@ STATE_FILE = os.path.join(_DATA_DIR, 'signal_analysis_state.json')
 _SCHEMA_VERSION = "3.0"
 
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 内部工具
 # ═══════════════════════════════════════════════════════════════════════════
@@ -89,7 +90,7 @@ def _save_raw(data: dict) -> None:
     os.makedirs(_DATA_DIR, exist_ok=True)
     tmp = STATE_FILE + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False)
     # Windows 上 os.replace 在目标文件被其他线程占用时会抛 PermissionError(WinError 5)
     # 重试最多 5 次，每次等待 100ms
     for attempt in range(5):
@@ -426,22 +427,36 @@ def _select_high_freq_top(combos: List[dict], top_n: int = 6,
                           min_triggers: int = 20,
                           min_score: float = 70.0,
                           max_conditions: int = 3,
-                          max_overlap: float = 0.5) -> List[dict]:
+                          max_overlap: float = 0.5,
+                          min_state_rate: Optional[float] = None) -> List[dict]:
     """
     高频策略筛选：
     1. 条件数量 2-3 个（简单策略，易于执行）
-    2. 触发次数 >= 20（高频触发，样本充足）
-    3. 评分 >= 70（基本质量门槛）
+    2. 触发次数：
+       - 普通模式（min_state_rate=None）：total_triggers >= min_triggers（全局）
+       - 震荡市专项（min_state_rate 已设置）：state_triggers >= min_triggers（状态专项）
+    3. 质量门槛：
+       - 普通模式：综合评分 >= min_score（全局评分）
+       - 震荡市专项：state_rate >= min_state_rate（状态专项命中率，避免全局低分过滤掉震荡市好策略）
     4. 排序：命中率 > 触发次数（强调胜率优先）
     5. 多样性约束放宽至 50%
     """
-    # 过滤：条件数 2-3，触发次数 >= min_triggers，评分 >= min_score
-    qualified = [
-        c for c in combos
-        if 2 <= len(c.get("conditions", [])) <= max_conditions
-        and c.get("total_triggers", 0) >= min_triggers
-        and c.get("综合评分", 0.0) >= min_score
-    ]
+    if min_state_rate is not None:
+        # 震荡市专项模式：用状态专项命中率替代全局综合评分
+        qualified = [
+            c for c in combos
+            if 2 <= len(c.get("conditions", [])) <= max_conditions
+            and c.get("state_triggers", 0) >= min_triggers
+            and c.get("state_rate", 0.0) >= min_state_rate
+        ]
+    else:
+        # 普通模式：全局触发次数和综合评分
+        qualified = [
+            c for c in combos
+            if 2 <= len(c.get("conditions", [])) <= max_conditions
+            and c.get("total_triggers", 0) >= min_triggers
+            and c.get("综合评分", 0.0) >= min_score
+        ]
 
     # 排序：命中率优先，触发次数次之
     sorted_combos = sorted(
@@ -469,6 +484,7 @@ def _select_high_freq_top(combos: List[dict], top_n: int = 6,
             selected_families.append(families)
 
     return selected
+
 
 
 def _select_diverse_top(combos: List[dict], top_n: int = 6,
@@ -514,7 +530,7 @@ def get_premium_pool(
     include_high_freq: bool = True,
 ) -> List[dict]:
     """
-    按市场状态与方向挑选精品池（双层：精品层 + 高频层）。
+    按市场状态与方向挑选精品池（两层：精品层 + 高频层）。
 
     规则：
       精品层（tier="精品"）：
@@ -523,12 +539,9 @@ def get_premium_pool(
         3. 每组 Top N
 
       高频层（tier="高频"，可选）：
-        1. 条件数 2-3 个
-        2. 触发次数 >= 20
-        3. 评分 >= 70
-        4. 排序：命中率 > 触发次数
-        5. 多样性放宽至 50%
-        6. 去重：排除已在精品层的组合
+        震荡市：top10，评分 >= 65，触发次数 >= 5，重叠度 < 50%
+        趋势市：top_n，评分 >= 70，触发次数 >= 10，重叠度 < 50%
+        去重：排除已在精品层的组合
 
     Args:
         state:             目标市场状态（None 表示三状态都取）
@@ -605,23 +618,36 @@ def get_premium_pool(
             results.extend(premium_list)
 
             # ══════════════════════════════════════════════════════════════════
-            # 高频层：条件2-3个，触发>=20，评分>=70，重叠度<50%
+            # 高频层：条件2-3个，重叠度<50%；震荡市扩容（top10，门槛降低）
             # ══════════════════════════════════════════════════════════════════
             if include_high_freq:
-                # 排除已在精品层的组合
                 high_freq_candidates = [
                     c for c in merged if c.get("combo_key") not in premium_keys
                 ]
-
-                high_freq_list = _select_high_freq_top(
-                    high_freq_candidates,
-                    top_n=top_n,
-                    min_triggers=10,
-                    min_score=70.0,
-                    max_conditions=3,
-                    max_overlap=0.5,
-                )
-
+                if market_state == "震荡市":
+                    # 震荡市：不排除精品层，从全量中找 2-3 条件的简单好策略
+                    # 用 dict(c) 创建副本，避免覆盖精品层的 tier 标签
+                    sideways_pool = [dict(c) for c in merged]
+                    _min_state_rate = 0.64 if dir_val == "long" else 0.52
+                    high_freq_list = _select_high_freq_top(
+                        sideways_pool,
+                        top_n=10,
+                        min_triggers=5,
+                        min_score=65.0,
+                        max_conditions=3,
+                        max_overlap=0.5,
+                        min_state_rate=_min_state_rate,
+                    )
+                else:
+                    # 趋势市保持原标准
+                    high_freq_list = _select_high_freq_top(
+                        high_freq_candidates,
+                        top_n=top_n,
+                        min_triggers=10,
+                        min_score=70.0,
+                        max_conditions=3,
+                        max_overlap=0.5,
+                    )
                 for c in high_freq_list:
                     c["tier"] = "高频"
                 results.extend(high_freq_list)

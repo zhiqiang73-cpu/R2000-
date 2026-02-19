@@ -746,12 +746,17 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                               min_triggers: int = 20,
                               min_score: float = 70.0,
                               max_conditions: int = 3,
-                              max_overlap: float = 0.5) -> List[dict]:
+                              max_overlap: float = 0.5,
+                              min_state_rate: Optional[float] = None) -> List[dict]:
         """
         高频策略筛选：
         1. 条件数量 2-3 个
-        2. 触发次数 >= 20
-        3. 评分 >= 70
+        2. 触发次数：
+           - 普通模式：total_triggers >= min_triggers（全局）
+           - 震荡市专项（min_state_rate 已设置）：state_triggers >= min_triggers
+        3. 质量门槛：
+           - 普通模式：综合评分 >= min_score
+           - 震荡市专项：state_rate >= min_state_rate（状态专项命中率）
         4. 排序：命中率 > 触发次数（强调胜率优先）
         5. 多样性约束放宽到 50%
         """
@@ -759,9 +764,18 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         for c in combos:
             conditions = c.get("conditions", [])
             cond_count = len(conditions)
-            total_triggers = c.get("total_triggers", 0)
-            score = c.get("综合评分", 0.0)
-            if 2 <= cond_count <= max_conditions and total_triggers >= min_triggers and score >= min_score:
+            if min_state_rate is not None:
+                # 震荡市专项模式：用状态专项命中率替代全局综合评分
+                ok = (2 <= cond_count <= max_conditions
+                      and c.get("state_triggers", 0) >= min_triggers
+                      and c.get("state_rate", 0.0) >= min_state_rate)
+            else:
+                total_triggers = c.get("total_triggers", 0)
+                score = c.get("综合评分", 0.0)
+                ok = (2 <= cond_count <= max_conditions
+                      and total_triggers >= min_triggers
+                      and score >= min_score)
+            if ok:
                 qualified.append(c)
 
         sorted_combos = sorted(
@@ -1473,21 +1487,31 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             if tier == "精品":
                 # 精品层：评分>=80, 多样性<30%
                 return self._select_diverse_top(merged, top_n=6, min_score=80.0, max_overlap=0.3)
-            else:
-                # 高频层：2-3条件, 触发>=10, 评分>=70, 多样性<50%
-                # 排除已在精品层的组合
+            elif tier == "高频":
                 high_freq_candidates = [
                     c for c in merged
                     if frozenset(c.get("conditions", [])) not in elite_keys
                 ]
-                return self._select_high_freq_top(high_freq_candidates, top_n=6,
-                                                  min_triggers=10,
-                                                  min_score=70.0, max_conditions=3, max_overlap=0.5)
+                if market_state == "震荡市":
+                    # 震荡市：从完整 merged 中找（包括已在精品层的 2-3 条件组合）
+                    sideways_pool = [dict(c) for c in merged]
+                    for c in sideways_pool:
+                        r, t = _get_state_rate(c.get("market_state_breakdown"), market_state)
+                        c["state_rate"] = r
+                        c["state_triggers"] = t
+                    _min_state_rate = 0.64 if direction == "long" else 0.52
+                    return self._select_high_freq_top(sideways_pool, top_n=10,
+                                                      min_triggers=5, min_score=65.0,
+                                                      max_conditions=3, max_overlap=0.5,
+                                                      min_state_rate=_min_state_rate)
+                else:
+                    return self._select_high_freq_top(high_freq_candidates, top_n=6,
+                                                      min_triggers=10, min_score=70.0,
+                                                      max_conditions=3, max_overlap=0.5)
 
-        # 构建两层结构：精品层 + 高频层
         TIERS = [
-            ("精品", "精品层（高质量：评分≥80）", ACCENT_GOLD, _BG_TIER_ELITE),
-            ("高频", "高频层（高触发：2-3条件，触发≥10）", TIER_HIGH_FREQ, _BG_TIER_FREQ),
+            ("精品", "精品层（高质量：评分≥80）",               ACCENT_GOLD,    _BG_TIER_ELITE),
+            ("高频", "高频层（触发优先；震荡市扩容至10个）",      TIER_HIGH_FREQ, _BG_TIER_FREQ),
         ]
 
         # 先收集精品层的组合key，用于高频层去重

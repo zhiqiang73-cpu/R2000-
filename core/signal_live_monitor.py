@@ -138,7 +138,7 @@ class SignalLiveMonitor:
 
         精品优先策略：
         1. 过滤在该市场状态下有触发记录的组合 (total_triggers > 0)
-        2. 按 tier 分组（精品 / 高频）
+        2. 按 tier 分组（精品 / 高频），两层兜底
         3. 精品层有触发 → 只从精品层选；精品层无触发 → 从高频层选
         4. 同层内按方向偏向选最高评分：
            - 多头趋势: 优先 long，次选 short
@@ -193,7 +193,7 @@ class SignalLiveMonitor:
             else:  # 震荡市
                 return max(pool, key=lambda x: x[1].get('综合评分', 0.0))
 
-        # 2. 精品优先：精品层有触发就只用精品，否则用高频
+        # 精品 → 高频，两层兜底
         elite_pool = [x for x in valid_triggered if x[2] == "精品"]
         result = _pick_by_direction(elite_pool)
         if result:
