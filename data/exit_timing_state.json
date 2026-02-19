@@ -9,26 +9,27 @@
   "state": {
     "data_version": 1,
     "created_at": 1771460922.2447605,
-    "last_save_time": 1771475985.7578557,
+    "last_save_time": 1771488195.1311464,
     "total_exits_recorded": 1,
-    "total_evaluations_done": 0,
+    "total_evaluations_done": 1,
     "total_adjustments_applied": 0
   },
   "reason_scores": {
     "止盈": {
       "close_reason": "止盈",
       "premature_count": 0,
-      "correct_count": 0,
+      "correct_count": 1,
       "late_count": 0,
-      "total": 0,
-      "correct": 0,
+      "total": 1,
+      "correct": 1,
       "total_left_on_table_pct": 0.0,
       "total_excess_retracement_pct": 0.0,
-      "recent_verdicts": []
+      "recent_verdicts": [
+        "correct"
+      ]
     }
   },
-  "history": [],
-  "pending_eval": [
+  "history": [
     {
       "id": "3dc86ad2-a20b-45d7-aaeb-4a28c0b4e972",
       "timestamp": 1771460916.6933246,
@@ -44,14 +45,15 @@
       "market_regime": "震荡偏空",
       "bar_idx_at_exit": 502,
       "template_fingerprint": "",
-      "evaluated": false,
-      "price_after_eval": null,
-      "bars_tracked": 1,
+      "evaluated": true,
+      "price_after_eval": 66705.5,
+      "bars_tracked": 30,
       "max_favorable_pct": 0.0,
       "max_adverse_pct": 0.8754,
       "price_at_max_favorable": null,
-      "verdict": "",
-      "evaluation_time": null
+      "verdict": "correct",
+      "evaluation_time": 1771479241.3287034
     }
-  ]
+  ],
+  "pending_eval": []
 }

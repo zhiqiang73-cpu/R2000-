@@ -735,15 +735,23 @@ class ChartWidget(QtWidgets.QWidget):
         if 'volume' in df_slice.columns:
             x = np.arange(actual_start, actual_start + n)
             height = df_slice['volume'].values
-            colors = []
-            for i in range(len(df_slice)):
-                c = df_slice['close'].values[i]
-                o = df_slice['open'].values[i]
-                color_hex = UI_CONFIG["CHART_UP_COLOR"] if c >= o else UI_CONFIG["CHART_DOWN_COLOR"]
-                qcolor = QtGui.QColor(color_hex)
-                qcolor.setAlpha(180) # 略微透明，更专业
-                colors.append(pg.mkBrush(qcolor))
-            
+            close_vals = df_slice['close'].values
+            open_vals = df_slice['open'].values
+
+            # 复用 brush，避免每帧创建大量 QColor/Brush 对象
+            if not hasattr(self, "_volume_up_brush"):
+                up_qcolor = QtGui.QColor(UI_CONFIG["CHART_UP_COLOR"])
+                up_qcolor.setAlpha(180)
+                down_qcolor = QtGui.QColor(UI_CONFIG["CHART_DOWN_COLOR"])
+                down_qcolor.setAlpha(180)
+                self._volume_up_brush = pg.mkBrush(up_qcolor)
+                self._volume_down_brush = pg.mkBrush(down_qcolor)
+
+            up_mask = close_vals >= open_vals
+            colors = [
+                self._volume_up_brush if is_up else self._volume_down_brush
+                for is_up in up_mask
+            ]
             self.volume_bars.setOpts(x=x, height=height, brushes=colors, width=0.8)
         
         # 更新实时价格线

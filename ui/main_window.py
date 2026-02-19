@@ -3476,7 +3476,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 # 初始化冷启动面板状态
                 self._init_cold_start_panel_from_engine()
                 
-                if has_prototypes:
+                if getattr(self._live_engine, "use_signal_mode", False):
+                    self.statusBar().showMessage(
+                        f"模拟交易已启动: {config['symbol']} | 精品+高频信号模式（精品优先）"
+                    )
+                elif has_prototypes:
                     mode_msg = f"聚合指纹图模式({ '已验证原型' if use_verified_protos else '全原型' })"
                     self.statusBar().showMessage(f"模拟交易已启动: {config['symbol']} | {mode_msg}")
                 else:
@@ -3744,6 +3748,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if getattr(state, 'signal_mode_active', False) or getattr(self._live_engine, 'use_signal_mode', False):
                 sm_info = getattr(state, 'signal_mode_info', {}) or {}
                 self.paper_trading_tab.status_panel.update_signal_mode_info(sm_info)
+                self.paper_trading_tab.control_panel.update_signal_mode_info(sm_info)
 
             # 更新模板统计
             profitable = len(self._live_engine.get_profitable_templates())

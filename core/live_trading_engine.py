@@ -257,7 +257,9 @@ class LiveTradingEngine:
         self.on_trade_closed = on_trade_closed
         self.on_error = on_error
         self._last_state_push_ts = 0.0
-        self._state_push_min_interval = 0.5
+        self._state_push_min_interval = float(
+            PAPER_TRADING_CONFIG.get("STATE_PUSH_INTERVAL_SEC", 1.0)
+        )
         
         # 自适应控制器
         self.adaptive_controller = adaptive_controller
@@ -762,7 +764,9 @@ class LiveTradingEngine:
             f"[LiveEngine] 执行参数固定: 杠杆={self.fixed_leverage}x | "
             f"单次仓位={self.fixed_position_size_pct:.0%}"
         )
-        if self.use_prototypes:
+        if self.use_signal_mode:
+            print("[LiveEngine] 模式: 精品+高频信号（精品优先）")
+        elif self.use_prototypes:
             proto_count = self._active_prototype_library.total_count if self._active_prototype_library is not None else 0
             print(f"[LiveEngine] 模式: 聚合指纹图（原型）")
             print(f"[LiveEngine] 原型库: {proto_count} 个原型")
@@ -1421,15 +1425,17 @@ class LiveTradingEngine:
                 from core.signal_live_monitor import SignalLiveMonitor
                 self._signal_live_monitor = SignalLiveMonitor()
             if self._df_buffer is not None and len(self._df_buffer) > 0:
+                df_idx = self._get_df_bar_idx()
                 # 获取精品池的 combo_keys（3状态 × 多空 × Top6 = 最多36个）
                 from core import signal_store as _sig_store
                 premium_pool = _sig_store.get_premium_pool()   # 全部精品池
                 premium_keys = [item["combo_key"] for item in premium_pool]
                 # 只检测精品池内的组合
                 self._pending_signal_combos = self._signal_live_monitor.on_bar(
-                    self._df_buffer, self._current_bar_idx, pool_keys=premium_keys
+                    self._df_buffer, df_idx, pool_keys=premium_keys
                 )
         except Exception as _e:
+            print(f"[LiveEngine] 信号监控异常: {_e}")
             self._pending_signal_combos = []
         
         # 事后评估被拒绝的交易（门控自适应学习）
@@ -1577,6 +1583,12 @@ class LiveTradingEngine:
             print(f"[LiveEngine] 更新特征失败: {e}")
             return False
     
+    def _get_df_bar_idx(self) -> int:
+        """Return a safe index into _df_buffer for current bar."""
+        if self._df_buffer is None or len(self._df_buffer) == 0:
+            return -1
+        return min(self._current_bar_idx, len(self._df_buffer) - 1)
+
     def _get_current_atr(self) -> float:
         """获取当前ATR"""
         if self._df_buffer is None or 'atr' not in self._df_buffer.columns:
@@ -1923,7 +1935,11 @@ class LiveTradingEngine:
         # 4. 获取市场状态 (3态)
         try:
             from core.market_state_detector import detect_state
-            row = self._df_buffer.iloc[self._current_bar_idx]
+            df_idx = self._get_df_bar_idx()
+            if df_idx < 0:
+                self.state.last_event = "[精品信号] 指标未就绪 (空数据)"
+                return
+            row = self._df_buffer.iloc[df_idx]
             adx = row.get('adx')
             ma5_slope = row.get('ma5_slope')
             
@@ -2127,7 +2143,8 @@ class LiveTradingEngine:
     ) -> List[dict]:
         if not pool_items:
             return []
-        cond_arrays = self._get_signal_condition_arrays(direction, self._current_bar_idx)
+        df_idx = self._get_df_bar_idx()
+        cond_arrays = self._get_signal_condition_arrays(direction, df_idx)
         annotated: List[dict] = []
         alias_map = {
             "boll_position": "boll_pos",
@@ -2157,7 +2174,7 @@ class LiveTradingEngine:
                     hit = False
                     for key in _candidate_keys(cond):
                         arr = cond_arrays.get(key)
-                        if arr is not None and self._current_bar_idx < len(arr) and bool(arr[self._current_bar_idx]):
+                        if arr is not None and df_idx < len(arr) and bool(arr[df_idx]):
                             hit = True
                             break
                     if hit:
@@ -2242,8 +2259,9 @@ class LiveTradingEngine:
             pre_entry_window = TRAJECTORY_CONFIG.get("PRE_ENTRY_WINDOW", 60)
             
             # 获取入场前轨迹
-            start_idx = max(0, self._current_bar_idx - pre_entry_window)
-            pre_entry_traj = self._fv_engine.get_raw_matrix(start_idx, self._current_bar_idx + 1)
+            df_idx = self._get_df_bar_idx()
+            start_idx = max(0, df_idx - pre_entry_window)
+            pre_entry_traj = self._fv_engine.get_raw_matrix(start_idx, df_idx + 1)
             
             if pre_entry_traj.size == 0:
                 self.state.matching_phase = "等待"
@@ -3453,8 +3471,9 @@ class LiveTradingEngine:
         if self.use_signal_mode:
             try:
                 from core.market_state_detector import detect_state
-                if self._df_buffer is not None and self._current_bar_idx >= 0:
-                    row = self._df_buffer.iloc[self._current_bar_idx]
+                df_idx = self._get_df_bar_idx()
+                if self._df_buffer is not None and df_idx >= 0:
+                    row = self._df_buffer.iloc[df_idx]
                     adx = row.get('adx')
                     ma5_slope = row.get('ma5_slope')
                     if pd.isna(adx) or pd.isna(ma5_slope):
@@ -3476,8 +3495,9 @@ class LiveTradingEngine:
         try:
             from config import TRAJECTORY_CONFIG
             pre_entry_window = TRAJECTORY_CONFIG.get("PRE_ENTRY_WINDOW", 60)
-            start_idx = max(0, self._current_bar_idx - pre_entry_window)
-            pre_entry_traj = self._fv_engine.get_raw_matrix(start_idx, self._current_bar_idx + 1)
+            df_idx = self._get_df_bar_idx()
+            start_idx = max(0, df_idx - pre_entry_window)
+            pre_entry_traj = self._fv_engine.get_raw_matrix(start_idx, df_idx + 1)
             if pre_entry_traj.size == 0:
                 return
 
@@ -4107,8 +4127,9 @@ class LiveTradingEngine:
         
         try:
             # 获取持仓轨迹
+            df_idx = self._get_df_bar_idx()
             holding_traj = self._fv_engine.get_raw_matrix(
-                order.entry_bar_idx, self._current_bar_idx + 1
+                order.entry_bar_idx, df_idx + 1
             )
             
             if holding_traj.size == 0:
@@ -5693,8 +5714,9 @@ class LiveTradingEngine:
         try:
             from config import TRAJECTORY_CONFIG
             pre_entry_window = TRAJECTORY_CONFIG.get("PRE_ENTRY_WINDOW", 60)
-            start_idx = max(0, self._current_bar_idx - pre_entry_window)
-            pre_entry_traj = self._fv_engine.get_raw_matrix(start_idx, self._current_bar_idx + 1)
+            df_idx = self._get_df_bar_idx()
+            start_idx = max(0, df_idx - pre_entry_window)
+            pre_entry_traj = self._fv_engine.get_raw_matrix(start_idx, df_idx + 1)
             
             if pre_entry_traj.size > 0:
                 # 优先原型匹配

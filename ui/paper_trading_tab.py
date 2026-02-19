@@ -33,10 +33,10 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._kelly_last_update_ts = 0.0
-        self._kelly_blink_state = False
+        self._kelly_alive_state = None
         self._kelly_timer = QtCore.QTimer(self)
         self._kelly_timer.timeout.connect(self._update_kelly_heartbeat)
-        self._kelly_timer.start(500)
+        self._kelly_timer.start(1000)
         self._init_ui()
     
     def _init_ui(self):
@@ -222,6 +222,7 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         
         # === 聚合指纹图筛选 ===
         template_group = QtWidgets.QGroupBox("聚合指纹图筛选")
+        self.template_group = template_group
         template_layout = QtWidgets.QVBoxLayout(template_group)
         
         self.use_all_radio = QtWidgets.QRadioButton("使用全部聚合指纹图")
@@ -355,9 +356,37 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         )
         self.signal_mode_checkbox.stateChanged.connect(self._on_signal_mode_changed)
         control_layout.addWidget(self.signal_mode_checkbox)
+        # 初始化一次标题状态，避免默认勾选时仍显示“聚合指纹图筛选”
+        self._on_signal_mode_changed(self.signal_mode_checkbox.checkState().value)
         
         layout.addWidget(control_group)
         
+        # === 精品信号状态（紧凑） ===
+        self.signal_compact_group = QtWidgets.QGroupBox("精品信号状态")
+        signal_compact_layout = QtWidgets.QFormLayout(self.signal_compact_group)
+        signal_compact_layout.setContentsMargins(8, 6, 8, 6)
+        signal_compact_layout.setSpacing(4)
+
+        self.compact_sm_state_label = QtWidgets.QLabel("-")
+        self.compact_sm_state_label.setStyleSheet("font-size: 12px; font-weight: bold; color: #888;")
+        signal_compact_layout.addRow("状态:", self.compact_sm_state_label)
+
+        self.compact_sm_today_label = QtWidgets.QLabel("0 次")
+        self.compact_sm_today_label.setStyleSheet("font-size: 11px; color: #bbb;")
+        signal_compact_layout.addRow("今日:", self.compact_sm_today_label)
+
+        self.compact_sm_pool_label = QtWidgets.QLabel("等待引擎启动")
+        self.compact_sm_pool_label.setWordWrap(True)
+        self.compact_sm_pool_label.setStyleSheet("font-size: 11px; color: #8aa;")
+        signal_compact_layout.addRow("池子:", self.compact_sm_pool_label)
+
+        self.compact_sm_trigger_label = QtWidgets.QLabel("等待触发...")
+        self.compact_sm_trigger_label.setWordWrap(True)
+        self.compact_sm_trigger_label.setStyleSheet("font-size: 10px; color: #9aa;")
+        signal_compact_layout.addRow("触发:", self.compact_sm_trigger_label)
+
+        layout.addWidget(self.signal_compact_group)
+
         # === 运行状态 ===
         status_group = QtWidgets.QGroupBox("运行状态")
         status_layout = QtWidgets.QFormLayout(status_group)
@@ -467,11 +496,47 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         # 更新引擎（如果已经运行）
         if hasattr(self, '_engine') and self._engine:
             self._engine.use_signal_mode = enabled
+        if hasattr(self, "template_group"):
+            self.template_group.setTitle("信号模式（指纹匹配已暂停）" if enabled else "聚合指纹图筛选")
         print(f"[UI] 精品信号模式: {'开启' if enabled else '关闭'}")
 
     def update_signal_mode_info(self, info: dict):
-        """转发到 status_panel（标签在那边）"""
-        pass
+        """更新左侧紧凑版精品信号状态"""
+        market_state = info.get("state", "-") if info else "-"
+        today_count = info.get("today_count", 0) if info else 0
+        pool_total = int(info.get("pool_total", 0) or 0) if info else 0
+        combo_key = info.get("combo_key", "") if info else ""
+        direction = info.get("direction", "")
+        score = float(info.get("score", 0.0) or 0.0) if info else 0.0
+
+        # 状态颜色
+        state_color = "#888"
+        if "多头" in market_state:
+            state_color = "#089981"
+        elif "空头" in market_state:
+            state_color = "#f23645"
+        elif "震荡" in market_state:
+            state_color = "#FFB74D"
+        self.compact_sm_state_label.setText(market_state if market_state != "-" else "等待")
+        self.compact_sm_state_label.setStyleSheet(
+            f"font-size: 12px; font-weight: bold; color: {state_color};"
+        )
+        self.compact_sm_today_label.setText(f"{today_count} 次")
+        self.compact_sm_pool_label.setText(f"已加载 {pool_total} 个策略")
+
+        if combo_key:
+            dir_text = "做多" if direction == "long" else ("做空" if direction == "short" else "-")
+            dir_color = "#089981" if direction == "long" else "#f23645"
+            self.compact_sm_trigger_label.setText(
+                f"<span style='color:{dir_color};font-weight:bold;'>{dir_text}</span> "
+                f"命中 · 评分{score:.1f}"
+            )
+        elif info and info.get("warning"):
+            self.compact_sm_trigger_label.setText(
+                f"<span style='color:#f23645;'>{info['warning']}</span>"
+            )
+        else:
+            self.compact_sm_trigger_label.setText("无触发")
     
     def _on_clear_memory_clicked(self):
         """清除学习记忆按钮点击"""
@@ -664,12 +729,12 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         """更新凯利心跳灯"""
         import time
         elapsed = time.time() - self._kelly_last_update_ts
-        self._kelly_blink_state = not self._kelly_blink_state
-        if elapsed > 3.0:
-            self.kelly_heartbeat_label.setStyleSheet("color: #666; font-size: 12px;")
-        else:
-            color = "#00E676" if self._kelly_blink_state else "#0a5c33"
-            self.kelly_heartbeat_label.setStyleSheet(f"color: {color}; font-size: 12px;")
+        is_alive = elapsed <= 3.0
+        if is_alive == self._kelly_alive_state:
+            return
+        self._kelly_alive_state = is_alive
+        style = "color: #00E676; font-size: 12px;" if is_alive else "color: #666; font-size: 12px;"
+        self.kelly_heartbeat_label.setStyleSheet(style)
 
 
 class PaperTradingStatusPanel(QtWidgets.QWidget):
@@ -684,15 +749,26 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # 心跳监控
         self._heartbeats = {}  # {模块名: 最后更新时间}
         self._heartbeat_indicators = {}  # {模块名: QLabel}
+        self._heartbeat_alive_states = {}  # {模块名: bool}
         self._heartbeat_timer = QtCore.QTimer()
         self._heartbeat_timer.timeout.connect(self._update_heartbeats)
-        self._heartbeat_timer.start(500)  # 每500ms检查一次
-        self._heartbeat_blink_state = False
+        self._heartbeat_timer.start(1000)  # 每1000ms检查一次，减少样式重算
+        self._heartbeat_alive_style = "color: #00E676; font-size: 12px;"
+        self._heartbeat_idle_style = "color: #666; font-size: 12px;"
+
+        # 信号模式池缓存：避免每次状态更新都重新进行全池筛选
+        self._signal_pool_cache = {}
+        self._signal_pool_cache_total = 0
+        self._signal_pool_cache_ts = 0.0
+        self._signal_pool_cache_ttl_sec = 12.0
+        self._last_signal_html = ""
+        self._last_sm_state_style = ""
+        self._last_sm_pool_style = ""
         
         self._init_ui()
     
     def _init_ui(self):
-        self.setMinimumWidth(280)  # 最小宽度，可与左侧分隔条拖拽拉宽
+        self.setMinimumWidth(420)  # 最小宽度，确保所有标签页tab可见
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: {UI_CONFIG['THEME_BACKGROUND']};
@@ -787,13 +863,10 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # ══════ Tab 3: 匹配 ══════
         self._create_matching_tab()
 
-        # ══════ Tab 4: 委托单 ══════
-        self._create_pending_tab()
-
-        # ══════ Tab 5: 推理 ══════
+        # ══════ Tab 4: 推理 ══════
         self._create_monitoring_tab()
         
-        # ══════ Tab 6: 日志 ══════
+        # ══════ Tab 5: 日志 ══════
         self._create_log_tab()
         
         layout.addWidget(self.tabs)
@@ -802,98 +875,166 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         """创建精品信号模式监控标签页"""
         tab = QtWidgets.QWidget()
         tab_layout = QtWidgets.QVBoxLayout(tab)
-        tab_layout.setContentsMargins(12, 12, 12, 12)
-        tab_layout.setSpacing(10)
+        tab_layout.setContentsMargins(10, 8, 10, 8)
+        tab_layout.setSpacing(6)
         
-        # 标题
-        title_label = QtWidgets.QLabel("💎 精品信号匹配")
-        title_label.setStyleSheet(f"color: {UI_CONFIG['THEME_ACCENT']}; font-weight: bold; font-size: 14px;")
-        tab_layout.addWidget(title_label)
-        
-        # 市场状态卡片
-        state_card = QtWidgets.QWidget()
-        state_card.setStyleSheet("""
+        # 顶部紧凑状态条（缩小高度，把空间留给策略池）
+        top_info = QtWidgets.QWidget()
+        top_info.setStyleSheet("""
             QWidget {
-                background-color: #252526;
-                border: 1px solid #3a3a3a;
-                border-radius: 6px;
+                background-color: #1f2124;
+                border: 1px solid #333;
+                border-radius: 4px;
             }
         """)
-        state_layout = QtWidgets.QFormLayout(state_card)
-        state_layout.setContentsMargins(15, 12, 15, 12)
-        state_layout.setSpacing(10)
-        
+        top_layout = QtWidgets.QVBoxLayout(top_info)
+        top_layout.setContentsMargins(8, 4, 8, 4)
+        top_layout.setSpacing(2)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+
         self.sm_market_state_label = QtWidgets.QLabel("-")
-        self.sm_market_state_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #aaa;")
-        state_layout.addRow("当前市场状态:", self.sm_market_state_label)
-        
+        self.sm_market_state_label.setStyleSheet("font-size: 12px; font-weight: bold; color: #aaa;")
+        row.addWidget(self.sm_market_state_label)
+
         self.sm_today_count_label = QtWidgets.QLabel("0 次")
-        self.sm_today_count_label.setStyleSheet("font-size: 14px; color: #ccc;")
-        state_layout.addRow("今日触发次数:", self.sm_today_count_label)
-        
+        self.sm_today_count_label.setStyleSheet("font-size: 11px; color: #ccc;")
+        row.addWidget(self.sm_today_count_label)
+
         self.sm_pool_status_label = QtWidgets.QLabel("正在检查...")
-        self.sm_pool_status_label.setStyleSheet("font-size: 12px; color: #888;")
-        state_layout.addRow("策略池状态:", self.sm_pool_status_label)
-        
-        tab_layout.addWidget(state_card)
-        
-        # 最新触发组合卡片
-        trigger_card = QtWidgets.QGroupBox("最新触发组合")
-        trigger_card.setStyleSheet(f"""
-            QGroupBox {{
-                border: 1px solid #3a3a3a;
-                border-radius: 6px;
-                margin-top: 15px;
-                padding-top: 15px;
-                font-weight: bold;
-                color: {UI_CONFIG['THEME_TEXT']};
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }}
-        """)
-        trigger_layout = QtWidgets.QVBoxLayout(trigger_card)
-        
+        self.sm_pool_status_label.setStyleSheet("font-size: 11px; color: #888;")
+        row.addWidget(self.sm_pool_status_label, 1)
+        top_layout.addLayout(row)
+
         self.sm_trigger_info_label = QtWidgets.QLabel("等待信号触发...")
         self.sm_trigger_info_label.setWordWrap(True)
-        self.sm_trigger_info_label.setStyleSheet("font-size: 13px; color: #bbb; line-height: 1.5; padding: 5px;")
-        trigger_layout.addWidget(self.sm_trigger_info_label)
-        
-        tab_layout.addWidget(trigger_card)
+        self.sm_trigger_info_label.setStyleSheet("font-size: 10px; color: #9aa;")
+        self.sm_trigger_info_label.setMaximumHeight(28)
+        top_layout.addWidget(self.sm_trigger_info_label)
 
-        # 精品池明细卡片（三状态分组，含精品+高频双层）
-        pool_card = QtWidgets.QGroupBox("精品策略池（按市场状态）— 精品(金色) + 高频(青色)")
-        pool_card.setStyleSheet(f"""
-            QGroupBox {{
-                border: 1px solid #3a3a3a;
-                border-radius: 6px;
-                margin-top: 15px;
-                padding-top: 15px;
-                font-weight: bold;
-                color: {UI_CONFIG['THEME_TEXT']};
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }}
+        tab_layout.addWidget(top_info)
+
+        # ── 上方：指标×状态 网格表（可折叠）──────────────────────────
+        pool_card = QtWidgets.QWidget()
+        pool_card.setStyleSheet("""
+            QWidget { background-color: #1e1e1e; border: 1px solid #3a3a3a; border-radius: 6px; }
         """)
         pool_vbox = QtWidgets.QVBoxLayout(pool_card)
         pool_vbox.setSpacing(0)
-        pool_vbox.setContentsMargins(4, 4, 4, 4)
+        pool_vbox.setContentsMargins(6, 6, 6, 6)
 
-        self.sm_all_states_text = QtWidgets.QTextEdit()
-        self.sm_all_states_text.setReadOnly(True)
-        self.sm_all_states_text.setStyleSheet(
-            "background-color:#1a1a1a; color:#ccc; border:none;"
+        # 标题栏（含折叠按钮）
+        pool_header_widget = QtWidgets.QWidget()
+        pool_header = QtWidgets.QHBoxLayout(pool_header_widget)
+        pool_header.setContentsMargins(0, 0, 0, 0)
+        pool_header.setSpacing(6)
+
+        self._pool_expand_btn = QtWidgets.QPushButton("▼")
+        self._pool_expand_btn.setFixedSize(20, 20)
+        self._pool_expand_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent; border: none;
+                color: #909090; font-size: 12px; font-weight: bold;
+            }
+            QPushButton:hover { color: #c0c0c0; }
+        """)
+        self._pool_expand_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self._pool_expand_btn.setToolTip("点击折叠/展开指标×状态总览表")
+        pool_header.addWidget(self._pool_expand_btn)
+        pool_title = QtWidgets.QLabel("精品策略池（按市场状态）— 精品(金色) + 高频(青色)")
+        pool_title.setStyleSheet(f"color: {UI_CONFIG['THEME_TEXT']}; font-weight: bold; font-size: 12px;")
+        pool_header.addWidget(pool_title)
+        pool_header.addStretch()
+        pool_vbox.addWidget(pool_header_widget)
+
+        # 可折叠的网格表区域
+        self._pool_table_widget = QtWidgets.QWidget()
+        pool_table_layout = QtWidgets.QVBoxLayout(self._pool_table_widget)
+        pool_table_layout.setContentsMargins(0, 4, 0, 0)
+        pool_table_layout.setSpacing(0)
+        self.sm_table_text = QtWidgets.QTextEdit()
+        self.sm_table_text.setReadOnly(True)
+        self.sm_table_text.setMinimumHeight(160)
+        self.sm_table_text.setMaximumHeight(260)
+        self.sm_table_text.setStyleSheet("background-color:#1a1a1a; color:#ccc; border:none;")
+        pool_table_layout.addWidget(self.sm_table_text)
+        pool_vbox.addWidget(self._pool_table_widget)
+
+        tab_layout.addWidget(pool_card)   # 固定高度，不拉伸
+
+        # 折叠/展开逻辑
+        def _toggle_pool_expand():
+            is_visible = self._pool_table_widget.isVisible()
+            if is_visible:
+                self._pool_table_widget.setVisible(False)
+                self._pool_expand_btn.setText("▶")
+            else:
+                self._pool_table_widget.setVisible(True)
+                self._pool_expand_btn.setText("▼")
+
+        self._pool_expand_btn.clicked.connect(_toggle_pool_expand)
+
+        # ── 下方：当前触发情况明细（始终可见）──────────────────────
+        self.sm_detail_text = QtWidgets.QTextEdit()
+        self.sm_detail_text.setReadOnly(True)
+        self.sm_detail_text.setStyleSheet(
+            "background-color:#1a1a1a; color:#ccc; border:1px solid #3a3a3a; border-radius:4px;"
         )
-        pool_vbox.addWidget(self.sm_all_states_text)
+        tab_layout.addWidget(self.sm_detail_text, 1)   # stretch=1，占满剩余空间
 
-        tab_layout.addWidget(pool_card, 1)   # stretch=1 让明细区域占满剩余空间
-        
+        # 向后兼容：sm_all_states_text 指向 detail，避免旧引用出错
+        self.sm_all_states_text = self.sm_detail_text
+
         self.tabs.addTab(tab, "精品")
+
+    def _get_cached_signal_pools(
+        self,
+        market_state: str,
+        engine_long_pool: list,
+        engine_short_pool: list,
+    ) -> tuple:
+        """缓存全状态策略池，避免高频 O(N²) 重复筛选。"""
+        import time
+
+        now = time.time()
+        should_reload = (
+            not self._signal_pool_cache
+            or (now - self._signal_pool_cache_ts >= self._signal_pool_cache_ttl_sec)
+        )
+
+        if should_reload:
+            all_states = ["多头趋势", "空头趋势", "震荡市"]
+            reloaded = {}
+            pool_total = 0
+            try:
+                from core import signal_store
+                for st in all_states:
+                    lp = signal_store.get_premium_pool(state=st, direction="long")
+                    sp = signal_store.get_premium_pool(state=st, direction="short")
+                    reloaded[st] = {"long": lp, "short": sp}
+                    pool_total += len(lp) + len(sp)
+            except Exception:
+                reloaded = {}
+                pool_total = 0
+            self._signal_pool_cache = reloaded
+            self._signal_pool_cache_total = pool_total
+            self._signal_pool_cache_ts = now
+
+        all_state_pools = {
+            st: {
+                "long": list((val or {}).get("long", [])),
+                "short": list((val or {}).get("short", [])),
+            }
+            for st, val in self._signal_pool_cache.items()
+        }
+        if market_state in all_state_pools:
+            if engine_long_pool:
+                all_state_pools[market_state]["long"] = engine_long_pool
+            if engine_short_pool:
+                all_state_pools[market_state]["short"] = engine_short_pool
+        return all_state_pools, int(self._signal_pool_cache_total or 0)
 
     def update_signal_mode_info(self, info: dict):
         """更新精品信号模式状态面板（由 main_window 状态回调调用）"""
@@ -905,24 +1046,9 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         engine_long_pool  = info.get("long_pool",  []) if info else []
         engine_short_pool = info.get("short_pool", []) if info else []
 
-        # === 始终从 signal_store 读取三个状态的完整精品池 ===
-        _ALL_STATES = ["多头趋势", "空头趋势", "震荡市"]
-        all_state_pools: dict = {}   # state -> {"long": [...], "short": [...]}
-        pool_total = 0
-        try:
-            from core import signal_store
-            for st in _ALL_STATES:
-                lp = signal_store.get_premium_pool(state=st, direction="long")
-                sp = signal_store.get_premium_pool(state=st, direction="short")
-                # 若引擎正在运行且当前状态匹配，用已注解版本替换（保留绿/红条件信息）
-                if st == market_state and engine_long_pool:
-                    lp = engine_long_pool
-                if st == market_state and engine_short_pool:
-                    sp = engine_short_pool
-                all_state_pools[st] = {"long": lp, "short": sp}
-                pool_total += len(lp) + len(sp)
-        except Exception:
-            pass
+        all_state_pools, pool_total = self._get_cached_signal_pools(
+            market_state, engine_long_pool, engine_short_pool
+        )
 
         _engine_stopped = (not info) or market_state == "-"
 
@@ -936,10 +1062,11 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             state_color = "#FFB74D"
 
         self.sm_market_state_label.setText(market_state if market_state != "-" else "等待引擎启动")
-        self.sm_market_state_label.setStyleSheet(
-            f"font-size: 16px; font-weight: bold; color: {state_color};"
-        )
-        self.sm_today_count_label.setText(f"{today_count} 次")
+        state_style = f"font-size: 12px; font-weight: bold; color: {state_color};"
+        if state_style != self._last_sm_state_style:
+            self.sm_market_state_label.setStyleSheet(state_style)
+            self._last_sm_state_style = state_style
+        self.sm_today_count_label.setText(f"今日触发: {today_count} 次")
 
         # ── 触发组合卡片 ──
         if info and info.get("combo_key"):
@@ -952,12 +1079,14 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                 cond_desc = _format_conditions(conditions, direction)
             except Exception:
                 cond_desc = " & ".join(conditions[:3])
+            if len(cond_desc) > 90:
+                cond_desc = cond_desc[:90] + "..."
             dir_color = '#089981' if direction == 'long' else '#f23645'
             self.sm_trigger_info_label.setText(
-                f"<b>方向:</b> <span style='color:{dir_color}'>"
-                f"{'做多' if direction == 'long' else '做空'}</span><br>"
-                f"<b>条件:</b> {cond_desc}<br>"
-                f"<b>评分:</b> {score:.1f}  <b>时间:</b> {trigger_time}"
+                f"<span style='color:{dir_color};font-weight:bold;'>"
+                f"{'做多' if direction == 'long' else '做空'}</span> · "
+                f"评分 {score:.1f} · {trigger_time}<br>"
+                f"<span style='color:#9aa;'>条件: {cond_desc}</span>"
             )
         elif info and info.get("warning"):
             self.sm_trigger_info_label.setText(
@@ -971,41 +1100,42 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # ── 策略池状态标签 ──
         if pool_total == 0:
             self.sm_pool_status_label.setText("⚠ 策略池为空，请先完成信号分析")
-            self.sm_pool_status_label.setStyleSheet(
-                "font-size: 12px; color: #f23645; font-weight: bold;"
-            )
+            pool_style = "font-size: 12px; color: #f23645; font-weight: bold;"
         elif _engine_stopped:
             self.sm_pool_status_label.setText(
-                f"✅ 已加载策略池: 共 {pool_total} 个策略（3状态×多空 Top6）— 引擎待启动"
+                f"池子 {pool_total} | 引擎待启动"
             )
-            self.sm_pool_status_label.setStyleSheet("font-size: 12px; color: #FFB74D;")
+            pool_style = "font-size: 12px; color: #FFB74D;"
         else:
             cur_l = len(engine_long_pool)
             cur_s = len(engine_short_pool)
             self.sm_pool_status_label.setText(
-                f"当前[{market_state}]: 做多{cur_l} / 做空{cur_s}  (总{pool_total}/36)"
+                f"[{market_state}] 多{cur_l} 空{cur_s} / 总{pool_total}"
             )
-            self.sm_pool_status_label.setStyleSheet("font-size: 12px; color: #089981;")
+            pool_style = "font-size: 12px; color: #089981;"
+        if pool_style != self._last_sm_pool_style:
+            self.sm_pool_status_label.setStyleSheet(pool_style)
+            self._last_sm_pool_style = pool_style
 
-        # ── 三状态精品池明细 ──
-        self.sm_all_states_text.setHtml(
-            self._format_all_states_html(all_state_pools, market_state, triggered_keys)
-        )
+        # ── 三状态精品池明细（网格表 + 触发明细，分两个widget）──
+        grid_html, detail_html = self._format_all_states_html(all_state_pools, market_state, triggered_keys)
+        if grid_html != getattr(self, '_last_grid_html', None):
+            self.sm_table_text.setHtml(grid_html)
+            self._last_grid_html = grid_html
+        if detail_html != self._last_signal_html:
+            self.sm_detail_text.setHtml(detail_html)
+            self._last_signal_html = detail_html
 
     def _format_all_states_html(
         self,
         all_state_pools: dict,   # state -> {"long": [...], "short": [...]}
         current_state: str,
         triggered_keys: set,
-    ) -> str:
+    ):
         """
-        指标×状态 表格视图（精品+高频双层颜色区分）。
-        - 行 = 指标类别（布林位置、偏离MA5、ATR波动率…）
-        - 列 = 3状态 × 做多/做空 = 6列
-        - 单元格 = (1/2/3) + 亮灯/灭灯
-          精品策略编号用金色，高频策略编号用青色
-        - 当前状态列高亮边框
-        - 表格下方：全亮策略摘要（含层级标签）
+        返回 (grid_html, detail_html) 元组：
+        - grid_html:   指标×状态 网格总览表（可折叠）
+        - detail_html: 当前状态触发明细（始终显示）
         """
         # ── 层级颜色 ──────────────────────────────────────────────
         TIER_COLOR_ELITE = "#D9B36A"  # 精品 - 金色
@@ -1050,6 +1180,30 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                     return cond[:-len(s)]
             return cond
 
+        try:
+            from core.signal_utils import _cond_label as _format_cond_label
+        except Exception:
+            _format_cond_label = None
+
+        def _describe_cond(cond: str, direction: str) -> str:
+            if _format_cond_label is None:
+                return cond
+            try:
+                return _format_cond_label(cond, direction)
+            except Exception:
+                return cond
+
+        def _cond_details_html(conditions: list, matched: set, direction: str) -> str:
+            details = []
+            for cond in conditions:
+                is_hit = cond in matched
+                color = "#4CAF50" if is_hit else "#f23645"
+                mark = "✓" if is_hit else "✗"
+                details.append(
+                    f"<span style='color:{color};'>{mark} {_describe_cond(cond, direction)}</span>"
+                )
+            return " ｜ ".join(details)
+
         # ── 构建每列的指标倒排索引 ──────────────────────────────────
         # col_map[(state, dir)] = {base: [(strategy_idx, is_matched_or_None, tier), ...]}
         col_map: dict = {}
@@ -1089,8 +1243,9 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         for v in col_map.values():
             all_used.update(v.keys())
         if not all_used:
-            return ("<div style='color:#555;padding:20px;text-align:center;'>"
-                    "无精品策略，请先完成信号分析</div>")
+            empty = ("<div style='color:#555;padding:20px;text-align:center;'>"
+                     "无精品策略，请先完成信号分析</div>")
+            return empty, empty
 
         ordered = [b for b in INDICATOR_ORDER if b in all_used]
         ordered += sorted(all_used - set(INDICATOR_ORDER))
@@ -1199,8 +1354,10 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             h.append("</tr>")
 
         h.append("</table>")
+        grid_html = "".join(h)   # ← 网格表到此为止
 
-        # ── 全亮策略摘要 ──────────────────────────────────────────
+        # ── 全亮策略摘要（独立 detail_html）────────────────────────
+        h = []   # 重置，开始构建 detail_html
         summary_parts = []
         if current_state in STATES:
             for direction, dir_label, dir_color in [
@@ -1225,6 +1382,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                     if is_triggered:
                         badge = ("<span style='background:#00C8D4;color:#000;font-size:10px;"
                                  "padding:1px 5px;border-radius:3px;font-weight:bold;'>●开仓</span>")
+                        cond_html = _cond_details_html(conditions, matched, direction)
                         summary_parts.append(
                             f"<div style='margin:2px 0;padding:3px 8px;"
                             f"background:#0d2a2a;border-left:3px solid #00C8D4;"
@@ -1233,10 +1391,13 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                             f"<span style='color:{dir_color};font-weight:bold;'>"
                             f"[{dir_label}策略{idx}]</span>&nbsp;{badge}&nbsp;"
                             f"<span style='color:#00C8D4;'>已触发开仓</span>"
+                            f"<div style='margin-top:2px;color:#9aa;font-size:10px;line-height:1.35;'>"
+                            f"条件: {cond_html}</div>"
                             f"</div>"
                         )
                     elif all_lit:
                         match_cnt = len(matched)
+                        cond_html = _cond_details_html(conditions, matched, direction)
                         summary_parts.append(
                             f"<div style='margin:2px 0;padding:3px 8px;"
                             f"background:#1a2a1a;border-left:3px solid #4CAF50;"
@@ -1247,11 +1408,14 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                             f"<span style='color:#4CAF50;font-weight:bold;'>全亮 {match_cnt}/{len(conditions)}</span>"
                             f"&nbsp;<span style='color:#666;'>胜率{item.get('state_rate',0):.0%}"
                             f" 评分{item.get('score',0):.1f}</span>"
+                            f"<div style='margin-top:2px;color:#9aa;font-size:10px;line-height:1.35;'>"
+                            f"条件: {cond_html}</div>"
                             f"</div>"
                         )
                     else:
                         match_cnt = len(matched)
                         if match_cnt > 0:
+                            cond_html = _cond_details_html(conditions, matched, direction)
                             summary_parts.append(
                                 f"<div style='margin:2px 0;padding:3px 8px;"
                                 f"background:#1a1a1a;border-left:3px solid #333;"
@@ -1259,9 +1423,12 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                                 f"{tier_badge}&nbsp;"
                                 f"<span style='color:#555;'>[{dir_label}策略{idx}]</span>&nbsp;"
                                 f"<span style='color:#FFB74D;'>{match_cnt}/{len(conditions)} 条件满足</span>"
+                                f"<div style='margin-top:2px;color:#9aa;font-size:10px;line-height:1.35;'>"
+                                f"条件: {cond_html}</div>"
                                 f"</div>"
                             )
                         else:
+                            cond_html = _cond_details_html(conditions, matched, direction)
                             summary_parts.append(
                                 f"<div style='margin:2px 0;padding:3px 8px;"
                                 f"background:#1f1515;border-left:3px solid #f23645;"
@@ -1269,13 +1436,15 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                                 f"{tier_badge}&nbsp;"
                                 f"<span style='color:#777;'>[{dir_label}策略{idx}]</span>&nbsp;"
                                 f"<span style='color:#f23645;'>0/{len(conditions)} 条件满足</span>"
+                                f"<div style='margin-top:2px;color:#9aa;font-size:10px;line-height:1.35;'>"
+                                f"条件: {cond_html}</div>"
                                 f"</div>"
                             )
 
         if summary_parts:
             cur_color = STATE_COLORS.get(current_state, "#888")
             h.append(
-                f"<div style='margin-top:10px;padding:6px;border:1px solid #2a2a2a;"
+                f"<div style='padding:6px;border:1px solid #2a2a2a;"
                 f"border-radius:4px;background:#181818;'>"
                 f"<div style='color:{cur_color};font-weight:bold;font-size:11px;"
                 f"margin-bottom:4px;'>▶ {current_state} 当前触发情况</div>"
@@ -1284,12 +1453,12 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             h.append("</div>")
         else:
             h.append(
-                "<div style='margin-top:10px;padding:8px;border:1px solid #2a2a2a;"
+                "<div style='padding:8px;border:1px solid #2a2a2a;"
                 "border-radius:4px;background:#181818;color:#666;font-size:11px;'>"
                 "当前状态暂无可统计的触发明细</div>"
             )
 
-        return "".join(h)
+        return grid_html, "".join(h)
 
     def _create_position_tab(self):
         """创建持仓标签页"""
@@ -3277,32 +3446,22 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         return indicator
     
     def _update_heartbeats(self):
-        """更新心跳显示（每500ms调用）"""
+        """更新心跳显示（轻量模式：只在状态变化时更新样式）"""
         import time
         current_time = time.time()
-        self._heartbeat_blink_state = not self._heartbeat_blink_state
         
         for module, indicator in self._heartbeat_indicators.items():
             last_update = self._heartbeats.get(module, 0)
             time_since_update = current_time - last_update
-            
-            # 超过3秒未更新 = 掉线/停止
-            if time_since_update > 3.0:
-                indicator.setStyleSheet("""
-                    QLabel {
-                        color: #666;
-                        font-size: 12px;
-                    }
-                """)
-            else:
-                # 心跳闪烁：绿色 <-> 深绿
-                color = "#00E676" if self._heartbeat_blink_state else "#089981"
-                indicator.setStyleSheet(f"""
-                    QLabel {{
-                        color: {color};
-                        font-size: 12px;
-                    }}
-                """)
+
+            # 超过3秒未更新 = 掉线/停止；仅在 alive 状态变化时触发样式更新
+            is_alive = time_since_update <= 3.0
+            if self._heartbeat_alive_states.get(module) == is_alive:
+                continue
+            self._heartbeat_alive_states[module] = is_alive
+            indicator.setStyleSheet(
+                self._heartbeat_alive_style if is_alive else self._heartbeat_idle_style
+            )
     
     def _trigger_heartbeat(self, module: str):
         """触发心跳（在数据更新时调用）"""
@@ -4564,8 +4723,8 @@ class PaperTradingTab(QtWidgets.QWidget):
         if hasattr(self.control_panel, "account_group"):
             self.status_panel.attach_account_group(self.control_panel.account_group)
         
-        # 初始比例约 左:中:右 = 1:4:1.2，右侧给够宽避免被挤扁
-        splitter.setSizes([280, 600, 380])
+        # 初始比例约 左:中:右 = 1:3:1.7，右侧加宽确保所有标签页可见
+        splitter.setSizes([280, 540, 470])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)

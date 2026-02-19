@@ -2,12 +2,11 @@
   "version": 1,
   "state": {
     "created_at": 1771460922.2460523,
-    "last_save_time": 1771475985.7598424,
+    "last_save_time": 1771488195.1321032,
     "total_records": 1,
-    "total_evaluations": 0
+    "total_evaluations": 1
   },
-  "history": [],
-  "pending": [
+  "history": [
     {
       "id": "991d0ba2-f583-40f7-8764-ab4d3bd60b09",
       "timestamp": 1771460916.6934483,
@@ -34,25 +33,26 @@
       "peak_profit_pct": 52.75,
       "hold_bars": 502,
       "trailing_stage": 0,
-      "evaluated": false,
-      "price_after_eval": null,
-      "bars_waited": 0,
-      "move_pct": null,
-      "outcome": null,
-      "evaluation_time": null
+      "evaluated": true,
+      "price_after_eval": 66705.5,
+      "bars_waited": 30,
+      "move_pct": -0.5615,
+      "outcome": "correct",
+      "evaluation_time": 1771479241.3426292
     }
   ],
+  "pending": [],
   "scores": {
     "TAKE_PROFIT": {
       "reason": "TAKE_PROFIT",
-      "correct": 0,
+      "correct": 1,
       "too_tight": 0,
       "neutral": 0,
-      "total": 0,
-      "accuracy": 0.5,
+      "total": 1,
+      "accuracy": 1.0,
       "recent_trend": 0.5,
       "total_missed_pct": 0.0,
-      "total_saved_pct": 0.0
+      "total_saved_pct": 0.56
     }
   }
 }

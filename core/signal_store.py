@@ -172,7 +172,8 @@ def _get_state_rate(breakdown: Optional[dict], state: str) -> Tuple[float, int]:
     if not breakdown:
         return 0.0, 0
     info = breakdown.get(state) or {}
-    return float(info.get("rate", 0.0)), int(info.get("total_triggers", 0))
+    # 字段名为 avg_rate，不是 rate
+    return float(info.get("avg_rate", 0.0)), int(info.get("total_triggers", 0))
 
 
 def _default_live_tracking() -> dict:

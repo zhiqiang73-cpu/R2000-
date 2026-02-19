@@ -669,7 +669,11 @@ PAPER_TRADING_CONFIG = {
     # REST轮询频率（秒，过高可能被限流）
     "REALTIME_REST_POLL_SEC": 0.80,
     # UI刷新频率（毫秒）
-    "REALTIME_UI_REFRESH_MS": 300,
+    # 说明：300ms 在复杂图表 + 多面板场景会造成主线程持续高负载。
+    # 提升到 1000ms，显著降低重绘压力并保持足够的实时感。
+    "REALTIME_UI_REFRESH_MS": 1000,
+    # 状态推送节流（秒）：降低 UI 主线程状态回调频率
+    "STATE_PUSH_INTERVAL_SEC": 1.0,
     
     # ── 自适应控制器 ──
     "ADAPTIVE_ENABLED": False,   # 关闭自适应控制器，稳定性测试阶段
