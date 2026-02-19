@@ -1944,7 +1944,7 @@ class LiveTradingEngine:
             "today_count": self._sm_today_count,
         }
 
-        # 5. 获取最佳触发组合
+        # 5. 获取最佳触发组合（精品优先，高频兜底）
         try:
             if self._signal_live_monitor is None:
                 from core.signal_live_monitor import SignalLiveMonitor
@@ -1963,8 +1963,13 @@ class LiveTradingEngine:
                 self.state.last_event = "⚠ [精品信号] 策略池为空"
                 return
 
+            # 构建 tier_map：combo_key -> "精品" 或 "高频"
+            _premium_pool = _sig_store.get_premium_pool()
+            _tier_map = {item["combo_key"]: item.get("tier", "精品") for item in _premium_pool}
+
             best_res = self._signal_live_monitor.get_best_for_state(
-                self._pending_signal_combos, cumulative, current_state
+                self._pending_signal_combos, cumulative, current_state,
+                tier_map=_tier_map,
             )
 
             if not best_res:
@@ -2007,9 +2012,9 @@ class LiveTradingEngine:
                 self.state.last_event = f"[精品信号] {current_state} 无触发"
                 return
 
-            combo_key, combo_entry = best_res
+            combo_key, combo_entry, combo_tier = best_res
             direction = combo_entry.get('direction', 'long')
-            # 记录匹配情况（命中哪个、差多少）
+            # 记录匹配情况（命中哪个、层级、差多少）
             triggered_keys = list(self._pending_signal_combos or [])
             triggered_entries = []
             for key in triggered_keys:
@@ -2018,6 +2023,7 @@ class LiveTradingEngine:
                 state_info = breakdown.get(current_state, {}) or {}
                 triggered_entries.append({
                     "key": key,
+                    "tier": _tier_map.get(key, "精品"),
                     "score": entry.get('综合评分', 0.0),
                     "avg_rate": entry.get('avg_rate', 0.0),
                     "overall_rate": entry.get('overall_rate', 0.0),
@@ -2030,9 +2036,9 @@ class LiveTradingEngine:
                 second = triggered_entries[1] if len(triggered_entries) > 1 else None
                 gap = (top["score"] - second["score"]) if second else 0.0
                 print(
-                    "[LiveEngine] [精品信号匹配] 命中 | "
+                    f"[LiveEngine] [{combo_tier}信号匹配] 命中 | "
                     f"state={current_state} | 触发数={len(triggered_entries)} | "
-                    f"best={combo_key} score={combo_entry.get('综合评分', 0.0):.2f} "
+                    f"best={combo_key} tier={combo_tier} score={combo_entry.get('综合评分', 0.0):.2f} "
                     f"avg_rate={combo_entry.get('avg_rate', 0.0):.3f} "
                     f"overall={combo_entry.get('overall_rate', 0.0):.3f} "
                     f"rounds={combo_entry.get('appear_rounds', 0)} | "
@@ -2069,7 +2075,7 @@ class LiveTradingEngine:
             take_profit=tp_price,
             stop_loss=sl_price,
             template_fingerprint=combo_key,
-            entry_reason=f"[精品信号] {current_state} | {combo_key}",
+            entry_reason=f"[{combo_tier}信号] {current_state} | {combo_key}",
             position_size_pct=0.05,
             regime_at_entry=current_state,
         )
@@ -2090,11 +2096,12 @@ class LiveTradingEngine:
                 "conditions": combo_entry.get('conditions', []),
                 "direction": direction,
                 "score": combo_entry.get('综合评分', 0.0),
+                "tier": combo_tier,
                 "today_count": self._sm_today_count,
                 "time": kline.open_time.strftime("%H:%M:%S"),
             }
-            self.state.last_event = f"[精品信号] {direction} 开仓: {combo_key}"
-            print(f"[LiveEngine] 精品信号开仓: {combo_key} @ {entry_price:.2f}")
+            self.state.last_event = f"[{combo_tier}信号] {direction} 开仓: {combo_key}"
+            print(f"[LiveEngine] {combo_tier}信号开仓: {combo_key} @ {entry_price:.2f}")
 
     def _get_signal_condition_arrays(self, direction: str, bar_idx: int) -> Dict[str, Any]:
         if self._df_buffer is None or bar_idx < 0 or bar_idx >= len(self._df_buffer):

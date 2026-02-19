@@ -130,59 +130,74 @@ class SignalLiveMonitor:
         self,
         triggered_keys: List[str],
         cumulative: Dict[str, dict],
-        market_state: str
-    ) -> Optional[Tuple[str, dict]]:
+        market_state: str,
+        tier_map: Optional[Dict[str, str]] = None,
+    ) -> Optional[Tuple[str, dict, str]]:
         """
         在已触发的组合中，根据当前市场状态选择最适合的一个。
-        
-        策略：
+
+        精品优先策略：
         1. 过滤在该市场状态下有触发记录的组合 (total_triggers > 0)
-        2. 根据方向偏向选择：
-           - 多头趋势: 优先选 long 中评分最高的，若无则选 short 中评分最高的
-           - 空头趋势: 优先选 short 中评分最高的，若无则选 long 中评分最高的
-           - 震荡市: 不分方向，选所有触发组合中评分最高的
+        2. 按 tier 分组（精品 / 高频）
+        3. 精品层有触发 → 只从精品层选；精品层无触发 → 从高频层选
+        4. 同层内按方向偏向选最高评分：
+           - 多头趋势: 优先 long，次选 short
+           - 空头趋势: 优先 short，次选 long
+           - 震荡市:   不分方向，取最高分
+
+        Args:
+            triggered_keys: 当前K线已触发的 combo_key 列表
+            cumulative:     signal_store 的累计数据 dict
+            market_state:   当前市场状态
+            tier_map:       combo_key -> tier ("精品"/"高频")，None 时视全部为精品
+
+        Returns:
+            (combo_key, entry_dict, tier_str) 或 None
         """
         if not triggered_keys or not cumulative:
             return None
 
-        # 1. 提取触发组合的完整信息，并过滤在该状态下有效的组合
+        _tier_map = tier_map or {}
+
+        # 1. 过滤：该市场状态下有历史触发记录的组合
         valid_triggered = []
         for key in triggered_keys:
             entry = cumulative.get(key)
             if not entry:
                 continue
-            
             breakdown = entry.get('market_state_breakdown', {})
             state_info = breakdown.get(market_state, {})
             if state_info.get('total_triggers', 0) > 0:
-                valid_triggered.append((key, entry))
+                tier = _tier_map.get(key, "精品")
+                valid_triggered.append((key, entry, tier))
 
         if not valid_triggered:
             return None
 
-        # 2. 方向偏向逻辑
-        if market_state == "多头趋势":
-            # 优先做多
-            longs = [item for item in valid_triggered if item[1].get('direction') == 'long']
-            if longs:
-                return max(longs, key=lambda x: x[1].get('综合评分', 0.0))
-            # 允许反向做空
-            shorts = [item for item in valid_triggered if item[1].get('direction') == 'short']
-            if shorts:
-                return max(shorts, key=lambda x: x[1].get('综合评分', 0.0))
-        
-        elif market_state == "空头趋势":
-            # 优先做空
-            shorts = [item for item in valid_triggered if item[1].get('direction') == 'short']
-            if shorts:
-                return max(shorts, key=lambda x: x[1].get('综合评分', 0.0))
-            # 允许反向做多
-            longs = [item for item in valid_triggered if item[1].get('direction') == 'long']
-            if longs:
-                return max(longs, key=lambda x: x[1].get('综合评分', 0.0))
-        
-        else: # 震荡市 或 其他
-            # 不分方向，取最高分
-            return max(valid_triggered, key=lambda x: x[1].get('综合评分', 0.0))
+        def _pick_by_direction(pool: List[Tuple[str, dict, str]]) -> Optional[Tuple[str, dict, str]]:
+            """按市场状态方向偏向从给定列表中选最高评分"""
+            if not pool:
+                return None
+            if market_state == "多头趋势":
+                longs = [x for x in pool if x[1].get('direction') == 'long']
+                if longs:
+                    return max(longs, key=lambda x: x[1].get('综合评分', 0.0))
+                shorts = [x for x in pool if x[1].get('direction') == 'short']
+                return max(shorts, key=lambda x: x[1].get('综合评分', 0.0)) if shorts else None
+            elif market_state == "空头趋势":
+                shorts = [x for x in pool if x[1].get('direction') == 'short']
+                if shorts:
+                    return max(shorts, key=lambda x: x[1].get('综合评分', 0.0))
+                longs = [x for x in pool if x[1].get('direction') == 'long']
+                return max(longs, key=lambda x: x[1].get('综合评分', 0.0)) if longs else None
+            else:  # 震荡市
+                return max(pool, key=lambda x: x[1].get('综合评分', 0.0))
 
-        return None
+        # 2. 精品优先：精品层有触发就只用精品，否则用高频
+        elite_pool = [x for x in valid_triggered if x[2] == "精品"]
+        result = _pick_by_direction(elite_pool)
+        if result:
+            return result
+
+        high_freq_pool = [x for x in valid_triggered if x[2] == "高频"]
+        return _pick_by_direction(high_freq_pool)
