@@ -1,4 +1,4 @@
-﻿"""
+"""
 R3000 量化 MVP 系统 - 全局配置文件
 上帝视角标注 + 特征提取 + 模式挖掘 + 遗传算法优化
 """
@@ -671,6 +671,9 @@ PAPER_TRADING_CONFIG = {
     # UI刷新频率（毫秒）
     "REALTIME_UI_REFRESH_MS": 300,
     
+    # ── 自适应控制器 ──
+    "ADAPTIVE_ENABLED": False,   # 关闭自适应控制器，稳定性测试阶段
+    
     # 数据目录
     "HISTORY_DIR": "data/paper_trading",
     "VERIFIED_DIR": "data/sim_verified",
@@ -706,14 +709,14 @@ PAPER_TRADING_CONFIG = {
     "MACD_POS_SCORE_RESCUE": 40,       # 位置评分≥此值且斜率正确时，豁免零轴检查
     
     # ── 凯利公式动态仓位管理 ──
-    "KELLY_ENABLED": True,                 # 是否启用凯利公式动态仓位
+    "KELLY_ENABLED": False,                # 关闭凯利公式，精品信号模式使用固定5%仓位
     "KELLY_FRACTION": 0.5,                # 凯利分数（0.5=半凯利，降低波动、减少高估时大亏）
     "KELLY_MAX_POSITION": 0.3,             # 凯利仓位上限（30% 本金）
     "KELLY_MIN_POSITION": 0.05,            # 凯利仓位下限（5% 本金，样本不足/期望为负时保守试探学习）
     "KELLY_MIN_SAMPLES": 5,                # 凯利计算最少样本数（少于此值用最小仓位）
     
     # ── 凯利参数自适应学习 ──
-    "KELLY_ADAPTATION_ENABLED": True,      # 是否启用凯利参数自适应学习
+    "KELLY_ADAPTATION_ENABLED": False,     # 关闭凯利参数自适应学习（稳定性测试）
     "KELLY_FRACTION_RANGE": (0.25, 0.6),  # KELLY_FRACTION 自适应调整范围（围绕半凯利）
     "KELLY_MAX_RANGE": (0.15, 0.30),       # KELLY_MAX 自适应调整范围
     "KELLY_MIN_RANGE": (0.05, 0.10),       # KELLY_MIN 自适应调整范围（下限5%~10%）

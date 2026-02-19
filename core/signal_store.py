@@ -42,7 +42,7 @@ import json
 import math
 import os
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ── 文件路径 ─────────────────────────────────────────────────────────────────
 _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -154,6 +154,14 @@ def _merge_market_state_breakdown(history: List[dict]) -> dict:
             "avg_rate":       round(h / t, 6) if t > 0 else 0.0,
         }
     return result
+
+
+def _get_state_rate(breakdown: Optional[dict], state: str) -> Tuple[float, int]:
+    """返回指定市场状态的命中率和触发次数，无数据则返回 (0.0, 0)。"""
+    if not breakdown:
+        return 0.0, 0
+    info = breakdown.get(state) or {}
+    return float(info.get("rate", 0.0)), int(info.get("total_triggers", 0))
 
 
 def _default_live_tracking() -> dict:
@@ -331,6 +339,77 @@ def get_cumulative(direction: Optional[str] = None) -> Dict[str, dict]:
     if direction is None:
         return cumulative
     return {k: v for k, v in cumulative.items() if v.get('direction') == direction}
+
+
+def get_premium_pool(
+    state: Optional[str] = None,
+    direction: Optional[str] = None,
+    top_n: int = 6,
+    min_state_triggers: int = 5,
+) -> List[dict]:
+    """
+    按市场状态与方向挑选精品池（每组 TOP N）。
+
+    规则：
+      - 过滤该状态触发次数 < min_state_triggers 的组合
+      - 主排序：该状态命中率（降序）
+      - 次排序：综合评分（降序）
+
+    Args:
+        state:             目标市场状态（None 表示三状态都取）
+        direction:         'long' / 'short' / None（两个方向都取）
+        top_n:             每个状态+方向的数量上限
+        min_state_triggers: 该状态最少触发次数
+
+    Returns:
+        List[dict]，元素包含：
+          combo_key, direction, conditions, market_state,
+          score, state_rate, state_triggers
+    """
+    cumulative = get_cumulative(direction)
+    if not cumulative:
+        return []
+
+    states = [state] if state else list(_ALL_STATES)
+    directions = [direction] if direction else ["long", "short"]
+    results: List[dict] = []
+
+    for market_state in states:
+        for dir_val in directions:
+            candidates: List[Tuple[str, dict, float, int]] = []
+            for key, entry in cumulative.items():
+                if entry.get("direction") != dir_val:
+                    continue
+                rate, triggers = _get_state_rate(
+                    entry.get("market_state_breakdown"), market_state
+                )
+                if triggers < min_state_triggers:
+                    continue
+                candidates.append((key, entry, rate, triggers))
+
+            if not candidates:
+                continue
+
+            candidates.sort(
+                key=lambda item: (
+                    item[2],  # state_rate
+                    item[1].get("综合评分", 0.0),
+                ),
+                reverse=True,
+            )
+
+            for key, entry, rate, triggers in candidates[:top_n]:
+                results.append({
+                    "combo_key":      key,
+                    "direction":      entry.get("direction"),
+                    "conditions":     entry.get("conditions", []),
+                    "market_state":   market_state,
+                    "score":          entry.get("综合评分", 0.0),
+                    "state_rate":     rate,
+                    "state_triggers": triggers,
+                })
+
+    return results
 
 
 def get_rounds() -> List[dict]:

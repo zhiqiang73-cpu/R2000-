@@ -101,6 +101,10 @@ class EngineState:
     early_exit_scores: Dict[str, Dict] = field(default_factory=dict)
     adaptive_adjustments_applied: int = 0
     
+    # 精品信号模式扩展
+    signal_mode_active: bool = False
+    signal_mode_info: dict = field(default_factory=dict)
+    
     # 冷启动系统状态（UI 展示）
     cold_start_enabled: bool = False
     cold_start_thresholds: Dict[str, float] = field(default_factory=dict)
@@ -285,7 +289,7 @@ class LiveTradingEngine:
         )
         
         # 执行参数固定：默认仓位比例（凯利启用时会覆盖为动态仓位）
-        self.fixed_position_size_pct = float(PAPER_TRADING_CONFIG.get("POSITION_SIZE_PCT", 0.1)) (绋宠禋鐗堟湰: 闃舵鍩哄噯姝㈢泩姝㈡崯绯荤粺)
+        self.fixed_position_size_pct = float(PAPER_TRADING_CONFIG.get("POSITION_SIZE_PCT", 0.1))
         default_lev = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
         self.fixed_leverage = default_lev
 
@@ -336,6 +340,8 @@ class LiveTradingEngine:
         # 信号组合实盘监控（懒加载）
         self._signal_live_monitor = None   # type: Optional[object]
         self._pending_signal_combos: List[str] = []
+        self._signal_pool_cond_cache: Dict[str, dict] = {}
+        self._signal_pool_cond_cache_bar: int = -1
 
         # 线程控制
         self._running = False
@@ -360,6 +366,11 @@ class LiveTradingEngine:
         
         # ── 反向下单测试模式 ──
         self._reverse_signal_mode = PAPER_TRADING_CONFIG.get("REVERSE_SIGNAL_MODE", False)
+        
+        # ── 精品信号模式 ──
+        self.use_signal_mode: bool = True
+        self._sm_today_count: int = 0
+        self._sm_last_date: str = ""
         
         # ── 价格位置翻转状态 ──
         self._flip_pending = False            # 是否有待执行的翻转信号
@@ -479,13 +490,16 @@ class LiveTradingEngine:
         # ── 自适应控制器（统一参数调整）──
         from core.adaptive_controller import AdaptiveController
         self._adaptive_controller: Optional[AdaptiveController] = None
-        try:
-            self._adaptive_controller = AdaptiveController(
-                state_file="data/adaptive_controller_state.json"
-            )
-            print(f"[LiveEngine] 自适应控制器已启用")
-        except Exception as e:
-            print(f"[LiveEngine] 自适应控制器初始化失败: {e}")
+        if PAPER_TRADING_CONFIG.get("ADAPTIVE_ENABLED", True):
+            try:
+                self._adaptive_controller = AdaptiveController(
+                    state_file="data/adaptive_controller_state.json"
+                )
+                print(f"[LiveEngine] 自适应控制器已启用")
+            except Exception as e:
+                print(f"[LiveEngine] 自适应控制器初始化失败: {e}")
+        else:
+            print(f"[LiveEngine] 自适应控制器已禁用 (ADAPTIVE_ENABLED=False)")
         
         # ── DeepSeek AI 复盘分析器 ──
         from config import DEEPSEEK_CONFIG
@@ -1002,8 +1016,10 @@ class LiveTradingEngine:
                 )
                 # 【WF Evolution】注入挂载的进化权重（多空分开时两套，否则一套）
                 self._using_evolved_weights = False
-                pending_long = getattr(self, "_pending_evolved_weights_long", None) or getattr(self, "_pending_evolved_weights", None)
+                pending_long_raw = getattr(self, "_pending_evolved_weights_long", None)
+                pending_shared = getattr(self, "_pending_evolved_weights", None)
                 pending_short = getattr(self, "_pending_evolved_weights_short", None)
+                pending_long = pending_long_raw if pending_long_raw is not None else pending_shared
                 if pending_long is not None:
                     try:
                         self._proto_matcher.set_feature_weights(pending_long, short_weights=pending_short)
@@ -1355,14 +1371,19 @@ class LiveTradingEngine:
         # 特征更新后刷新指标灯状态，确保 UI 与后续门控使用相同数据
         self._update_indicator_state()
 
-        # 信号组合实盘监控：检测当前K线触发哪些已知组合
+        # 信号组合实盘监控：只检测精品池（36个）内的组合是否触发
         try:
             if self._signal_live_monitor is None:
                 from core.signal_live_monitor import SignalLiveMonitor
                 self._signal_live_monitor = SignalLiveMonitor()
             if self._df_buffer is not None and len(self._df_buffer) > 0:
+                # 获取精品池的 combo_keys（3状态 × 多空 × Top6 = 最多36个）
+                from core import signal_store as _sig_store
+                premium_pool = _sig_store.get_premium_pool()   # 全部精品池
+                premium_keys = [item["combo_key"] for item in premium_pool]
+                # 只检测精品池内的组合
                 self._pending_signal_combos = self._signal_live_monitor.on_bar(
-                    self._df_buffer, self._current_bar_idx
+                    self._df_buffer, self._current_bar_idx, pool_keys=premium_keys
                 )
         except Exception as _e:
             self._pending_signal_combos = []
@@ -1839,8 +1860,274 @@ class LiveTradingEngine:
             print(f"[LiveEngine] ⚠ 翻转单下单失败")
             self.state.last_event = "[翻转单] 下单失败"
     
+    def _process_entry_signal_mode(self, kline: KlineData, atr: float):
+        """精品信号模式开仓逻辑"""
+        # 1. 风控检查
+        if self._risk_limit_reached():
+            self.state.last_event = "⚠ [精品信号] 风控限制，停止开仓"
+            return
+
+        # 2. 持仓检查
+        if self._paper_trader.has_position():
+            return
+
+        # 3. Bar 数量保护
+        if self._current_bar_idx < 50:
+            self.state.last_event = f"[精品信号] 等待数据积累 ({self._current_bar_idx}/50)"
+            return
+
+        # 4. 获取市场状态 (3态)
+        try:
+            from core.market_state_detector import detect_state
+            row = self._df_buffer.iloc[self._current_bar_idx]
+            adx = row.get('adx')
+            ma5_slope = row.get('ma5_slope')
+            
+            if pd.isna(adx) or pd.isna(ma5_slope):
+                self.state.last_event = "[精品信号] 指标未就绪 (ADX/MA5 Slope)"
+                return
+                
+            current_state = detect_state(adx, ma5_slope)
+            self.state.market_regime = current_state
+        except Exception as e:
+            self.state.last_event = f"[精品信号] 状态检测失败: {e}"
+            return
+
+        pool_info = self._build_signal_pool_info(current_state)
+        self.state.signal_mode_info = {
+            **pool_info,
+            "state": current_state,
+            "today_count": self._sm_today_count,
+        }
+
+        # 5. 获取最佳触发组合
+        try:
+            if self._signal_live_monitor is None:
+                from core.signal_live_monitor import SignalLiveMonitor
+                self._signal_live_monitor = SignalLiveMonitor()
+
+            from core import signal_store as _sig_store
+            cumulative = _sig_store.get_cumulative()
+
+            if not cumulative:
+                self.state.signal_mode_info = {
+                    **pool_info,
+                    "state": current_state,
+                    "today_count": self._sm_today_count,
+                    "warning": "策略池为空，请先完成信号分析",
+                }
+                self.state.last_event = "⚠ [精品信号] 策略池为空"
+                return
+
+            best_res = self._signal_live_monitor.get_best_for_state(
+                self._pending_signal_combos, cumulative, current_state
+            )
+
+            if not best_res:
+                # 记录匹配情况（无触发 / 无有效触发）
+                triggered_keys = list(self._pending_signal_combos or [])
+                triggered_entries = []
+                for key in triggered_keys:
+                    entry = cumulative.get(key) or {}
+                    breakdown = entry.get('market_state_breakdown', {}) or {}
+                    state_info = breakdown.get(current_state, {}) or {}
+                    triggered_entries.append({
+                        "key": key,
+                        "score": entry.get('综合评分', 0.0),
+                        "avg_rate": entry.get('avg_rate', 0.0),
+                        "overall_rate": entry.get('overall_rate', 0.0),
+                        "appear_rounds": entry.get('appear_rounds', 0),
+                        "state_triggers": state_info.get('total_triggers', 0),
+                    })
+                if triggered_entries:
+                    triggered_entries.sort(key=lambda x: x["score"], reverse=True)
+                    top = triggered_entries[0]
+                    second = triggered_entries[1] if len(triggered_entries) > 1 else None
+                    gap = (top["score"] - second["score"]) if second else 0.0
+                    print(
+                        "[LiveEngine] [精品信号匹配] 无有效触发 | "
+                        f"state={current_state} | 触发数={len(triggered_entries)} | "
+                        f"top={top['key']} score={top['score']:.2f} "
+                        f"avg_rate={top['avg_rate']:.3f} overall={top['overall_rate']:.3f} "
+                        f"rounds={top['appear_rounds']} state_triggers={top['state_triggers']} "
+                        f"{'gap=' + format(gap, '.2f') if second else ''}"
+                    )
+                else:
+                    print(f"[LiveEngine] [精品信号匹配] 无触发 | state={current_state}")
+                self.state.signal_mode_info = {
+                    **pool_info,
+                    "state": current_state,
+                    "last_trigger": "无触发",
+                    "today_count": self._sm_today_count
+                }
+                self.state.last_event = f"[精品信号] {current_state} 无触发"
+                return
+
+            combo_key, combo_entry = best_res
+            direction = combo_entry.get('direction', 'long')
+            # 记录匹配情况（命中哪个、差多少）
+            triggered_keys = list(self._pending_signal_combos or [])
+            triggered_entries = []
+            for key in triggered_keys:
+                entry = cumulative.get(key) or {}
+                breakdown = entry.get('market_state_breakdown', {}) or {}
+                state_info = breakdown.get(current_state, {}) or {}
+                triggered_entries.append({
+                    "key": key,
+                    "score": entry.get('综合评分', 0.0),
+                    "avg_rate": entry.get('avg_rate', 0.0),
+                    "overall_rate": entry.get('overall_rate', 0.0),
+                    "appear_rounds": entry.get('appear_rounds', 0),
+                    "state_triggers": state_info.get('total_triggers', 0),
+                })
+            if triggered_entries:
+                triggered_entries.sort(key=lambda x: x["score"], reverse=True)
+                top = triggered_entries[0]
+                second = triggered_entries[1] if len(triggered_entries) > 1 else None
+                gap = (top["score"] - second["score"]) if second else 0.0
+                print(
+                    "[LiveEngine] [精品信号匹配] 命中 | "
+                    f"state={current_state} | 触发数={len(triggered_entries)} | "
+                    f"best={combo_key} score={combo_entry.get('综合评分', 0.0):.2f} "
+                    f"avg_rate={combo_entry.get('avg_rate', 0.0):.3f} "
+                    f"overall={combo_entry.get('overall_rate', 0.0):.3f} "
+                    f"rounds={combo_entry.get('appear_rounds', 0)} | "
+                    f"gap={gap:.2f}"
+                )
+
+        except Exception as e:
+            self.state.last_event = f"[精品信号] 获取组合失败: {e}"
+            import traceback; traceback.print_exc()
+            return
+
+        # 6. 固定 TP/SL (与回测一致)
+        from core.signal_analyzer import (
+            LONG_TP1_PCT, LONG_SL_PCT,
+            SHORT_TP1_PCT, SHORT_SL_PCT
+        )
+
+        entry_price = kline.close
+        if direction == 'long':
+            tp_price = entry_price * (1 + LONG_TP1_PCT)
+            sl_price = entry_price * (1 - LONG_SL_PCT)
+            side = OrderSide.LONG
+        else:
+            tp_price = entry_price * (1 - SHORT_TP1_PCT)
+            sl_price = entry_price * (1 + SHORT_SL_PCT)
+            side = OrderSide.SHORT
+
+        # 7. 固定 5% 仓位下单
+        # combo_key 格式已经是 "long|cond1+cond2+..." ，直接用作 template_fingerprint
+        order_id = self._paper_trader.place_stop_order(
+            side=side,
+            trigger_price=entry_price,
+            bar_idx=self._current_bar_idx,
+            take_profit=tp_price,
+            stop_loss=sl_price,
+            template_fingerprint=combo_key,
+            entry_reason=f"[精品信号] {current_state} | {combo_key}",
+            position_size_pct=0.05,
+            regime_at_entry=current_state,
+        )
+
+        if order_id:
+            today_str = kline.open_time.strftime("%Y-%m-%d")
+            if today_str != self._sm_last_date:
+                self._sm_today_count = 1
+                self._sm_last_date = today_str
+            else:
+                self._sm_today_count += 1
+
+            self.state.signal_mode_active = True
+            self.state.signal_mode_info = {
+                **pool_info,
+                "state": current_state,
+                "combo_key": combo_key,
+                "conditions": combo_entry.get('conditions', []),
+                "direction": direction,
+                "score": combo_entry.get('综合评分', 0.0),
+                "today_count": self._sm_today_count,
+                "time": kline.open_time.strftime("%H:%M:%S"),
+            }
+            self.state.last_event = f"[精品信号] {direction} 开仓: {combo_key}"
+            print(f"[LiveEngine] 精品信号开仓: {combo_key} @ {entry_price:.2f}")
+
+    def _get_signal_condition_arrays(self, direction: str, bar_idx: int) -> Dict[str, Any]:
+        if self._df_buffer is None or bar_idx < 0 or bar_idx >= len(self._df_buffer):
+            return {}
+        if self._signal_pool_cond_cache_bar != bar_idx:
+            self._signal_pool_cond_cache = {}
+            self._signal_pool_cond_cache_bar = bar_idx
+        if direction not in self._signal_pool_cond_cache:
+            try:
+                from core.signal_analyzer import _build_condition_arrays
+                self._signal_pool_cond_cache[direction] = _build_condition_arrays(
+                    self._df_buffer, direction
+                )
+            except Exception:
+                self._signal_pool_cond_cache[direction] = {}
+        return self._signal_pool_cond_cache.get(direction, {})
+
+    def _annotate_pool_conditions(
+        self,
+        pool_items: List[dict],
+        direction: str,
+        triggered_keys: set,
+    ) -> List[dict]:
+        if not pool_items:
+            return []
+        cond_arrays = self._get_signal_condition_arrays(direction, self._current_bar_idx)
+        annotated: List[dict] = []
+        for item in pool_items:
+            conditions = item.get("conditions", []) or []
+            matched: List[str] = []
+            unmatched: List[str] = []
+            if conditions and cond_arrays:
+                for cond in conditions:
+                    arr = cond_arrays.get(cond)
+                    if arr is not None and self._current_bar_idx < len(arr) and bool(arr[self._current_bar_idx]):
+                        matched.append(cond)
+                    else:
+                        unmatched.append(cond)
+            else:
+                unmatched = list(conditions)
+            annotated.append({
+                **item,
+                "matched_conditions": matched,
+                "unmatched_conditions": unmatched,
+                "is_triggered": item.get("combo_key") in triggered_keys,
+            })
+        return annotated
+
+    def _build_signal_pool_info(self, current_state: str) -> dict:
+        info = {
+            "long_pool": [],
+            "short_pool": [],
+            "pool_total": 0,
+            "triggered_keys": list(self._pending_signal_combos or []),
+        }
+        try:
+            from core import signal_store
+            triggered_set = set(info["triggered_keys"])
+            long_pool = signal_store.get_premium_pool(
+                state=current_state, direction="long"
+            )
+            short_pool = signal_store.get_premium_pool(
+                state=current_state, direction="short"
+            )
+            info["pool_total"] = len(long_pool) + len(short_pool)
+            info["long_pool"] = self._annotate_pool_conditions(long_pool, "long", triggered_set)
+            info["short_pool"] = self._annotate_pool_conditions(short_pool, "short", triggered_set)
+        except Exception:
+            return info
+        return info
+
     def _process_entry(self, kline: KlineData, atr: float):
         """处理入场逻辑：实现 Ready-Aim-Fire 三重过滤 (已优化：支持信号动态替换)"""
+        if self.use_signal_mode:
+            self._process_entry_signal_mode(kline, atr)
+            return
+            
         # 冷启动阈值兜底（防止被其他流程覆盖）
         self._ensure_cold_start_thresholds()
         if self._risk_limit_reached():
@@ -3087,6 +3374,21 @@ class LiveTradingEngine:
         # 冷启动阈值兜底（防止被其他流程覆盖）
         self._ensure_cold_start_thresholds()
         # 【关键】更新市场状态，确保UI始终显示最新市场状态
+        # 精品信号模式：不需要摆动点检测，避免额外开销
+        if self.use_signal_mode:
+            try:
+                from core.market_state_detector import detect_state
+                if self._df_buffer is not None and self._current_bar_idx >= 0:
+                    row = self._df_buffer.iloc[self._current_bar_idx]
+                    adx = row.get('adx')
+                    ma5_slope = row.get('ma5_slope')
+                    if pd.isna(adx) or pd.isna(ma5_slope):
+                        self.state.market_regime = "未知"
+                    else:
+                        self.state.market_regime = detect_state(adx, ma5_slope)
+            except Exception:
+                self.state.market_regime = "未知"
+            return
         self.state.market_regime = self._confirm_market_regime()
         
         if self._fv_engine is None:
@@ -4074,7 +4376,13 @@ class LiveTradingEngine:
                         order.regime_at_entry = current_regime
                 # 首次成交时打标信号组合（仅在列表为空时写入，避免重复）
                 if not getattr(order, 'signal_combo_keys', None):
-                    order.signal_combo_keys = list(self._pending_signal_combos)
+                    fp = getattr(order, 'template_fingerprint', '') or ''
+                    # 精品信号模式：template_fingerprint 即 combo_key（格式 "long|..." / "short|..."）
+                    # 只记录实际触发开仓的那一个组合，避免把所有同时触发的组合都计入胜负
+                    if fp.startswith('long|') or fp.startswith('short|'):
+                        order.signal_combo_keys = [fp]
+                    else:
+                        order.signal_combo_keys = list(self._pending_signal_combos)
         except Exception as e:
             print(f"[LiveEngine] 入场状态回填失败: {e}")
     

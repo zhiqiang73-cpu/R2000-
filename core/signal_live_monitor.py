@@ -8,7 +8,7 @@ core/signal_live_monitor.py
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -31,25 +31,34 @@ class SignalLiveMonitor:
         self._min_appear_rounds = min_appear_rounds
         self._last_bar_idx: int = -1
         self._last_combos: List[str] = []
+        self._last_pool_keys: Optional[frozenset] = None
         # 条件数组缓存（按方向，避免重复构建）
         self._cond_cache: Dict[str, dict] = {}   # direction -> {cond_name: np.ndarray}
         self._cond_cache_bar: int = -1
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def on_bar(self, df: pd.DataFrame, latest_bar_idx: int) -> List[str]:
+    def on_bar(
+        self,
+        df: pd.DataFrame,
+        latest_bar_idx: int,
+        pool_keys: Optional[List[str]] = None,
+    ) -> List[str]:
         """
-        检测所有已知累计组合是否在 latest_bar_idx 对应的K线触发。
+        检测指定组合（或全部累计组合）是否在 latest_bar_idx 对应的K线触发。
 
         Args:
             df:             已计算全部技术指标的 DataFrame
             latest_bar_idx: 最新完成K线的行索引（0-based）
+            pool_keys:      仅检测的 combo_key 列表（None 表示全部）
 
         Returns:
             触发的 combo_key 列表（可能为空）。
         """
-        # 同一根K线只算一次
-        if latest_bar_idx == self._last_bar_idx:
+        pool_key_set = frozenset(pool_keys) if pool_keys else None
+
+        # 同一根K线+同一池只算一次
+        if latest_bar_idx == self._last_bar_idx and pool_key_set == self._last_pool_keys:
             return list(self._last_combos)
 
         try:
@@ -74,6 +83,8 @@ class SignalLiveMonitor:
         triggered: List[str] = []
 
         for combo_key, entry in cumulative.items():
+            if pool_key_set is not None and combo_key not in pool_key_set:
+                continue
             if entry.get('appear_rounds', 0) < self._min_appear_rounds:
                 continue
 
@@ -102,8 +113,9 @@ class SignalLiveMonitor:
             if all_true:
                 triggered.append(combo_key)
 
-        self._last_bar_idx = latest_bar_idx
-        self._last_combos  = triggered
+        self._last_bar_idx   = latest_bar_idx
+        self._last_pool_keys = pool_key_set
+        self._last_combos    = triggered
         return list(triggered)
 
     def reset_cache(self) -> None:
@@ -112,3 +124,65 @@ class SignalLiveMonitor:
         self._cond_cache_bar  = -1
         self._last_bar_idx    = -1
         self._last_combos     = []
+        self._last_pool_keys  = None
+
+    def get_best_for_state(
+        self,
+        triggered_keys: List[str],
+        cumulative: Dict[str, dict],
+        market_state: str
+    ) -> Optional[Tuple[str, dict]]:
+        """
+        在已触发的组合中，根据当前市场状态选择最适合的一个。
+        
+        策略：
+        1. 过滤在该市场状态下有触发记录的组合 (total_triggers > 0)
+        2. 根据方向偏向选择：
+           - 多头趋势: 优先选 long 中评分最高的，若无则选 short 中评分最高的
+           - 空头趋势: 优先选 short 中评分最高的，若无则选 long 中评分最高的
+           - 震荡市: 不分方向，选所有触发组合中评分最高的
+        """
+        if not triggered_keys or not cumulative:
+            return None
+
+        # 1. 提取触发组合的完整信息，并过滤在该状态下有效的组合
+        valid_triggered = []
+        for key in triggered_keys:
+            entry = cumulative.get(key)
+            if not entry:
+                continue
+            
+            breakdown = entry.get('market_state_breakdown', {})
+            state_info = breakdown.get(market_state, {})
+            if state_info.get('total_triggers', 0) > 0:
+                valid_triggered.append((key, entry))
+
+        if not valid_triggered:
+            return None
+
+        # 2. 方向偏向逻辑
+        if market_state == "多头趋势":
+            # 优先做多
+            longs = [item for item in valid_triggered if item[1].get('direction') == 'long']
+            if longs:
+                return max(longs, key=lambda x: x[1].get('综合评分', 0.0))
+            # 允许反向做空
+            shorts = [item for item in valid_triggered if item[1].get('direction') == 'short']
+            if shorts:
+                return max(shorts, key=lambda x: x[1].get('综合评分', 0.0))
+        
+        elif market_state == "空头趋势":
+            # 优先做空
+            shorts = [item for item in valid_triggered if item[1].get('direction') == 'short']
+            if shorts:
+                return max(shorts, key=lambda x: x[1].get('综合评分', 0.0))
+            # 允许反向做多
+            longs = [item for item in valid_triggered if item[1].get('direction') == 'long']
+            if longs:
+                return max(longs, key=lambda x: x[1].get('综合评分', 0.0))
+        
+        else: # 震荡市 或 其他
+            # 不分方向，取最高分
+            return max(valid_triggered, key=lambda x: x[1].get('综合评分', 0.0))
+
+        return None

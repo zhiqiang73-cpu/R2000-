@@ -1,14 +1,14 @@
 {
   "symbol": "BTCUSDT",
-  "save_time": "2026-02-18T17:09:09.402209",
+  "save_time": "2026-02-19T09:00:26.586529",
   "initial_balance": 5000.0,
   "leverage": 20,
   "stats": {
-    "total_trades": 3,
-    "win_rate": 0.0,
-    "total_pnl": -191.9159747399999,
-    "total_pnl_pct": -3.838319494800002,
-    "max_drawdown_pct": 3.4491030832000074,
+    "total_trades": 8,
+    "win_rate": 0.375,
+    "total_pnl": -114.41578448000018,
+    "total_pnl_pct": -2.2883156896000068,
+    "max_drawdown_pct": 2.2883156896000036,
     "max_balance": 5000.0
   },
   "trades": [
@@ -18,6 +18,7 @@
       "side": "SHORT",
       "quantity": 0.106,
       "margin_used": 237.930483333348,
+      "leverage": 0.0,
       "entry_price": 67338.81603774,
       "entry_time": "2026-02-18T10:44:03.593733",
       "entry_bar_idx": 506,
@@ -51,7 +52,8 @@
       "entry_snapshot": null,
       "exit_snapshot": null,
       "indicator_snapshots_during_hold": [],
-      "kelly_position_pct": 0.05
+      "kelly_position_pct": 0.05,
+      "signal_combo_keys": []
     },
     {
       "order_id": "EXCHANGE_SYNC",
@@ -59,6 +61,7 @@
       "side": "SHORT",
       "quantity": 0.106,
       "margin_used": 237.930483333348,
+      "leverage": 0.0,
       "entry_price": 67338.81603774,
       "entry_time": "2026-02-18T10:44:03.593733",
       "entry_bar_idx": 506,
@@ -92,7 +95,8 @@
       "entry_snapshot": null,
       "exit_snapshot": null,
       "indicator_snapshots_during_hold": [],
-      "kelly_position_pct": 0.05
+      "kelly_position_pct": 0.05,
+      "signal_combo_keys": []
     },
     {
       "order_id": "EXCHANGE_SYNC",
@@ -100,6 +104,7 @@
       "side": "SHORT",
       "quantity": 0.07,
       "margin_used": 236.26155999999006,
+      "leverage": 0.0,
       "entry_price": 67503.30285714,
       "entry_time": "2026-02-18T11:34:03.897518",
       "entry_bar_idx": 556,
@@ -133,7 +138,8 @@
       "entry_snapshot": null,
       "exit_snapshot": null,
       "indicator_snapshots_during_hold": [],
-      "kelly_position_pct": 0.05
+      "kelly_position_pct": 0.05,
+      "signal_combo_keys": []
     },
     {
       "order_id": "EXCHANGE_SYNC",
@@ -141,6 +147,7 @@
       "side": "SHORT",
       "quantity": 0.07,
       "margin_used": 236.26155999999006,
+      "leverage": 0.0,
       "entry_price": 67503.30285714,
       "entry_time": "2026-02-18T11:34:03.897518",
       "entry_bar_idx": 556,
@@ -174,7 +181,8 @@
       "entry_snapshot": null,
       "exit_snapshot": null,
       "indicator_snapshots_during_hold": [],
-      "kelly_position_pct": 0.05
+      "kelly_position_pct": 0.05,
+      "signal_combo_keys": []
     },
     {
       "order_id": "EXCHANGE_SYNC",
@@ -182,6 +190,7 @@
       "side": "LONG",
       "quantity": 0.037,
       "margin_used": 125.24518500000002,
+      "leverage": 0.0,
       "entry_price": 67700.1,
       "entry_time": "2026-02-18T12:51:04.150052",
       "entry_bar_idx": 633,
@@ -215,7 +224,8 @@
       "entry_snapshot": null,
       "exit_snapshot": null,
       "indicator_snapshots_during_hold": [],
-      "kelly_position_pct": 0.054000000000000006
+      "kelly_position_pct": 0.054000000000000006,
+      "signal_combo_keys": []
     },
     {
       "order_id": "EXCHANGE_SYNC",
@@ -223,6 +233,7 @@
       "side": "LONG",
       "quantity": 0.038,
       "margin_used": 128.63019000000003,
+      "leverage": 0.0,
       "entry_price": 67700.1,
       "entry_time": "2026-02-18T12:51:04.150052",
       "entry_bar_idx": 633,
@@ -256,7 +267,8 @@
       "entry_snapshot": null,
       "exit_snapshot": null,
       "indicator_snapshots_during_hold": [],
-      "kelly_position_pct": 0.054000000000000006
+      "kelly_position_pct": 0.054000000000000006,
+      "signal_combo_keys": []
     },
     {
       "order_id": "EXCHANGE_SYNC",
@@ -264,6 +276,7 @@
       "side": "LONG",
       "quantity": 0.019,
       "margin_used": 64.31509500000001,
+      "leverage": 0.0,
       "entry_price": 67700.1,
       "entry_time": "2026-02-18T12:51:04.150052",
       "entry_bar_idx": 633,
@@ -297,7 +310,51 @@
       "entry_snapshot": null,
       "exit_snapshot": null,
       "indicator_snapshots_during_hold": [],
-      "kelly_position_pct": 0.054000000000000006
+      "kelly_position_pct": 0.054000000000000006,
+      "signal_combo_keys": []
+    },
+    {
+      "order_id": "EXCHANGE_SYNC",
+      "symbol": "BTCUSDT",
+      "side": "SHORT",
+      "quantity": 0.02,
+      "margin_used": 68.12100253164999,
+      "leverage": 20.0,
+      "entry_price": 68121.00253165,
+      "entry_time": "2026-02-19T08:26:53.752459",
+      "entry_bar_idx": 0,
+      "take_profit": 67739.52491747275,
+      "stop_loss": 68393.4865417766,
+      "status": "CLOSED",
+      "exit_price": 66333.0425,
+      "exit_time": "2026-02-19T08:28:34.023000",
+      "exit_bar_idx": 502,
+      "close_reason": "止盈",
+      "close_reason_detail": "挂单触发(止盈)",
+      "realized_pnl": 70.45707258,
+      "profit_pct": 103.42929487460881,
+      "total_fee": 1.06132867,
+      "template_fingerprint": null,
+      "entry_similarity": 0.0,
+      "entry_reason": "",
+      "decision_reason": "[交易所同步平仓] [根因] 交易所有4笔BUY成交记录 | 入场=68121.00 出场=66333.04 | TP=67739.52491747275 SL=68393.4865417766 | hold_bars=502",
+      "hold_bars": 502,
+      "peak_profit_pct": 52.75035112365612,
+      "partial_tp_count": 0,
+      "partial_sl_count": 0,
+      "exit_signals_triggered": [],
+      "entry_atr": 47.600000000001664,
+      "is_flip_trade": false,
+      "flip_reason": "",
+      "entry_trajectory": null,
+      "similarity_history": [],
+      "reasoning_history": [],
+      "regime_at_entry": "震荡偏空",
+      "entry_snapshot": null,
+      "exit_snapshot": null,
+      "indicator_snapshots_during_hold": [],
+      "kelly_position_pct": 0.0,
+      "signal_combo_keys": []
     }
   ]
 }

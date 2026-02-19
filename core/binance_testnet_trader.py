@@ -58,6 +58,15 @@ class BinanceTestnetTrader:
         # Futures Testnet
         self.base_url = "https://testnet.binancefuture.com"
         self.session = requests.Session()
+        self._open_orders_cache = None
+        self._open_orders_cache_ts = 0.0
+        self._open_orders_cache_ttl = 2.0
+        self._balance_cache_rows = None
+        self._balance_cache_ts = 0.0
+        self._balance_cache_ttl = 5.0
+        self._position_cache_row = None
+        self._position_cache_ts = 0.0
+        self._position_cache_ttl = 5.0
         self.session.headers.update({"X-MBX-APIKEY": self.api_key})
 
         self.stats = AccountStats(
@@ -179,6 +188,37 @@ class BinanceTestnetTrader:
             raise Exception(f"Binance API {error_code}: {error_msg}")
         
         return data
+
+    def _get_open_orders_cached(self, force: bool = False, source: str = "") -> List[dict]:
+        now = time.time()
+        if (not force) and self._open_orders_cache is not None:
+            if (now - self._open_orders_cache_ts) < self._open_orders_cache_ttl:
+                return self._open_orders_cache
+        open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+        self._open_orders_cache = open_orders
+        self._open_orders_cache_ts = now
+        return open_orders
+
+    def _get_balance_rows_cached(self, force: bool = False) -> List[dict]:
+        now = time.time()
+        if (not force) and self._balance_cache_rows is not None:
+            if (now - self._balance_cache_ts) < self._balance_cache_ttl:
+                return self._balance_cache_rows
+        rows = self._signed_request("GET", "/fapi/v2/balance")
+        self._balance_cache_rows = rows
+        self._balance_cache_ts = now
+        return rows
+
+    def _get_position_cached(self, force: bool = False) -> dict:
+        now = time.time()
+        if (not force) and self._position_cache_row is not None:
+            if (now - self._position_cache_ts) < self._position_cache_ttl:
+                return self._position_cache_row
+        rows = self._signed_request("GET", "/fapi/v2/positionRisk", {"symbol": self.symbol})
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        self._position_cache_row = row
+        self._position_cache_ts = now
+        return row
 
     @staticmethod
     def _trade_side(trade: dict) -> Optional[str]:
@@ -396,7 +436,7 @@ class BinanceTestnetTrader:
             raise Exception(f"更新杠杆失败: {e}")
 
     def _get_usdt_balance(self) -> float:
-        rows = self._signed_request("GET", "/fapi/v2/balance")
+        rows = self._get_balance_rows_cached()
         for row in rows:
             if row.get("asset") == "USDT":
                 bal = float(row.get("balance", 0.0))
@@ -405,7 +445,7 @@ class BinanceTestnetTrader:
         return 0.0
 
     def _get_usdt_available_balance(self) -> float:
-        rows = self._signed_request("GET", "/fapi/v2/balance")
+        rows = self._get_balance_rows_cached()
         for row in rows:
             if row.get("asset") == "USDT":
                 # Binance 下单应使用可用余额，而不是总余额
@@ -417,10 +457,7 @@ class BinanceTestnetTrader:
         return float(data.get("markPrice", 0.0))
 
     def _get_position(self) -> dict:
-        rows = self._signed_request("GET", "/fapi/v2/positionRisk", {"symbol": self.symbol})
-        if isinstance(rows, list) and rows:
-            return rows[0]
-        return {}
+        return self._get_position_cached()
 
     def _infer_close_reason(self, order: PaperOrder, exit_price: float) -> CloseReason:
         """
@@ -566,7 +603,8 @@ class BinanceTestnetTrader:
     def _sync_from_exchange(self, force: bool = False):
         """从交易所同步余额/持仓，确保UI与币安账户一致"""
         now = time.time()
-        if (not force) and (now - self._last_sync_ts < self._sync_interval_sec):
+        delta = now - self._last_sync_ts
+        if (not force) and (delta < self._sync_interval_sec):
             return
         self._last_sync_ts = now
 
@@ -797,7 +835,7 @@ class BinanceTestnetTrader:
         # 否则旧的反方向入场单可能仍在交易所上，一旦成交就会平掉当前仓位
         # 注意：即使本地列表为空也要检查交易所，因为列表可能已被之前的sync清空
         try:
-            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            open_orders = self._get_open_orders_cached(force=True, source="sync_existing_position_cancel_entry")
             for o in open_orders:
                 client_id = o.get("clientOrderId", "")
                 if "ENTRY_LIMIT" in client_id or "ENTRY_STOP" in client_id:
@@ -830,7 +868,7 @@ class BinanceTestnetTrader:
     def _has_active_exchange_staged_orders(self) -> bool:
         """交易所是否存在本系统的阶梯保护单"""
         try:
-            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            open_orders = self._get_open_orders_cached(source="has_active_exchange_staged_orders")
             for o in open_orders:
                 cid = str(o.get("clientOrderId", "") or "")
                 # 兼容旧前缀，避免历史单导致误判
@@ -886,7 +924,7 @@ class BinanceTestnetTrader:
                 return True
         try:
             # 获取所有挂单
-            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            open_orders = self._get_open_orders_cached(source="has_pending_stop_orders")
             # 查找带有 ENTRY_LIMIT 或 ENTRY_STOP 前缀的挂单（兼容旧版本）
             for o in open_orders:
                 client_id = o.get("clientOrderId", "")
@@ -900,7 +938,7 @@ class BinanceTestnetTrader:
     def cancel_entry_stop_orders(self):
         """取消所有挂起的入场挂单"""
         try:
-            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            open_orders = self._get_open_orders_cached(force=True, source="cancel_entry_stop_orders")
             for o in open_orders:
                 client_id = o.get("clientOrderId", "")
                 # 兼容新旧版本的订单前缀
@@ -1231,7 +1269,7 @@ class BinanceTestnetTrader:
         if not self._staged_orders:
             return
         try:
-            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            open_orders = self._get_open_orders_cached(force=True, source="verify_staged_orders_on_exchange")
             exchange_ids = {int(o["orderId"]) for o in open_orders}
         except Exception as e:
             print(f"[BinanceTrader] ⚠ 校验委托单失败(无法拉取 openOrders): {e}")
@@ -1682,7 +1720,7 @@ class BinanceTestnetTrader:
         （程序重启时调用，避免旧订单干扰新仓位）
         """
         try:
-            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            open_orders = self._get_open_orders_cached(force=True, source="cleanup_orphan_tp_sl")
             for o in open_orders:
                 client_id = str(o.get("clientOrderId", ""))
                 order_type = str(o.get("type", ""))
@@ -1799,10 +1837,10 @@ class BinanceTestnetTrader:
         return order_id
 
     def get_pending_entry_orders_snapshot(self, current_bar_idx: int = None) -> List[dict]:
-        """直接从交易所拉取 openOrders，确保与交易所一致"""
+        """获取委托单快照（优先使用短TTL缓存，避免UI高频刷新打爆API）"""
         snapshots: List[dict] = []
         try:
-            open_orders = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            open_orders = self._get_open_orders_cached(source="get_pending_entry_orders_snapshot")
         except Exception as e:
             print(f"[BinanceTrader] ⚠ 拉取委托单失败: {e}")
             return snapshots

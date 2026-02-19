@@ -323,6 +323,38 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         )
         self.reverse_signal_checkbox.stateChanged.connect(self._on_reverse_mode_changed)
         control_layout.addWidget(self.reverse_signal_checkbox)
+
+        # 精品信号模式开关
+        self.signal_mode_checkbox = QtWidgets.QCheckBox("💎 精品信号开仓")
+        self.signal_mode_checkbox.setChecked(True)
+        self.signal_mode_checkbox.setStyleSheet(f"""
+            QCheckBox {{
+                color: {UI_CONFIG['THEME_ACCENT']};
+                font-size: 12px;
+                font-weight: bold;
+                padding: 5px 0;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {UI_CONFIG['THEME_ACCENT']};
+                border: 1px solid {UI_CONFIG['THEME_ACCENT']};
+                border-radius: 3px;
+            }}
+            QCheckBox::indicator:unchecked {{
+                background-color: #333;
+                border: 1px solid #555;
+                border-radius: 3px;
+            }}
+        """)
+        self.signal_mode_checkbox.setToolTip(
+            "勾选：按精品信号组合开仓（固定5%仓位 + 固定TP/SL）\n"
+            "取消：使用原指纹/原型匹配策略"
+        )
+        self.signal_mode_checkbox.stateChanged.connect(self._on_signal_mode_changed)
+        control_layout.addWidget(self.signal_mode_checkbox)
         
         layout.addWidget(control_group)
         
@@ -428,6 +460,18 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
                     border-radius: 3px;
                 }
             """)
+
+    def _on_signal_mode_changed(self, state):
+        """精品信号模式开关变更"""
+        enabled = (state == QtCore.Qt.CheckState.Checked.value)
+        # 更新引擎（如果已经运行）
+        if hasattr(self, '_engine') and self._engine:
+            self._engine.use_signal_mode = enabled
+        print(f"[UI] 精品信号模式: {'开启' if enabled else '关闭'}")
+
+    def update_signal_mode_info(self, info: dict):
+        """转发到 status_panel（标签在那边）"""
+        pass
     
     def _on_clear_memory_clicked(self):
         """清除学习记忆按钮点击"""
@@ -737,17 +781,324 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # ══════ Tab 1: 持仓（含委托单、账户设置与统计） ══════
         self._create_position_tab()
         
-        # ══════ Tab 2: 匹配 ══════
+        # ══════ Tab 2: 精品 ══════
+        self._create_signal_mode_tab()
+
+        # ══════ Tab 3: 匹配 ══════
         self._create_matching_tab()
-        
-        # ══════ Tab 3: 监控 ══════
+
+        # ══════ Tab 4: 委托单 ══════
+        self._create_pending_tab()
+
+        # ══════ Tab 5: 推理 ══════
         self._create_monitoring_tab()
         
-        # ══════ Tab 4: 日志 ══════
+        # ══════ Tab 6: 日志 ══════
         self._create_log_tab()
         
         layout.addWidget(self.tabs)
     
+    def _create_signal_mode_tab(self):
+        """创建精品信号模式监控标签页"""
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(12, 12, 12, 12)
+        tab_layout.setSpacing(10)
+        
+        # 标题
+        title_label = QtWidgets.QLabel("💎 精品信号匹配")
+        title_label.setStyleSheet(f"color: {UI_CONFIG['THEME_ACCENT']}; font-weight: bold; font-size: 14px;")
+        tab_layout.addWidget(title_label)
+        
+        # 市场状态卡片
+        state_card = QtWidgets.QWidget()
+        state_card.setStyleSheet("""
+            QWidget {
+                background-color: #252526;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+            }
+        """)
+        state_layout = QtWidgets.QFormLayout(state_card)
+        state_layout.setContentsMargins(15, 12, 15, 12)
+        state_layout.setSpacing(10)
+        
+        self.sm_market_state_label = QtWidgets.QLabel("-")
+        self.sm_market_state_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #aaa;")
+        state_layout.addRow("当前市场状态:", self.sm_market_state_label)
+        
+        self.sm_today_count_label = QtWidgets.QLabel("0 次")
+        self.sm_today_count_label.setStyleSheet("font-size: 14px; color: #ccc;")
+        state_layout.addRow("今日触发次数:", self.sm_today_count_label)
+        
+        self.sm_pool_status_label = QtWidgets.QLabel("正在检查...")
+        self.sm_pool_status_label.setStyleSheet("font-size: 12px; color: #888;")
+        state_layout.addRow("策略池状态:", self.sm_pool_status_label)
+        
+        tab_layout.addWidget(state_card)
+        
+        # 最新触发组合卡片
+        trigger_card = QtWidgets.QGroupBox("最新触发组合")
+        trigger_card.setStyleSheet(f"""
+            QGroupBox {{
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+                margin-top: 15px;
+                padding-top: 15px;
+                font-weight: bold;
+                color: {UI_CONFIG['THEME_TEXT']};
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        trigger_layout = QtWidgets.QVBoxLayout(trigger_card)
+        
+        self.sm_trigger_info_label = QtWidgets.QLabel("等待信号触发...")
+        self.sm_trigger_info_label.setWordWrap(True)
+        self.sm_trigger_info_label.setStyleSheet("font-size: 13px; color: #bbb; line-height: 1.5; padding: 5px;")
+        trigger_layout.addWidget(self.sm_trigger_info_label)
+        
+        tab_layout.addWidget(trigger_card)
+
+        # 精品池明细卡片（三状态分组）
+        pool_card = QtWidgets.QGroupBox("精品策略池（按市场状态）— 绿=当前K线满足 红=不满足")
+        pool_card.setStyleSheet(f"""
+            QGroupBox {{
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+                margin-top: 15px;
+                padding-top: 15px;
+                font-weight: bold;
+                color: {UI_CONFIG['THEME_TEXT']};
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        pool_vbox = QtWidgets.QVBoxLayout(pool_card)
+        pool_vbox.setSpacing(0)
+        pool_vbox.setContentsMargins(4, 4, 4, 4)
+
+        self.sm_all_states_text = QtWidgets.QTextEdit()
+        self.sm_all_states_text.setReadOnly(True)
+        self.sm_all_states_text.setStyleSheet(
+            "background-color:#1a1a1a; color:#ccc; border:none;"
+        )
+        pool_vbox.addWidget(self.sm_all_states_text)
+
+        tab_layout.addWidget(pool_card, 1)   # stretch=1 让明细区域占满剩余空间
+        
+        self.tabs.addTab(tab, "精品")
+
+    def update_signal_mode_info(self, info: dict):
+        """更新精品信号模式状态面板（由 main_window 状态回调调用）"""
+        market_state = info.get("state", "-") if info else "-"
+        today_count  = info.get("today_count", 0) if info else 0
+        triggered_keys = set(info.get("triggered_keys", [])) if info else set()
+
+        # 引擎提供的当前状态已注解精品池（含 matched/unmatched 条件信息）
+        engine_long_pool  = info.get("long_pool",  []) if info else []
+        engine_short_pool = info.get("short_pool", []) if info else []
+
+        # === 始终从 signal_store 读取三个状态的完整精品池 ===
+        _ALL_STATES = ["多头趋势", "空头趋势", "震荡市"]
+        all_state_pools: dict = {}   # state -> {"long": [...], "short": [...]}
+        pool_total = 0
+        try:
+            from core import signal_store
+            for st in _ALL_STATES:
+                lp = signal_store.get_premium_pool(state=st, direction="long")
+                sp = signal_store.get_premium_pool(state=st, direction="short")
+                # 若引擎正在运行且当前状态匹配，用已注解版本替换（保留绿/红条件信息）
+                if st == market_state and engine_long_pool:
+                    lp = engine_long_pool
+                if st == market_state and engine_short_pool:
+                    sp = engine_short_pool
+                all_state_pools[st] = {"long": lp, "short": sp}
+                pool_total += len(lp) + len(sp)
+        except Exception:
+            pass
+
+        _engine_stopped = (not info) or market_state == "-"
+
+        # ── 市场状态标签 ──
+        state_color = "#888"
+        if "多头" in market_state:
+            state_color = "#089981"
+        elif "空头" in market_state:
+            state_color = "#f23645"
+        elif "震荡" in market_state:
+            state_color = "#FFB74D"
+
+        self.sm_market_state_label.setText(market_state if market_state != "-" else "等待引擎启动")
+        self.sm_market_state_label.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; color: {state_color};"
+        )
+        self.sm_today_count_label.setText(f"{today_count} 次")
+
+        # ── 触发组合卡片 ──
+        if info and info.get("combo_key"):
+            conditions   = info.get("conditions", [])
+            direction    = info.get("direction", "long")
+            score        = info.get("score", 0.0)
+            trigger_time = info.get("time", "-")
+            try:
+                from core.signal_utils import _format_conditions
+                cond_desc = _format_conditions(conditions, direction)
+            except Exception:
+                cond_desc = " & ".join(conditions[:3])
+            dir_color = '#089981' if direction == 'long' else '#f23645'
+            self.sm_trigger_info_label.setText(
+                f"<b>方向:</b> <span style='color:{dir_color}'>"
+                f"{'做多' if direction == 'long' else '做空'}</span><br>"
+                f"<b>条件:</b> {cond_desc}<br>"
+                f"<b>评分:</b> {score:.1f}  <b>时间:</b> {trigger_time}"
+            )
+        elif info and info.get("warning"):
+            self.sm_trigger_info_label.setText(
+                f"<span style='color:#f23645;'>{info['warning']}</span>"
+            )
+        else:
+            self.sm_trigger_info_label.setText(
+                "<span style='color:#666;'>等待信号触发...</span>"
+            )
+
+        # ── 策略池状态标签 ──
+        if pool_total == 0:
+            self.sm_pool_status_label.setText("⚠ 策略池为空，请先完成信号分析")
+            self.sm_pool_status_label.setStyleSheet(
+                "font-size: 12px; color: #f23645; font-weight: bold;"
+            )
+        elif _engine_stopped:
+            self.sm_pool_status_label.setText(
+                f"✅ 已加载精品池: 共 {pool_total} 个策略（3状态×多空 Top6）— 引擎待启动"
+            )
+            self.sm_pool_status_label.setStyleSheet("font-size: 12px; color: #FFB74D;")
+        else:
+            cur_l = len(engine_long_pool)
+            cur_s = len(engine_short_pool)
+            self.sm_pool_status_label.setText(
+                f"当前[{market_state}]: 做多{cur_l} / 做空{cur_s}  (总{pool_total}/36)"
+            )
+            self.sm_pool_status_label.setStyleSheet("font-size: 12px; color: #089981;")
+
+        # ── 三状态精品池明细 ──
+        self.sm_all_states_text.setHtml(
+            self._format_all_states_html(all_state_pools, market_state, triggered_keys)
+        )
+
+    def _format_all_states_html(
+        self,
+        all_state_pools: dict,   # state -> {"long": [...], "short": [...]}
+        current_state: str,
+        triggered_keys: set,
+    ) -> str:
+        """
+        生成三个市场状态的精品池 HTML。
+        - 当前状态区块高亮边框
+        - 当前状态的条件：绿=满足、红=不满足
+        - 非当前状态的条件：灰色（无引擎注解）
+        """
+        try:
+            from core.signal_utils import _cond_label
+        except Exception:
+            _cond_label = None
+
+        STATE_CFG = {
+            "多头趋势": {"label": "📈 多头趋势", "color": "#089981"},
+            "空头趋势": {"label": "📉 空头趋势", "color": "#f23645"},
+            "震荡市":   {"label": "↔ 震荡市",   "color": "#FFB74D"},
+        }
+        html_parts = []
+
+        for state, cfg in STATE_CFG.items():
+            pools = all_state_pools.get(state, {"long": [], "short": []})
+            long_pool  = pools.get("long", [])
+            short_pool = pools.get("short", [])
+            is_current = (state == current_state)
+
+            border_style = (
+                f"border:2px solid {cfg['color']}; border-radius:6px; margin:6px 2px; padding:6px;"
+                if is_current
+                else "border:1px solid #333; border-radius:6px; margin:6px 2px; padding:6px;"
+            )
+            active_tag = (
+                f"<span style='background:{cfg['color']};color:#000;font-size:10px;"
+                f"padding:1px 5px;border-radius:3px;margin-left:6px;'>▶ 当前</span>"
+                if is_current else ""
+            )
+            html_parts.append(
+                f"<div style='{border_style}'>"
+                f"<div style='color:{cfg['color']};font-weight:bold;font-size:13px;"
+                f"margin-bottom:6px;'>{cfg['label']}{active_tag}</div>"
+            )
+
+            for direction, dir_label, dir_color in [
+                ("long",  "做多", "#089981"),
+                ("short", "做空", "#f23645"),
+            ]:
+                pool = long_pool if direction == "long" else short_pool
+                html_parts.append(
+                    f"<div style='color:{dir_color};font-weight:bold;"
+                    f"font-size:11px;margin:4px 0 2px 0;'>{dir_label} Top6</div>"
+                )
+                if not pool:
+                    html_parts.append("<div style='color:#555;font-size:11px;'>暂无</div>")
+                    continue
+
+                for idx, item in enumerate(pool, start=1):
+                    conditions = item.get("conditions", []) or []
+                    matched    = set(item.get("matched_conditions",   []) or [])
+                    unmatched  = set(item.get("unmatched_conditions", []) or [])
+                    has_annotation = bool(matched or unmatched)
+
+                    cond_parts = []
+                    for cond in conditions:
+                        label = _cond_label(cond, direction) if _cond_label else cond
+                        if is_current and has_annotation:
+                            if cond in matched:
+                                color = "#4CAF50"   # 绿
+                            elif cond in unmatched:
+                                color = "#f23645"   # 红
+                            else:
+                                color = "#9aa0a6"
+                        else:
+                            color = "#666"          # 灰（非当前状态或引擎未启动）
+                        cond_parts.append(
+                            f"<span style='color:{color};'>{label}</span>"
+                        )
+                    cond_html = " & ".join(cond_parts) if cond_parts else "-"
+
+                    state_rate     = item.get("state_rate", 0.0)
+                    state_triggers = item.get("state_triggers", 0)
+                    score          = item.get("score", 0.0)
+                    is_triggered   = item.get("combo_key") in triggered_keys
+                    hot_tag = (
+                        "<span style='color:#00C8D4;font-weight:bold;'> ●触发</span>"
+                        if is_triggered else ""
+                    )
+                    match_cnt = len(matched) if has_annotation else "?"
+                    total_cnt = len(conditions)
+                    match_badge = (
+                        f"<span style='color:#9aa0a6;'>[{match_cnt}/{total_cnt}]</span> "
+                        if is_current else ""
+                    )
+                    html_parts.append(
+                        f"<div style='margin:1px 0 4px 8px;font-size:11px;'>"
+                        f"<b style='color:#aaa;'>{idx}.</b> {match_badge}{cond_html}{hot_tag}<br>"
+                        f"<span style='color:#555;'>胜率 {state_rate:.0%} · 触发 {state_triggers} · 评分 {score:.1f}</span>"
+                        f"</div>"
+                    )
+
+            html_parts.append("</div>")
+
+        return "".join(html_parts) if html_parts else "<span style='color:#555;'>无精品策略，请先完成信号分析</span>"
+
     def _create_position_tab(self):
         """创建持仓标签页"""
         tab = QtWidgets.QWidget()
@@ -3074,7 +3425,7 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         # ========== 新增列：离场信号触发 + 基于峰值的精简建议 ==========
         signals = getattr(order, "exit_signals_triggered", [])
         signal_count = len(signals)
-        main_text = f"{signal_count}个" if signal_count > 0 else "-"
+        main_text = self._format_signal_description(order)
         suggestion = self._peak_suggestion(order, peak_pct, order.profit_pct) if is_closed else ""
         if suggestion:
             main_text = main_text + "\n" + suggestion
@@ -3145,6 +3496,33 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         """)
         delete_btn.clicked.connect(lambda checked=False, o=order: self._on_delete_clicked(o))
         self.table.setCellWidget(row, 15, delete_btn)
+
+    def _format_signal_description(self, order) -> str:
+        """格式化信号列描述，支持精品信号解析"""
+        fp = getattr(order, "template_fingerprint", "") or ""
+        if not fp:
+            return "-"
+            
+        # 精品信号格式: "long|cond1+cond2+cond3" 或 "short|cond1+cond2"
+        if "|" in fp and (fp.startswith("long|") or fp.startswith("short|")):
+            try:
+                direction, cond_str = fp.split("|", 1)
+                conditions = cond_str.split("+")
+                
+                from core.signal_utils import _format_conditions
+                desc = _format_conditions(conditions, direction)
+                
+                # 截断长描述
+                if len(desc) > 24:
+                    desc = desc[:21] + "..."
+                return desc
+            except Exception:
+                return fp
+        
+        # 原有逻辑：返回简短指纹或ID
+        if len(fp) > 12:
+            return fp[:10] + ".."
+        return fp
     
     def _peak_suggestion(self, order, peak_pct: float, profit_pct: float) -> str:
         """基于峰值与实际盈亏给出精简建议（仅已平仓且峰值有效时）。"""

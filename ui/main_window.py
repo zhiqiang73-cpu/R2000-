@@ -3758,7 +3758,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     order
                 )
             self.paper_trading_tab.control_panel.update_account_stats(stats)
-            
+
+            # 更新精品信号模式状态面板
+            if getattr(state, 'signal_mode_active', False) or getattr(self._live_engine, 'use_signal_mode', False):
+                sm_info = getattr(state, 'signal_mode_info', {}) or {}
+                self.paper_trading_tab.status_panel.update_signal_mode_info(sm_info)
+
             # 更新模板统计
             profitable = len(self._live_engine.get_profitable_templates())
             losing = len(self._live_engine.get_losing_templates())
