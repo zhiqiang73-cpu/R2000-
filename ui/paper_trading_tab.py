@@ -863,8 +863,8 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         
         tab_layout.addWidget(trigger_card)
 
-        # 精品池明细卡片（三状态分组）
-        pool_card = QtWidgets.QGroupBox("精品策略池（按市场状态）— 绿=当前K线满足 红=不满足")
+        # 精品池明细卡片（三状态分组，含精品+高频双层）
+        pool_card = QtWidgets.QGroupBox("精品策略池（按市场状态）— 精品(金色) + 高频(青色)")
         pool_card.setStyleSheet(f"""
             QGroupBox {{
                 border: 1px solid #3a3a3a;
@@ -976,7 +976,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             )
         elif _engine_stopped:
             self.sm_pool_status_label.setText(
-                f"✅ 已加载精品池: 共 {pool_total} 个策略（3状态×多空 Top6）— 引擎待启动"
+                f"✅ 已加载策略池: 共 {pool_total} 个策略（3状态×多空 Top6）— 引擎待启动"
             )
             self.sm_pool_status_label.setStyleSheet("font-size: 12px; color: #FFB74D;")
         else:
@@ -999,15 +999,23 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         triggered_keys: set,
     ) -> str:
         """
-        方案1增强版：指标×状态 表格视图。
+        指标×状态 表格视图（精品+高频双层颜色区分）。
         - 行 = 指标类别（布林位置、偏离MA5、ATR波动率…）
         - 列 = 3状态 × 做多/做空 = 6列
         - 单元格 = (1/2/3) + 亮灯/灭灯
-          其中 1/2/3 表示该状态+方向下哪几条精品策略用到了这个指标
-          亮灯=当前K线满足，灭灯=不满足
+          精品策略编号用金色，高频策略编号用青色
         - 当前状态列高亮边框
-        - 表格下方：全亮策略摘要
+        - 表格下方：全亮策略摘要（含层级标签）
         """
+        # ── 层级颜色 ──────────────────────────────────────────────
+        TIER_COLOR_ELITE = "#D9B36A"  # 精品 - 金色
+        TIER_COLOR_FREQ  = "#00CED1"  # 高频 - 青色
+        TIER_BG_ELITE    = "#2A2520"
+        TIER_BG_FREQ     = "#1E2A2A"
+
+        def _tier_color(tier: str) -> str:
+            return TIER_COLOR_FREQ if tier == "高频" else TIER_COLOR_ELITE
+
         # ── 指标顺序与标签 ──────────────────────────────────────────
         INDICATOR_ORDER = [
             "boll_pos", "close_vs_ma5", "atr_ratio", "vol_ratio",
@@ -1043,7 +1051,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             return cond
 
         # ── 构建每列的指标倒排索引 ──────────────────────────────────
-        # col_map[(state, dir)] = {base: [(strategy_idx, is_matched_or_None), ...]}
+        # col_map[(state, dir)] = {base: [(strategy_idx, is_matched_or_None, tier), ...]}
         col_map: dict = {}
         for state, direction in COLS:
             pools = all_state_pools.get(state, {})
@@ -1055,6 +1063,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                 matched    = set(item.get("matched_conditions",   []) or [])
                 unmatched  = set(item.get("unmatched_conditions", []) or [])
                 has_ann    = bool(matched or unmatched)
+                tier       = item.get("tier", "精品")
                 for cond in conditions:
                     base = _get_base(cond)
                     if base not in idx_map:
@@ -1062,9 +1071,18 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                     if is_cur and has_ann:
                         is_matched = cond in matched
                     else:
-                        is_matched = None   # 无注解
-                    idx_map[base].append((idx, is_matched))
+                        is_matched = None
+                    idx_map[base].append((idx, is_matched, tier))
             col_map[(state, direction)] = idx_map
+
+        # ── 构建每列的策略 tier 映射（用于表头图例） ──────────────
+        col_tier_map: dict = {}   # (state, direction) -> {idx: tier}
+        for state, direction in COLS:
+            pools = all_state_pools.get(state, {})
+            pool  = pools.get(direction, [])
+            col_tier_map[(state, direction)] = {
+                idx: item.get("tier", "精品") for idx, item in enumerate(pool, 1)
+            }
 
         # ── 收集所有出现过的指标 ──────────────────────────────────
         all_used: set = set()
@@ -1086,7 +1104,17 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                "border:1px solid #2a2a2a;font-size:11px;font-weight:bold;"
                "white-space:nowrap;background:#1c1c1c;color:#aaa;")
 
-        h = ["<table style='width:100%;border-collapse:collapse;'>"]
+        # ── 图例 ────────────────────────────────────────────────────
+        h = [
+            f"<div style='margin-bottom:6px;font-size:11px;'>"
+            f"<span style='color:{TIER_COLOR_ELITE};font-weight:bold;'>■ 精品策略</span>"
+            f"&nbsp;&nbsp;"
+            f"<span style='color:{TIER_COLOR_FREQ};font-weight:bold;'>■ 高频策略</span>"
+            f"&nbsp;&nbsp;"
+            f"<span style='color:#666;'>绿=当前K线满足 红=不满足</span>"
+            f"</div>"
+        ]
+        h.append("<table style='width:100%;border-collapse:collapse;'>")
 
         # ── 表头行1：状态（每2列合并） ────────────────────────────
         h.append("<tr>")
@@ -1128,34 +1156,46 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                     h.append(f"<td style='{TD}background:#151515;'></td>")
                     continue
 
-                nums   = [str(i) for i, _ in entries]
-                ms     = [m for _, m in entries if m is not None]
-                num_str = "/".join(nums)
+                ms = [m for _, m, _ in entries if m is not None]
 
-                if not ms:            # 引擎未启动 / 非当前列
-                    cell_color = "#444"
-                    bg         = "#181818"
-                    suffix     = ""
-                elif all(ms):         # 全亮
-                    cell_color = "#4CAF50"
-                    bg         = "#1a2a1a"
-                    suffix     = " <b>亮灯</b>"
-                elif any(ms):         # 部分亮
-                    cell_color = "#FFB74D"
-                    bg         = "#252015"
-                    suffix     = " <b>部分</b>"
-                else:                 # 全灭
-                    cell_color = "#f23645"
-                    bg         = "#261717"
-                    suffix     = " <b>未满足</b>"
+                if not ms:
+                    bg = "#181818"
+                elif all(ms):
+                    bg = "#1a2a1a"
+                elif any(ms):
+                    bg = "#252015"
+                else:
+                    bg = "#261717"
 
-                nums_html = (f"<span style='color:#666;'>({num_str})</span>"
-                             if not ms else
-                             f"<span style='color:{cell_color};'>({num_str})</span>")
+                # 每个策略编号按 tier 着色
+                num_parts = []
+                for idx, is_matched, tier in entries:
+                    tc = _tier_color(tier)
+                    if ms:
+                        if is_matched:
+                            c = "#4CAF50"
+                        elif is_matched is False:
+                            c = "#f23645"
+                        else:
+                            c = tc
+                    else:
+                        c = tc
+                    num_parts.append(f"<span style='color:{c};'>{idx}</span>")
+
+                nums_html = f"<span>({'/'.join(num_parts)})</span>"
+
+                # 状态后缀
+                if not ms:
+                    suffix = ""
+                elif all(ms):
+                    suffix = " <b style='color:#4CAF50;'>亮灯</b>"
+                elif any(ms):
+                    suffix = " <b style='color:#FFB74D;'>部分</b>"
+                else:
+                    suffix = " <b style='color:#f23645;'>未满足</b>"
+
                 h.append(f"<td style='{TD}background:{bg};'>"
-                         f"{nums_html}"
-                         f"<span style='color:{cell_color};'>{suffix}</span>"
-                         f"</td>")
+                         f"{nums_html}{suffix}</td>")
             h.append("</tr>")
 
         h.append("</table>")
@@ -1172,6 +1212,12 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                     conditions = item.get("conditions", []) or []
                     matched    = set(item.get("matched_conditions", []) or [])
                     unmatched  = set(item.get("unmatched_conditions", []) or [])
+                    tier       = item.get("tier", "精品")
+                    tier_color = _tier_color(tier)
+                    tier_badge = (
+                        f"<span style='background:{tier_color};color:#000;font-size:9px;"
+                        f"padding:1px 4px;border-radius:2px;font-weight:bold;'>{tier}</span>"
+                    )
                     if not conditions:
                         continue
                     is_triggered = item.get("combo_key") in triggered_keys
@@ -1183,6 +1229,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                             f"<div style='margin:2px 0;padding:3px 8px;"
                             f"background:#0d2a2a;border-left:3px solid #00C8D4;"
                             f"border-radius:2px;font-size:11px;'>"
+                            f"{tier_badge}&nbsp;"
                             f"<span style='color:{dir_color};font-weight:bold;'>"
                             f"[{dir_label}策略{idx}]</span>&nbsp;{badge}&nbsp;"
                             f"<span style='color:#00C8D4;'>已触发开仓</span>"
@@ -1194,6 +1241,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                             f"<div style='margin:2px 0;padding:3px 8px;"
                             f"background:#1a2a1a;border-left:3px solid #4CAF50;"
                             f"border-radius:2px;font-size:11px;'>"
+                            f"{tier_badge}&nbsp;"
                             f"<span style='color:{dir_color};font-weight:bold;'>"
                             f"[{dir_label}策略{idx}]</span>&nbsp;"
                             f"<span style='color:#4CAF50;font-weight:bold;'>全亮 {match_cnt}/{len(conditions)}</span>"
@@ -1208,6 +1256,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                                 f"<div style='margin:2px 0;padding:3px 8px;"
                                 f"background:#1a1a1a;border-left:3px solid #333;"
                                 f"border-radius:2px;font-size:11px;'>"
+                                f"{tier_badge}&nbsp;"
                                 f"<span style='color:#555;'>[{dir_label}策略{idx}]</span>&nbsp;"
                                 f"<span style='color:#FFB74D;'>{match_cnt}/{len(conditions)} 条件满足</span>"
                                 f"</div>"
@@ -1217,6 +1266,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
                                 f"<div style='margin:2px 0;padding:3px 8px;"
                                 f"background:#1f1515;border-left:3px solid #f23645;"
                                 f"border-radius:2px;font-size:11px;'>"
+                                f"{tier_badge}&nbsp;"
                                 f"<span style='color:#777;'>[{dir_label}策略{idx}]</span>&nbsp;"
                                 f"<span style='color:#f23645;'>0/{len(conditions)} 条件满足</span>"
                                 f"</div>"

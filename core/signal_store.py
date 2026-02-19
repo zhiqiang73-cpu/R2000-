@@ -615,7 +615,7 @@ def get_premium_pool(
                 high_freq_list = _select_high_freq_top(
                     high_freq_candidates,
                     top_n=top_n,
-                    min_triggers=20,
+                    min_triggers=10,
                     min_score=70.0,
                     max_conditions=3,
                     max_overlap=0.5,
