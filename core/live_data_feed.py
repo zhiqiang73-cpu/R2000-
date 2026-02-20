@@ -148,6 +148,7 @@ class LiveDataFeed:
         self._price_ws: Optional[websocket.WebSocketApp] = None
         self._price_ws_thread: Optional[threading.Thread] = None
         self._rest_poll_thread: Optional[threading.Thread] = None
+        self._dispatch_thread: Optional[threading.Thread] = None
         self._running = False
         self._connected = False
         self._reconnect_count = 0
@@ -228,6 +229,12 @@ class LiveDataFeed:
         # 先获取历史K线
         self._fetch_history()
         
+        # 启动 kline 回调分发线程（将 on_kline 调用从 WS 线程解耦）
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_loop, daemon=True, name="kline-dispatch"
+        )
+        self._dispatch_thread.start()
+
         # 启动 WebSocket
         self._start_websocket()
         # 启动逐笔成交价通道（仅用于低延迟价格显示）
@@ -250,6 +257,8 @@ class LiveDataFeed:
             self._price_ws_thread.join(timeout=3)
         if self._rest_poll_thread and self._rest_poll_thread.is_alive():
             self._rest_poll_thread.join(timeout=3)
+        if self._dispatch_thread and self._dispatch_thread.is_alive():
+            self._dispatch_thread.join(timeout=3)
         self._connected = False
     
     def get_history_df(self, include_current: bool = True) -> pd.DataFrame:
@@ -760,13 +769,23 @@ class LiveDataFeed:
                 self._current_kline = kline
                 emit_callback = True
         
-        # 回调
+        # 入队交给 dispatch 线程调用，避免阻塞 WS 线程
         if emit_callback and self.on_kline:
-            try:
-                self.on_kline(kline)
-            except Exception as e:
-                print(f"[LiveDataFeed] K线回调异常: {e}")
+            self._msg_queue.put(kline)
     
+    def _dispatch_loop(self):
+        """分发线程：从 _msg_queue 取出 kline 并调用 on_kline 回调。
+        将重IO/计算的回调与 WebSocket 线程完全解耦，防止 WS Ping 超时断线。"""
+        while self._running:
+            try:
+                kline = self._msg_queue.get(timeout=1.0)
+                try:
+                    self.on_kline(kline)
+                except Exception as e:
+                    print(f"[LiveDataFeed] dispatch回调异常: {e}")
+            except queue.Empty:
+                pass
+
     def test_connection(self) -> tuple:
         """
         测试API连接

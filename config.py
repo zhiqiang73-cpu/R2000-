@@ -135,14 +135,30 @@ GA_CONFIG = {
 
 # ==================== 回测配置 ====================
 BACKTEST_CONFIG = {
-    "INITIAL_CAPITAL": 10000,   # 初始资金 (USDT)
-    "LEVERAGE": 10,             # 杠杆倍数
+    "INITIAL_CAPITAL": 5000,    # 初始资金 (USDT)
+    "LEVERAGE": 20,             # 杠杆倍数
     "FEE_RATE": 0.0004,         # 手续费率 0.04%
     "SLIPPAGE": 0.0002,         # 滑点 0.02%
-    "POSITION_SIZE_PCT": 0.1,   # 单次仓位比例 10%
-    "STOP_LOSS_PCT": 0.02,      # 默认止损 2%
-    "TAKE_PROFIT_PCT": 0.03,    # 默认止盈 3%
+    "POSITION_SIZE_PCT": 0.05,  # 单次仓位比例 5%
+    "STOP_LOSS_PCT": 0.008,     # SL 价格 -0.8%（10x杠杆 = -8%杠杆后）
+    "TAKE_PROFIT_PCT": 0.012,   # TP1 = +12%杠杆后 = 价格 +1.2%（新系统：原 TP2 升为 TP1）
+    "TP1_RATIO": 0.70,          # TP1 平仓比例 70%
     "TP_SP_LOOKBACK": 20,       # TP/SP 近端高低点窗口
+
+    # ── 追踪止盈止损系统 ──
+    "TRAILING_STOP_ENABLED": True,          # 启用追踪止损（TP1后阶段2）
+    "TRAILING_STOP_PCT": 0.08,              # 追踪止损间距 8%（价格）
+
+    # 阶梯止损上移（杠杆后%）
+    "BREAKEVEN_THRESHOLD_PCT": 6.0,         # 浮盈达到+6%（杠杆后）触发止损上移
+    "BREAKEVEN_SL_PCT": -3.0,               # 止损上移目标：-3%（杠杆后）
+
+    # 时间衰减止损（杠杆后%）
+    "TIME_DECAY_ENABLED": True,             # 启用时间衰减止损收窄
+    "TIME_DECAY_BAR_1": 120,                # 超过120根K线触发第一档收窄
+    "TIME_DECAY_SL_1": -10.0,               # 第一档：止损收窄至 -10%（杠杆后）
+    "TIME_DECAY_BAR_2": 180,                # 超过180根K线触发第二档收窄
+    "TIME_DECAY_SL_2": -5.0,                # 第二档：止损收窄至 -5%（杠杆后）
 }
 
 # ==================== 实盘风控配置 ====================
@@ -591,30 +607,46 @@ PAPER_TRADING_CONFIG = {
     # ── 弱化·震荡：先保本收紧（有浮盈才把止损挪到入场价，触发=保本出场）──
     "REGIME_WEAKEN_MIN_PROFIT_PCT": 0.2,   # 至少浮盈 0.2% 才收紧到 entry，否则不收紧
 
-    # ── 阶梯基准止盈止损系统（三档止盈 + 动态止损）──
-    # 【核心理念】止盈分三档锁定利润，止损不分档（全平剩余），每档止损跟随止盈成交价动态上移
-    # 【阶梯基准】TP1基于入场价，TP2基于TP1成交价，TP3基于TP2成交价；SL始终基于当前阶梯基准
-    # 【仓位分配】TP1平50% → TP2平剩余50%(=25%) → TP3全平(=25%)；SL始终全平剩余
+    # ── 仓位比例 ──
+    "POSITION_SIZE_PCT": 0.05,        # 单次仓位比例 5%
+
+    # ── 阶梯基准止盈止损系统（两档止盈 + 固定止损）──
+    # 【核心理念】两档止盈锁定利润；止损全平剩余仓位
+    # 【仓位分配】TP1平70% → TP2平剩余30%；SL始终全平剩余
+    # 【止损上移】TP1成交后，止损上移至入场价（保本）
     #
     # 以下 % 均为「收益率%」（杠杆后），挂单价格按 价格变动% = 收益率% / 杠杆 换算
-    "STAGED_TP_PCT": 7.0,             # 每档止盈收益率 +7%（阶梯累计约 +21%）
-    "STAGED_SL_PCT": 5.0,             # 止损收益率 -5%（基于当前阶梯基准，全平剩余）
-    "STAGED_TP_RATIO_1": 0.50,        # 第1档减仓比例（50%）
-    "STAGED_TP_RATIO_2": 0.50,        # 第2档减仓比例（剩余的50% = 总仓位25%）
-    "STAGED_TP_RATIO_3": 1.00,        # 第3档全平剩余仓位（25%）
+    "STAGED_TP_PCT": 12.0,            # TP1 收益率 +12%（价格 +0.6%，20x杠杆）
+    "STAGED_SL_PCT": 16.0,            # SL 收益率 -16%（价格 -0.8%，20x杠杆）
+    "STAGED_TP_RATIO_1": 0.70,        # 第1档减仓比例（70%）
+    "STAGED_TP_RATIO_2": 1.00,        # 第2档全平剩余仓位（30%）
     "LIMIT_PRICE_BAND_PCT": 5.0,      # Binance 限价单价格带（相对 mark 偏离上限 %），超出则用 STOP_MARKET
     "STAGED_ORDERS_SEQUENTIAL": True,  # 阶梯基准模式必须为 True（逐档挂单）
     
+    # ── 追踪止盈止损系统 ──
+    # 阶段1：入场→TP1（+12%），动态调整止损
+    # 阶段2：TP1后，剩余30%用追踪止损跑利润
+    "TRAILING_STOP_ENABLED": True,       # 启用追踪止损（阶段2使用）
+    "TRAILING_STOP_PCT": 0.08,           # 追踪止损间距 8%（价格变动）
+
+    # 阶梯止损上移（阶段1）
+    "BREAKEVEN_THRESHOLD_PCT": 6.0,      # 浮盈达到+6%（杠杆后）→止损上移
+    "BREAKEVEN_SL_PCT": -3.0,            # 上移后止损：-3%（杠杆后）
+
+    # 时间衰减止损（阶段1，未到过+6%时才触发）
+    "TIME_DECAY_ENABLED": True,          # 启用时间衰减
+    "TIME_DECAY_BAR_1": 120,             # 第一档：持仓超过120根K线
+    "TIME_DECAY_SL_1": -10.0,            # 第一档止损收窄到：-10%（杠杆后）
+    "TIME_DECAY_BAR_2": 180,             # 第二档：持仓超过180根K线
+    "TIME_DECAY_SL_2": -5.0,             # 第二档止损收窄到：-5%（杠杆后）
+
     # 兼容旧配置（已废弃，保留以防其他模块引用）
-    "STAGED_TP_1_PCT": 7.0,           # [废弃] 使用 STAGED_TP_PCT
-    "STAGED_TP_2_PCT": 14.0,          # [废弃] TP2 = TP1成交价 + 7%
-    "STAGED_TP_3_PCT": 21.0,          # [废弃] TP3 = TP2成交价 + 7%
-    "STAGED_SL_1_PCT": 5.0,           # [废弃] 使用 STAGED_SL_PCT
-    "STAGED_SL_2_PCT": 5.0,           # [废弃] SL2 = TP1成交价 - 5%
-    "STAGED_SL_3_PCT": 5.0,           # [废弃] SL3 = TP2成交价 - 5%
+    "STAGED_TP_1_PCT": 12.0,          # [废弃] TP1 收益率 +12%
+    "STAGED_TP_2_PCT": 24.0,          # [废弃] TP2 收益率 +24%
+    "STAGED_SL_1_PCT": 16.0,          # [废弃] 使用 STAGED_SL_PCT
+    "STAGED_SL_2_PCT": 0.0,           # [废弃] TP1成交后止损挪至入场价（保本）
     "STAGED_SL_RATIO_1": 1.00,        # [废弃] 止损始终全平
     "STAGED_SL_RATIO_2": 1.00,        # [废弃] 止损始终全平
-    "STAGED_SL_RATIO_3": 1.00,        # [废弃] 止损始终全平
 
     # ── 价格动量衰减离场（新增）──
     # 当价格接近峰值但动能衰减时主动离场
@@ -752,9 +784,6 @@ PAPER_TRADING_CONFIG = {
     "EXIT_TIMING_MIN_EVALS": 10,                # 每种出场原因至少需要多少次评估才给建议
     "EXIT_TIMING_STATE_FILE": "data/exit_timing_state.json",  # 持久化文件路径
     
-    # ========== 反向下单测试 ==========
-    "REVERSE_SIGNAL_MODE": False,  # True=所有信号反向（LONG→SHORT, SHORT→LONG）
-    
     # ── 近似信号追踪器（相似度阈值自适应学习）──
     "NEAR_MISS_TRACKER_ENABLED": True,      # 是否启用近似信号追踪
     "NEAR_MISS_MARGIN": 0.10,               # 近似信号捕获范围（与阈值的差距，0.10=10%）
@@ -762,6 +791,21 @@ PAPER_TRADING_CONFIG = {
     "NEAR_MISS_PROFIT_THRESHOLD_PCT": 0.3,  # 价格移动超过此百分比视为"本可盈利"（%）
     "NEAR_MISS_MAX_HISTORY": 200,           # 最大历史记录数
     "NEAR_MISS_STATE_FILE": "data/near_miss_tracker_state.json",  # 持久化文件路径
+
+    # ── 追踪止盈止损系统 ──
+    "TRAILING_STOP_ENABLED": True,          # 启用追踪止损（TP1后进入阶段2时生效）
+    "TRAILING_STOP_PCT": 0.08,              # 追踪止损间距 8%（价格，非杠杆后）
+
+    # 阶梯止损上移（杠杆后%）
+    "BREAKEVEN_THRESHOLD_PCT": 6.0,         # 第一档阈值：浮盈+6%（杠杆后）触发止损上移
+    "BREAKEVEN_SL_PCT": -3.0,               # 第一档止损：-3%（杠杆后）
+
+    # 时间衰减止损（杠杆后%）
+    "TIME_DECAY_ENABLED": True,             # 启用时间衰减止损收窄
+    "TIME_DECAY_BAR_1": 120,                # 第一档：持仓超过120根K线
+    "TIME_DECAY_SL_1": -10.0,               # 第一档止损收窄目标：-10%（杠杆后）
+    "TIME_DECAY_BAR_2": 180,                # 第二档：持仓超过180根K线
+    "TIME_DECAY_SL_2": -5.0,                # 第二档止损收窄目标：-5%（杠杆后）
 }
 
 # ==================== DeepSeek API 配置 ====================

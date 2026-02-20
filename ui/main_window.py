@@ -24,7 +24,7 @@ from ui.chart_widget import ChartWidget
 from ui.control_panel import ControlPanel
 from ui.analysis_panel import AnalysisPanel
 from ui.optimizer_panel import OptimizerPanel
-from ui.paper_trading_tab import PaperTradingTab
+from ui.paper_trading_tab import PaperTradingTab, PaperTradingTradeLog
 from ui.adaptive_learning_tab import AdaptiveLearningTab
 from ui.signal_analysis_tab import SignalAnalysisTab
 from core.adaptive_controller import AdaptiveController, TradeContext as AdaptiveTradeContext
@@ -155,6 +155,462 @@ class LabelingWorker(QtCore.QObject):
     
     def set_speed(self, speed: int):
         """设置速度"""
+        self.speed = speed
+
+
+class PaperTradingStartWorker(QtCore.QObject):
+    """后台线程：创建 LiveTradingEngine + start()，避免阻塞 UI"""
+    succeeded = QtCore.pyqtSignal(object)   # engine
+    failed    = QtCore.pyqtSignal(str)      # error message
+    progress  = QtCore.pyqtSignal(str)      # status text
+
+    def __init__(self, build_fn):
+        super().__init__()
+        self._build_fn = build_fn
+
+    def run(self):
+        try:
+            engine, ok = self._build_fn(self.progress.emit)
+            if ok:
+                self.succeeded.emit(engine)
+            else:
+                self.failed.emit("无法启动模拟交易，请检查网络连接。")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.failed.emit(str(e))
+
+
+class TradeHistoryIOWorker(QtCore.QObject):
+    """后台线程：历史交易文件读/删/写"""
+    loaded = QtCore.pyqtSignal(list)            # history list
+    deleted = QtCore.pyqtSignal(int, int)       # (removed_count, remaining_count)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, history_file: str, action: str, order=None):
+        super().__init__()
+        self._history_file = history_file
+        self._action = action
+        self._order = order
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            if self._action == "load":
+                history = load_trade_history_from_file(self._history_file) or []
+                self.loaded.emit(history)
+                return
+
+            if self._action == "delete":
+                existing_history = load_trade_history_from_file(self._history_file) or []
+                filtered_history = [
+                    o for o in existing_history
+                    if not self._is_same_order(o, self._order)
+                ]
+                save_trade_history_to_file(filtered_history, self._history_file)
+                removed = len(existing_history) - len(filtered_history)
+                self.deleted.emit(removed, len(filtered_history))
+                return
+
+            raise ValueError(f"Unknown action: {self._action}")
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    @staticmethod
+    def _is_same_order(order1, order2) -> bool:
+        """判断两个订单是否相同（供后台线程使用）"""
+        if order1 is None or order2 is None:
+            return False
+        id1 = getattr(order1, "order_id", None)
+        id2 = getattr(order2, "order_id", None)
+        if id1 and id2 and id1 == id2:
+            return True
+        time1 = getattr(order1, "entry_time", None)
+        time2 = getattr(order2, "entry_time", None)
+        price1 = getattr(order1, "entry_price", 0.0)
+        price2 = getattr(order2, "entry_price", 0.0)
+        side1 = getattr(order1, "side", None)
+        side2 = getattr(order2, "side", None)
+        if time1 and time2 and time1 == time2:
+            if abs(price1 - price2) < 0.01:
+                if side1 and side2 and side1 == side2:
+                    return True
+        return False
+
+
+class SignalBacktestWorker(QtCore.QObject):
+    """信号回测工作者 - 使用策略池信号驱动回测，动画接口与 LabelingWorker 完全一致"""
+    step_completed    = QtCore.pyqtSignal(int)
+    label_found       = QtCore.pyqtSignal(int, int)
+    labeling_progress = QtCore.pyqtSignal(str)
+    labels_ready      = QtCore.pyqtSignal(object)
+    finished          = QtCore.pyqtSignal(object)   # dict: {bt_result, metrics}
+    rt_update         = QtCore.pyqtSignal(dict, list)   # (running_metrics, completed_trades)
+    error             = QtCore.pyqtSignal(str)
+
+    def __init__(self, df):
+        super().__init__()
+        self.df = df
+        self.labels = None
+        self.labeler = None   # 保持与 LabelingWorker 接口一致，避免 _on_labels_ready 中 AttributeError
+        self.speed  = UI_CONFIG["DEFAULT_SPEED"]
+        self._stop_requested  = False
+        self._pause_requested = False
+        self.is_running = False
+        self._labels_ready = False
+
+    @QtCore.pyqtSlot()
+    def run_backtest(self):
+        """后台预计算 + 前台动画循环"""
+        try:
+            import threading as _threading
+            import pandas as _pd
+            from utils.indicators import calculate_all_indicators
+            from core.signal_store import get_cumulative
+            from core.signal_analyzer import (
+                _build_condition_arrays,
+                LONG_TP1_PCT, LONG_SL_PCT,
+                SHORT_TP1_PCT, SHORT_SL_PCT,
+                MAX_HOLD,
+            )
+            from core.market_state_detector import detect_state
+            from core.backtester import TradeRecord, BacktestResult, Position, PositionSide
+            from config import PAPER_TRADING_CONFIG, BACKTEST_CONFIG
+
+            n = len(self.df)
+            INITIAL_CAP = float(PAPER_TRADING_CONFIG.get("DEFAULT_BALANCE", 5000.0))
+            self.is_running = True
+            self._stop_requested = False
+            self._pause_requested = False
+            self._labels_ready = False
+            self._precompute_ready = False
+            self._precompute_failed = False
+            self._df_work = None
+            self._cond = None
+            self._valid = None
+
+            def _make_running_metrics(records, init_cap, current_pos=None):
+                total_trades = len(records)
+                wins   = [r for r in records if r.profit > 0]
+                losses = [r for r in records if r.profit <= 0]
+                total_profit = sum(r.profit for r in records)
+                final_cap = init_cap + total_profit
+                total_return_pct = ((final_cap - init_cap) / init_cap * 100.0) if init_cap else 0.0
+                gross_profit = sum(r.profit for r in wins)
+                gross_loss = abs(sum(r.profit for r in losses))
+                profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
+                avg_profit_pct = (
+                    sum(r.profit_pct for r in records) / total_trades if total_trades else 0.0
+                )
+                avg_hold_periods = (
+                    sum(r.hold_periods for r in records) / total_trades if total_trades else 0.0
+                )
+                long_recs  = [r for r in records if r.side ==  1]
+                short_recs = [r for r in records if r.side == -1]
+                long_wins  = [r for r in long_recs  if r.profit > 0]
+                short_wins = [r for r in short_recs if r.profit > 0]
+                long_profit = sum(r.profit for r in long_recs)
+                short_profit = sum(r.profit for r in short_recs)
+                cap2, peak, max_dd = init_cap, init_cap, 0.0
+                for r in records:
+                    cap2 += r.profit
+                    peak = max(peak, cap2)
+                    dd = (peak - cap2) / peak * 100.0 if peak > 0 else 0.0
+                    if dd > max_dd:
+                        max_dd = dd
+
+                out = {
+                    "initial_capital": init_cap,
+                    "total_trades": total_trades,
+                    "win_rate": len(wins) / total_trades if total_trades else 0.0,
+                    "total_return": total_return_pct / 100.0,
+                    "total_profit": total_profit,
+                    "max_drawdown": max_dd,
+                    "sharpe_ratio": 0.0,
+                    "profit_factor": profit_factor,
+                    "long_win_rate": len(long_wins) / len(long_recs) if long_recs else 0.0,
+                    "long_profit": long_profit,
+                    "short_win_rate": len(short_wins) / len(short_recs) if short_recs else 0.0,
+                    "short_profit": short_profit,
+                    "current_pos": current_pos,
+                    "last_trade": records[-1] if records else None,
+                    "avg_profit_pct": avg_profit_pct,
+                    "avg_hold_periods": avg_hold_periods,
+                }
+                return out
+
+            def precompute():
+                try:
+                    self.labeling_progress.emit("正在计算所有指标...")
+                    df_work = calculate_all_indicators(self.df.copy())
+                    cumulative = get_cumulative()
+                    valid = {k: v for k, v in cumulative.items()
+                             if v.get('appear_rounds', 0) >= 2}
+                    if not valid:
+                        self._precompute_failed = True
+                        self.error.emit("策略池为空，请先完成信号分析")
+                        return
+
+                    cond = {
+                        'long':  _build_condition_arrays(df_work, 'long'),
+                        'short': _build_condition_arrays(df_work, 'short'),
+                    }
+
+                    self._df_work = df_work
+                    self._cond = cond
+                    self._valid = valid
+                    self._precompute_ready = True
+                    self.labeling_progress.emit("预计算完成，正在播放...")
+                except Exception as exc:
+                    self._precompute_failed = True
+                    self.error.emit(str(exc) + "\n" + traceback.format_exc())
+
+            precompute_thread = _threading.Thread(target=precompute, daemon=True)
+            precompute_thread.start()
+
+            labels_arr = None
+            df_work = None
+            cond = None
+            valid = None
+            prep_initialized = False
+
+            trade_records = []
+            capital = INITIAL_CAP
+            LEVERAGE = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
+            PCT = float(PAPER_TRADING_CONFIG.get("POSITION_SIZE_PCT", 0.05))
+            FEE = float(BACKTEST_CONFIG.get("FEE_RATE", 0.0004))
+            in_pos = False
+            e_price = e_idx = e_dir = tp = sl = None
+            e_key = None
+            e_info = None
+
+            cur = 0
+            while self.is_running and not self._stop_requested and cur < n:
+                while self._pause_requested and not self._stop_requested:
+                    time.sleep(0.05)
+                if self._stop_requested:
+                    break
+                if self._precompute_failed:
+                    break
+
+                if self._precompute_ready and not prep_initialized:
+                    df_work = self._df_work
+                    cond = self._cond
+                    valid = self._valid
+                    labels_arr = np.zeros(len(df_work), dtype=int)
+                    self.labels = _pd.Series(labels_arr, index=df_work.index, copy=False)
+                    self._labels_ready = True
+                    self.labels_ready.emit(self.labels)
+                    prep_initialized = True
+                    self.labeling_progress.emit("正在逐 bar 扫描信号...")
+
+                if prep_initialized and cur >= 50 and cur < len(df_work):
+                    row = df_work.iloc[cur]
+                    hi, lo, cl = float(row['high']), float(row['low']), float(row['close'])
+                    adx   = row.get('adx')
+                    slope = row.get('ma5_slope')
+
+                    if in_pos:
+                        hit_tp = (e_dir == 'long' and hi >= tp) or (e_dir == 'short' and lo <= tp)
+                        hit_sl = (e_dir == 'long' and lo <= sl) or (e_dir == 'short' and hi >= sl)
+                        timed  = (cur - e_idx) >= MAX_HOLD
+                        if hit_tp or hit_sl or timed:
+                            x_price = (tp if hit_tp else sl) if (hit_tp or hit_sl) else cl
+                            pnl_pct = (
+                                ((x_price - e_price) / e_price if e_dir == 'long'
+                                 else (e_price - x_price) / e_price) - FEE * 2
+                            )
+                            pnl = pnl_pct * capital * PCT * LEVERAGE
+                            capital += pnl
+                            reason = 'tp' if hit_tp else ('sl' if hit_sl else 'timeout')
+                            labels_arr[cur] = 2 if e_dir == 'long' else -2
+                            self.label_found.emit(cur, int(labels_arr[cur]))
+                            trade_records.append(TradeRecord(
+                                entry_idx=e_idx, exit_idx=cur,
+                                side=1 if e_dir == 'long' else -1,
+                                entry_price=e_price, exit_price=x_price,
+                                size=capital * PCT * LEVERAGE / e_price,
+                                profit=pnl, profit_pct=pnl_pct * 100,
+                                hold_periods=cur - e_idx, exit_reason=reason,
+                                signal_key=e_key or "",
+                                signal_rate=(e_info or {}).get('overall_rate', 0.0),
+                                signal_score=(e_info or {}).get('综合评分', 0.0),
+                            ))
+                            in_pos = False
+                            self.rt_update.emit(
+                                _make_running_metrics(trade_records, INITIAL_CAP),
+                                list(trade_records),
+                            )
+                        else:
+                            # 持仓中，每步刷新交易明细和持仓
+                            cur_pos = Position(
+                                side=PositionSide.LONG if e_dir == 'long' else PositionSide.SHORT,
+                                entry_price=e_price, entry_idx=e_idx,
+                                size=capital * PCT * LEVERAGE / e_price,
+                                stop_loss=sl, take_profit=tp, liquidation_price=0.0,
+                                margin=capital * PCT,
+                            )
+                            m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
+                            m["current_bar"] = cur
+                            self.rt_update.emit(m, list(trade_records))
+                        self.step_completed.emit(cur)
+                        cur += 1
+                        sleep_time = max(0.001, 10.0 / max(1, self.speed))
+                        time.sleep(sleep_time)
+                        continue
+
+                    if _pd.isna(adx) or _pd.isna(slope):
+                        self.step_completed.emit(cur)
+                        cur += 1
+                        sleep_time = max(0.001, 10.0 / max(1, self.speed))
+                        time.sleep(sleep_time)
+                        continue
+
+                    state = detect_state(float(adx), float(slope))
+                    # 方向预过滤：多头趋势只做多，空头趋势只做空，震荡市两边均可
+                    if state == '多头趋势':
+                        _allowed = {'long'}
+                    elif state == '空头趋势':
+                        _allowed = {'short'}
+                    else:
+                        _allowed = {'long', 'short'}
+                    _triggered = []
+                    for key, entry in valid.items():
+                        d = entry.get('direction', 'long')
+                        if d not in _allowed:
+                            continue
+                        conds = entry.get('conditions', [])
+                        bkd   = (entry.get('market_state_breakdown') or {}).get(state, {})
+                        if bkd.get('total_triggers', 0) == 0:
+                            continue
+                        arr = cond.get(d, {})
+                        if all(bool(arr.get(c, [False])[cur]) for c in conds if c in arr):
+                            state_wr = bkd.get('avg_rate', 0.0)
+                            _triggered.append((key, entry, d, state_wr, len(conds)))
+                    # 按状态专项命中率降序，同分时少条件优先
+                    best_entry = None
+                    if _triggered:
+                        _triggered.sort(key=lambda x: (-x[3], x[4]))
+                        _best = _triggered[0]
+                        best_entry = (_best[0], _best[1], _best[2])
+                    if best_entry:
+                        key, info, d = best_entry
+                        in_pos, e_price, e_idx, e_dir = True, cl, cur, d
+                        e_key, e_info = key, info
+                        labels_arr[cur] = 1 if d == 'long' else -1
+                        self.label_found.emit(cur, int(labels_arr[cur]))
+                        tp = cl * (1 + LONG_TP1_PCT)  if d == 'long' else cl * (1 - SHORT_TP1_PCT)
+                        sl = cl * (1 - LONG_SL_PCT)   if d == 'long' else cl * (1 + SHORT_SL_PCT)
+                        # 开仓时立即刷新持仓和交易明细
+                        cur_pos = Position(
+                            side=PositionSide.LONG if d == 'long' else PositionSide.SHORT,
+                            entry_price=e_price, entry_idx=e_idx,
+                            size=capital * PCT * LEVERAGE / e_price,
+                            stop_loss=sl, take_profit=tp, liquidation_price=0.0,
+                            margin=capital * PCT,
+                        )
+                        m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
+                        m["current_bar"] = cur
+                        self.rt_update.emit(m, list(trade_records))
+
+                self.step_completed.emit(cur)
+                cur += 1
+
+                sleep_time = max(0.001, 10.0 / max(1, self.speed))
+                time.sleep(sleep_time)
+
+            precompute_thread.join(timeout=10)
+
+            if self._stop_requested or self._precompute_failed or not prep_initialized:
+                self.is_running = False
+                return
+
+            final_labels = _pd.Series(labels_arr, index=df_work.index)
+            self.labels = final_labels
+
+            # 构建 BacktestResult
+            def _make_bt_result(records, init_cap, final_cap):
+                res = BacktestResult()
+                res.initial_capital  = init_cap
+                res.current_capital  = final_cap
+                res.total_return_pct = (final_cap - init_cap) / init_cap * 100.0
+                res.trades           = records
+                res.total_trades     = len(records)
+                wins   = [r for r in records if r.profit > 0]
+                losses = [r for r in records if r.profit <= 0]
+                res.win_trades  = len(wins)
+                res.loss_trades = len(losses)
+                res.win_rate    = len(wins) / len(records) if records else 0.0
+                res.total_profit    = sum(r.profit for r in records)
+                res.gross_profit    = sum(r.profit for r in wins)
+                res.gross_loss      = abs(sum(r.profit for r in losses))
+                res.avg_win         = res.gross_profit / len(wins)   if wins   else 0.0
+                res.avg_loss        = res.gross_loss   / len(losses) if losses else 0.0
+                res.profit_factor   = res.gross_profit / res.gross_loss if res.gross_loss > 0 else 0.0
+                res.avg_profit_pct  = (sum(r.profit_pct for r in records) / len(records)
+                                       if records else 0.0)
+                res.avg_hold_periods = (sum(r.hold_periods for r in records) / len(records)
+                                        if records else 0.0)
+                long_recs  = [r for r in records if r.side ==  1]
+                short_recs = [r for r in records if r.side == -1]
+                res.long_trades   = len(long_recs)
+                res.short_trades  = len(short_recs)
+                lw = [r for r in long_recs  if r.profit > 0]
+                sw = [r for r in short_recs if r.profit > 0]
+                res.long_win_rate  = len(lw) / len(long_recs)  if long_recs  else 0.0
+                res.short_win_rate = len(sw) / len(short_recs) if short_recs else 0.0
+                res.long_profit    = sum(r.profit for r in long_recs)
+                res.short_profit   = sum(r.profit for r in short_recs)
+                cap2, peak, max_dd = init_cap, init_cap, 0.0
+                for r in records:
+                    cap2 += r.profit
+                    peak = max(peak, cap2)
+                    dd   = (peak - cap2) / peak * 100.0 if peak > 0 else 0.0
+                    if dd > max_dd:
+                        max_dd = dd
+                res.max_drawdown = max_dd
+                return res
+
+            bt_result = _make_bt_result(trade_records, INITIAL_CAP, capital)
+            metrics = {
+                "initial_capital": bt_result.initial_capital,
+                "total_trades":    bt_result.total_trades,
+                "win_rate":        bt_result.win_rate,
+                "total_return":    bt_result.total_return_pct / 100.0,
+                "total_profit":    bt_result.total_profit,
+                "max_drawdown":    bt_result.max_drawdown,
+                "sharpe_ratio":    bt_result.sharpe_ratio,
+                "profit_factor":   bt_result.profit_factor,
+                "long_win_rate":   bt_result.long_win_rate,
+                "long_profit":     bt_result.long_profit,
+                "short_win_rate":  bt_result.short_win_rate,
+                "short_profit":    bt_result.short_profit,
+                "current_pos":     None,
+                "last_trade":      bt_result.trades[-1] if bt_result.trades else None,
+            }
+            self.finished.emit({
+                'bt_result': bt_result,
+                'metrics': metrics,
+                'final_labels': final_labels,
+            })
+
+        except Exception as exc:
+            self.error.emit(str(exc) + "\n" + traceback.format_exc())
+
+        self.is_running = False
+
+    def pause(self):
+        self._pause_requested = True
+
+    def resume(self):
+        self._pause_requested = False
+
+    def stop(self):
+        self._stop_requested  = True
+        self._pause_requested = False
+        self.is_running = False
+
+    def set_speed(self, speed: int):
         self.speed = speed
 
 
@@ -464,6 +920,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 模拟交易相关
         self._live_engine = None
         self._live_running = False
+        self._paper_start_thread = None
+        self._paper_start_worker = None
         self._live_chart_timer = QtCore.QTimer(self)
         refresh_ms = int(PAPER_TRADING_CONFIG.get("REALTIME_UI_REFRESH_MS", 1000))
         self._live_chart_timer.setInterval(max(50, refresh_ms))  # UI刷新频率
@@ -513,15 +971,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_signals()
         self._load_saved_paper_api_config()
 
-        # 自动加载已有记忆（如果配置了）
-        self._auto_load_memory()
-        
-        # 自动加载已有原型库（如果配置了）
-        self._auto_load_prototypes()
-        
-        # 自动加载历史交易记录（程序启动即显示）
-        self._load_paper_trade_history_on_start()
+        # 延迟加载：UI 先显示，再异步加载数据（消除启动白屏）
+        QtCore.QTimer.singleShot(0, self._deferred_startup_load)
     
+    def _deferred_startup_load(self):
+        """窗口显示后再加载数据，消除启动白屏"""
+        self.statusBar().showMessage("正在加载数据...")
+        QtWidgets.QApplication.processEvents()
+
+        self._auto_load_memory()
+        self._auto_load_prototypes()
+        self._load_paper_trade_history_on_start()
+
+        self.statusBar().showMessage("就绪", 3000)
+
     def _init_ui(self):
         """初始化 UI - 深色主题"""
         self.setWindowTitle(UI_CONFIG["WINDOW_TITLE"])
@@ -694,6 +1157,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.main_tabs.addTab(self.signal_analysis_tab, "🔍 信号分析")
         # "换新数据再验证"按钮 → 触发重新加载不同时间段的数据
         self.signal_analysis_tab.request_new_data.connect(self._on_signal_request_new_data)
+        self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
 
         # 连接删除交易记录信号
         self.paper_trading_tab.trade_log.delete_trade_signal.connect(self._on_trade_delete_requested)
@@ -816,10 +1280,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.paper_trading_tab.control_panel.save_api_requested.connect(
             self._on_paper_api_save_requested
         )
-        # 反向下单模式信号连接
-        self.paper_trading_tab.control_panel.reverse_signal_checkbox.stateChanged.connect(
-            self._on_reverse_mode_changed
-        )
         # 清除学习记忆信号
         self.paper_trading_tab.control_panel.clear_memory_requested.connect(
             self._on_clear_learning_memory
@@ -859,6 +1319,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.adaptive_learning_tab.clear_memory_requested.connect(
             self._on_clear_adaptive_learning_requested
         )
+
+    def _on_main_tab_changed(self, index: int):
+        """主标签切换：延迟加载重资源标签，避免启动卡顿。"""
+        widget = self.main_tabs.widget(index) if self.main_tabs else None
+        if widget is self.signal_analysis_tab:
+            self.signal_analysis_tab.ensure_initial_load()
 
     def _infer_source_meta(self) -> tuple:
         """从数据文件名推断来源交易对与时间框架（如 btcusdt_1m.parquet）"""
@@ -988,28 +1454,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.analysis_panel.update_trade_log([])
         self.analysis_panel.fingerprint_widget.clear_plot()
         self.control_panel.set_playing_state(True)
-        self.control_panel.set_status("正在执行上帝视角标注...")
-        self.statusBar().showMessage("正在标注...")
-        
+        self.control_panel.set_status("正在启动实时回测...")
+        self.statusBar().showMessage("正在启动实时回测...")
+
         # 重置图表
         self.chart_widget.set_data(self.df, show_all=False)
-        
-        # 创建标注工作线程
+        speed = self.control_panel.get_speed()
+        self.chart_widget.set_render_stride(speed)
+        self.chart_widget.set_fast_playback(True)
+        self._progress_stride = 1 if speed <= 10 else (2 if speed <= 20 else 3)
+
+        # 创建信号回测工作线程
         self.worker_thread = QtCore.QThread()
-        self.labeling_worker = LabelingWorker(self.df, params)
-        self.labeling_worker.speed = self.control_panel.get_speed()
+        self.labeling_worker = SignalBacktestWorker(self.df)
+        self.labeling_worker.speed = speed
         self.labeling_worker.moveToThread(self.worker_thread)
-        
-        self.worker_thread.started.connect(self.labeling_worker.run_labeling)
-        self.labeling_worker.step_completed.connect(self._on_labeling_step, QtCore.Qt.ConnectionType.QueuedConnection)
-        self.labeling_worker.label_found.connect(self._on_label_found, QtCore.Qt.ConnectionType.QueuedConnection)
+
+        self.worker_thread.started.connect(self.labeling_worker.run_backtest)
+        self.labeling_worker.step_completed.connect(self._on_signal_bt_step,     QtCore.Qt.ConnectionType.QueuedConnection)
+        self.labeling_worker.label_found.connect(self._on_label_found,           QtCore.Qt.ConnectionType.QueuedConnection)
         self.labeling_worker.labeling_progress.connect(self._on_labeling_progress, QtCore.Qt.ConnectionType.QueuedConnection)
-        self.labeling_worker.labels_ready.connect(self._on_labels_ready, QtCore.Qt.ConnectionType.QueuedConnection)
-        self.labeling_worker.finished.connect(self._on_labeling_finished, QtCore.Qt.ConnectionType.QueuedConnection)
-        self.labeling_worker.error.connect(self._on_worker_error, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.labeling_worker.labels_ready.connect(self._on_labels_ready,         QtCore.Qt.ConnectionType.QueuedConnection)
+        self.labeling_worker.rt_update.connect(self._on_signal_bt_rt_update,     QtCore.Qt.ConnectionType.QueuedConnection)
+        self.labeling_worker.finished.connect(self._on_signal_bt_finished,       QtCore.Qt.ConnectionType.QueuedConnection)
+        self.labeling_worker.error.connect(self._on_signal_bt_error,             QtCore.Qt.ConnectionType.QueuedConnection)
         self.labeling_worker.finished.connect(self.worker_thread.quit)
         self.labeling_worker.error.connect(self.worker_thread.quit)
-        
+
         self.worker_thread.start()
 
     def _on_quick_label_requested(self, params: dict):
@@ -1209,7 +1680,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"发现 {label_str} 信号 @ 索引 {idx}")
         
         # 更新图表上的标记
-        if self.df is not None and self.labeling_worker and self.labeling_worker.labels is not None:
+        if self.df is not None and self.labels is not None:
             self.chart_widget.add_signal_at(idx, label_type, self.df)
     
     def _on_labeling_progress(self, msg: str):
@@ -1222,6 +1693,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.labels = labels
         self._labels_ready = True
         self.chart_widget.set_labels(labels)
+
+        if isinstance(self.labeling_worker, SignalBacktestWorker):
+            cur_idx = getattr(self.chart_widget, 'current_display_index', 0)
+            for i in range(min(cur_idx, len(labels))):
+                v = int(labels.iloc[i])
+                if v != 0:
+                    self.chart_widget.add_signal_at(i, v, self.df)
+            return
 
         # 创建市场状态分类器
         if self.labeling_worker and self.labeling_worker.labeler:
@@ -1249,6 +1728,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     print("[TrajectoryMemory] 轨迹记忆体就绪（实时积累模式）")
             except Exception as e:
                 print(f"[TrajectoryMemory] 初始化失败: {e}")
+
+        # 补发：动画已经过了但 labels 那时还没 ready 的标记
+        if self.df is not None and isinstance(self.labeling_worker, SignalBacktestWorker):
+            cur_idx = getattr(self.chart_widget, 'current_display_index', 0)
+            for i in range(min(cur_idx, len(labels))):
+                v = int(labels.iloc[i])
+                if v != 0:
+                    self.chart_widget.add_signal_at(i, v, self.df)
+            return
 
         # 启动回测追赶（避免主线程卡顿）
         if self.df is not None:
@@ -1315,8 +1803,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_memory_stats()
             print(f"[TrajectoryMemory] 追赶阶段提取: {templates_added} 个模板")
 
-    def _format_trades(self, trades):
-        """格式化交易明细（仅展示最近200条）"""
+    def _format_trades(self, trades, current_pos=None, current_bar=0):
+        """格式化交易明细（仅展示最近200条），可选附加当前持仓行"""
         if self.df is None:
             return []
 
@@ -1338,15 +1826,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 return str(idx)
 
         rows = []
+        # 当前持仓行（若有）
+        if current_pos is not None:
+            side_val = getattr(current_pos, 'side', 0)
+            side = "LONG" if side_val == 1 else "SHORT"
+            entry_idx = getattr(current_pos, 'entry_idx', 0)
+            entry_price = getattr(current_pos, 'entry_price', 0.0)
+            hold_bars = max(0, current_bar - entry_idx)
+            rows.append({
+                "side": side,
+                "entry_time": fmt_time(entry_idx),
+                "entry_price": f"{entry_price:.2f}",
+                "exit_time": "持仓中",
+                "exit_price": "--",
+                "profit": "--",
+                "profit_pct": "--",
+                "hold": f"已持{hold_bars}根",
+                "regime": "",
+                "fingerprint": "--",
+            })
         for t in trades[-200:]:
             side = "LONG" if t.side == 1 else "SHORT"
-            # 指纹摘要：模板ID + 相似度
-            template_idx = getattr(t, 'matched_template_idx', None)
-            entry_sim = getattr(t, 'entry_similarity', None)
-            if template_idx is not None and entry_sim is not None:
-                fingerprint = f"T#{template_idx} | Sim={entry_sim:.2f}"
+            signal_key = getattr(t, 'signal_key', '') or ''
+            signal_rate = getattr(t, 'signal_rate', 0.0)
+            signal_score = getattr(t, 'signal_score', 0.0)
+            if signal_key:
+                fingerprint = f"#{signal_key[:8]} 率{signal_rate:.0%} 分{signal_score:.0f}"
             else:
-                fingerprint = "--"
+                # 指纹摘要：模板ID + 相似度
+                template_idx = getattr(t, 'matched_template_idx', None)
+                entry_sim = getattr(t, 'entry_similarity', None)
+                if template_idx is not None and entry_sim is not None:
+                    fingerprint = f"T#{template_idx} | Sim={entry_sim:.2f}"
+                else:
+                    fingerprint = "--"
             rows.append({
                 "side": side,
                 "entry_time": fmt_time(t.entry_idx),
@@ -2384,26 +2897,22 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "保存失败", f"保存权重失败:\n{e}")
 
-    def _inject_evolved_weights_to_engine(self):
+    def _gather_evolved_weights(self) -> dict:
         """
-        将进化权重挂载到即将启动的 LiveTradingEngine。
+        收集进化权重（不依赖 engine 实例）。
         优先级: 原型库自带 → 内存 _evo_result_long/_short → 磁盘 long/short 文件。
+        返回 dict（key = engine 属性名）；若无可用权重返回空 dict。
         """
-        if self._live_engine is None:
-            return
-
         long_w, long_f, long_c, long_e, long_d = None, None, None, None, None
         short_w, short_f, short_c, short_e, short_d = None, None, None, None, None
         source = ""
 
-        # 优先：当前原型库自带的进化结果（多空两套）
         if self._prototype_library is not None:
             (lw, lf, lc, le, ld), (sw, sf, sc, se, sd) = self._prototype_library.get_evolved_params()
             if lw is not None:
                 long_w, long_f, long_c, long_e, long_d = lw, lf, lc, le, ld
                 short_w, short_f, short_c, short_e, short_d = sw, sf, sc, se, sd
                 source = "当前聚合指纹图（原型库）"
-        # 其次：内存中的进化结果
         if long_w is None and self._evo_result_long and self._evo_result_long.success and self._evo_result_long.full_weights is not None:
             long_w = self._evo_result_long.full_weights
             long_f = self._evo_result_long.fusion_threshold
@@ -2427,7 +2936,6 @@ class MainWindow(QtWidgets.QMainWindow):
             long_d = getattr(self._evo_result, "dtw_min_threshold", 0.40)
             short_w, short_f, short_c, short_e, short_d = long_w, long_f, long_c, long_e, long_d
             source = "本次进化结果"
-        # 再次：从磁盘 long/short 文件加载
         if long_w is None:
             try:
                 from config import WF_EVOLUTION_CONFIG
@@ -2469,22 +2977,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 print(f"[WF-Evo] 加载已保存权重失败: {e}")
 
         if long_w is None:
-            return
+            return {}
 
-        try:
-            self._live_engine._pending_evolved_weights_long = long_w
-            self._live_engine._pending_evolved_weights_short = short_w if (short_w is not None and (short_w is not long_w or id(short_w) != id(long_w))) else None
-            self._live_engine._pending_evolved_fusion_th = long_f
-            self._live_engine._pending_evolved_cosine_th = long_c
-            self._live_engine._pending_evolved_euclidean_th_long = long_e
-            self._live_engine._pending_evolved_euclidean_th_short = short_e
-            self._live_engine._pending_evolved_dtw_th_long = long_d
-            self._live_engine._pending_evolved_dtw_th_short = short_d
-            # 兼容旧逻辑：单组时也写 _pending_evolved_weights
-            self._live_engine._pending_evolved_weights = long_w
-            print(f"[WF-Evo] 进化权重已挂载到引擎 (来源: {source}, 多空分开={bool(self._live_engine._pending_evolved_weights_short)})")
-        except Exception as e:
-            print(f"[WF-Evo] 挂载权重到引擎失败: {e}")
+        effective_short_w = short_w if (short_w is not None and short_w is not long_w) else None
+        result = {
+            "_pending_evolved_weights_long": long_w,
+            "_pending_evolved_weights_short": effective_short_w,
+            "_pending_evolved_fusion_th": long_f,
+            "_pending_evolved_cosine_th": long_c,
+            "_pending_evolved_euclidean_th_long": long_e,
+            "_pending_evolved_euclidean_th_short": short_e,
+            "_pending_evolved_dtw_th_long": long_d,
+            "_pending_evolved_dtw_th_short": short_d,
+            "_pending_evolved_weights": long_w,
+        }
+        print(f"[WF-Evo] 进化权重已收集 (来源: {source}, 多空分开={effective_short_w is not None})")
+        return result
+
+    def _inject_evolved_weights_to_engine(self):
+        """将进化权重挂载到已创建的 LiveTradingEngine。"""
+        if self._live_engine is None:
+            return
+        weights = self._gather_evolved_weights()
+        for attr_name, val in weights.items():
+            setattr(self._live_engine, attr_name, val)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 记忆持久化管理
@@ -2966,6 +3482,76 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control_panel.set_playing_state(False)
         self.labeling_worker = None
     
+    def _on_signal_bt_step(self, target_idx: int):
+        """信号回测专用步进：一次推进到 target_idx，只触发1次图表渲染"""
+        try:
+            self.chart_widget.advance_to(target_idx)
+            total = len(self.df) if self.df is not None else 0
+            progress_stride = getattr(self, "_progress_stride", 1)
+            if target_idx % progress_stride == 0 or target_idx >= total - 1:
+                self.control_panel.update_play_progress(target_idx + 1, total)
+        except Exception as e:
+            if self.labeling_worker:
+                self.labeling_worker.stop()
+            self.is_playing = False
+            self.control_panel.set_playing_state(False)
+
+    def _on_signal_bt_rt_update(self, metrics: dict, trades: list):
+        """信号回测实时指标刷新"""
+        self.optimizer_panel.update_backtest_metrics(metrics)
+        current_pos = metrics.get("current_pos")
+        current_bar = metrics.get("current_bar", 0)
+        self.analysis_panel.update_trade_log(self._format_trades(trades, current_pos=current_pos, current_bar=current_bar))
+
+    def _on_signal_bt_finished(self, result: dict):
+        """信号回测完成"""
+        bt_result = result["bt_result"]
+        metrics   = result["metrics"]
+        final_labels = result.get("final_labels") or self.labels
+
+        # 显示全部数据和标注
+        self.labels = final_labels
+        self.chart_widget.set_data(self.df, final_labels, show_all=True)
+
+        # 更新指标面板
+        self.optimizer_panel.update_backtest_metrics(metrics)
+
+        # 更新交易明细
+        self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
+
+        self.is_playing = False
+        self.control_panel.set_playing_state(False)
+        self.labeling_worker = None
+        if self.chart_widget:
+            self.chart_widget.set_fast_playback(False)
+
+        long_n  = bt_result.long_trades
+        short_n = bt_result.short_trades
+        status = (
+            f"信号回测完成: {bt_result.total_trades}笔"
+            f"(多{long_n}/空{short_n}) | "
+            f"胜率{bt_result.win_rate:.1%} | "
+            f"收益{bt_result.total_return_pct:.2f}%"
+        )
+        self.control_panel.set_status(status)
+        self.statusBar().showMessage(status)
+
+        QtWidgets.QMessageBox.information(
+            self, "信号回测结果",
+            f"总交易: {bt_result.total_trades} 笔\n"
+            f"胜率: {bt_result.win_rate:.1%}\n"
+            f"总收益: {bt_result.total_return_pct:.2f}%\n"
+            f"最大回撤: {bt_result.max_drawdown:.2f}%\n"
+            f"做多: {long_n}笔  做空: {short_n}笔",
+        )
+
+    def _on_signal_bt_error(self, error_msg: str):
+        """信号回测出错"""
+        self.is_playing = False
+        self.control_panel.set_playing_state(False)
+        self.labeling_worker = None
+        self._on_worker_error(error_msg)
+
     def _on_pause_requested(self):
         """暂停请求"""
         if self.labeling_worker:
@@ -2974,16 +3560,31 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _on_stop_requested(self):
         """停止请求"""
-        if self.labeling_worker:
-            self.labeling_worker.stop()
-        
+        try:
+            if self.labeling_worker:
+                self.labeling_worker.stop()
+            # 通知工作线程退出事件循环，避免 QThread 残留导致崩溃
+            if self.worker_thread and self.worker_thread.isRunning():
+                self.worker_thread.quit()
+                self.worker_thread.wait(15000)  # 预计算可能需10s，留足余量
+        except Exception as e:
+            print(f"[MainWindow] 停止回测时异常: {e}")
+            import traceback
+            traceback.print_exc()
+
         self.is_playing = False
         self.control_panel.set_playing_state(False)
-        
-        # 显示已有的标注
-        if self.labels is not None:
-            self.chart_widget.set_data(self.df, self.labels, show_all=True)
-        
+        if self.chart_widget:
+            self.chart_widget.set_fast_playback(False)
+
+        try:
+            # 显示已有的标注
+            if self.df is not None and self.labels is not None:
+                self.chart_widget.set_data(self.df, self.labels, show_all=True)
+        except Exception as e:
+            print(f"[MainWindow] 停止后刷新图表异常: {e}")
+
+        self.labeling_worker = None
         self.statusBar().showMessage("已停止")
     
     def _on_speed_changed(self, speed: int):
@@ -2992,6 +3593,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.labeling_worker.set_speed(speed)
         if self.chart_widget:
             self.chart_widget.set_render_stride(speed)
+        self._progress_stride = 1 if speed <= 10 else (2 if speed <= 20 else 3)
     
     def _on_analyze_requested(self):
         """处理分析请求"""
@@ -3130,19 +3732,68 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             print(f"[MainWindow] 加载API配置失败: {e}")
     
+    def _start_trade_history_io_worker(self, action: str, order=None,
+                                       on_loaded=None, on_deleted=None, on_failed=None):
+        """启动历史交易文件 IO 的后台线程"""
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        history_file = os.path.join(project_root, "data", "live_trade_history.json")
+
+        thread = QtCore.QThread(self)
+        worker = TradeHistoryIOWorker(history_file, action, order)
+        worker.moveToThread(thread)
+
+        if on_loaded:
+            worker.loaded.connect(on_loaded)
+        if on_deleted:
+            worker.deleted.connect(on_deleted)
+        if on_failed:
+            worker.failed.connect(on_failed)
+        else:
+            worker.failed.connect(lambda msg: self._on_trade_history_io_failed(action, msg))
+
+        worker.loaded.connect(thread.quit)
+        worker.deleted.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        if not hasattr(self, "_history_io_threads"):
+            self._history_io_threads = []
+        self._history_io_threads.append(thread)
+
+        def _cleanup():
+            try:
+                self._history_io_threads.remove(thread)
+            except ValueError:
+                pass
+        thread.finished.connect(_cleanup)
+
+        thread.started.connect(worker.run)
+        thread.start()
+
+    def _on_trade_history_io_failed(self, action: str, error_msg: str):
+        """历史交易文件 IO 失败提示"""
+        self.statusBar().showMessage("历史交易处理失败", 5000)
+        QtWidgets.QMessageBox.warning(
+            self,
+            "历史交易处理失败",
+            f"{action} 操作失败:\n{error_msg}"
+        )
+    
     def _load_paper_trade_history_on_start(self):
-        """程序启动时从本地文件加载历史交易记录并显示（仅显示最近10笔）"""
-        try:
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            history_file = os.path.join(project_root, "data", "live_trade_history.json")
-            history = load_trade_history_from_file(history_file)
-            if history:
-                # 仅显示最近10笔，减少UI渲染负担
-                display_count = min(10, len(history))
-                self.paper_trading_tab.load_historical_trades(history[-10:])
-                self.statusBar().showMessage(f"已加载历史交易记录: 显示{display_count}笔 / 共{len(history)}笔", 3000)
-        except Exception as e:
-            print(f"[MainWindow] 加载历史交易记录失败: {e}")
+        """程序启动时从本地文件加载历史交易记录并显示（后台 IO）"""
+        display_limit = PaperTradingTradeLog.MAX_DISPLAY_TRADES
+
+        def _apply_history(history):
+            if not history:
+                return
+            display_count = min(display_limit, len(history))
+            self.paper_trading_tab.load_historical_trades(history[-display_count:])
+            self.statusBar().showMessage(
+                f"已加载历史交易记录: 显示{display_count}笔 / 共{len(history)}笔", 3000
+            )
+
+        self._start_trade_history_io_worker("load", on_loaded=_apply_history)
     
     def _on_paper_api_save_requested(self, cfg: dict):
         """保存模拟交易API配置"""
@@ -3164,26 +3815,6 @@ class MainWindow(QtWidgets.QMainWindow):
             msg = f"保存API配置失败: {e}"
             self.paper_trading_tab.control_panel.update_connection_status(False, msg)
             self.statusBar().showMessage(msg, 5000)
-    
-    def _on_reverse_mode_changed(self, state):
-        """反向下单模式切换"""
-        from PyQt6 import QtCore
-        enabled = (state == QtCore.Qt.CheckState.Checked.value)
-        
-        # 更新引擎（如果运行中）
-        if self._live_engine:
-            self._live_engine._reverse_signal_mode = enabled
-        
-        # 日志
-        mode_text = "启用" if enabled else "关闭"
-        self.paper_trading_tab.status_panel.append_event(
-            f"[系统] 反向下单模式: {mode_text}"
-        )
-        
-        if enabled:
-            self.statusBar().showMessage("⚠️ 反向下单模式已启用！所有信号将反向操作", 5000)
-        else:
-            self.statusBar().showMessage("反向下单模式已关闭", 3000)
     
     def _clear_adaptive_learning_files_impl(self):
         """实际执行：删除学习状态文件并重置引擎状态。返回删除的文件数。"""
@@ -3284,6 +3915,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_paper_trading_start(self, config: dict):
         """启动模拟交易"""
         if self._live_running:
+            return
+        if self._paper_start_thread and self._paper_start_thread.isRunning():
             return
 
         # 真实测试网执行模式：必须提供API凭证
@@ -3391,23 +4024,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 template_count, mode="template"
             )
         
-        # 创建交易引擎
-        from core.live_trading_engine import LiveTradingEngine
-        
+        # ── 禁用按钮，显示加载状态 ──
+        self.paper_trading_tab.control_panel.start_btn.setEnabled(False)
+        self.paper_trading_tab.control_panel.run_status_label.setText("连接中...")
+        self.paper_trading_tab.control_panel.run_status_label.setStyleSheet(
+            "color: #FFA500; font-weight: bold;")
+        self.statusBar().showMessage("正在连接交易所，请稍候...")
+
+        # ── 准备在后台线程中需要的参数（全部在主线程取好） ──
+        http_proxy, socks_proxy = self._get_proxy_settings()
+        effective_leverage = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
+
         try:
-            # 获取代理设置
-            http_proxy, socks_proxy = self._get_proxy_settings()
-            
-            # 杠杆固定 20x（不再从学习记忆恢复历史杠杆）
-            effective_leverage = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
-            
-            self._live_engine = LiveTradingEngine(
-                trajectory_memory=self.trajectory_memory,
-                prototype_library=self._prototype_library if has_prototypes else None,
+            desired_cold_start = self.adaptive_learning_tab.is_cold_start_enabled()
+        except Exception:
+            desired_cold_start = False
+
+        evolved_weights = self._gather_evolved_weights()
+
+        trajectory_memory = self.trajectory_memory
+        prototype_library = self._prototype_library if has_prototypes else None
+        adaptive_controller = self._adaptive_controller
+
+        def _build_engine(emit_progress):
+            """在后台线程运行：创建引擎 + start()"""
+            from core.live_trading_engine import LiveTradingEngine
+
+            emit_progress("正在初始化交易引擎...")
+            engine = LiveTradingEngine(
+                trajectory_memory=trajectory_memory,
+                prototype_library=prototype_library,
                 symbol=config["symbol"],
                 interval=config["interval"],
                 initial_balance=config["initial_balance"],
-                adaptive_controller=self._adaptive_controller,  # NEW: 传入自适应控制器
+                adaptive_controller=adaptive_controller,
                 leverage=effective_leverage,
                 use_qualified_only=(config.get("use_qualified_only", True) and (not has_prototypes)),
                 qualified_fingerprints=qualified_fingerprints,
@@ -3425,76 +4075,99 @@ class MainWindow(QtWidgets.QMainWindow):
                 on_trade_closed=self._on_live_trade_closed,
                 on_error=self._handle_live_error,
             )
-            
-            # 冷启动开关：在引擎启动前应用当前UI状态，确保阈值正确
-            try:
-                desired_cold_start = self.adaptive_learning_tab.is_cold_start_enabled()
-                self._live_engine.set_cold_start_enabled(desired_cold_start)
-            except Exception as e:
-                print(f"[MainWindow] 冷启动状态应用失败: {e}")
 
-            # ── 初始化 DeepSeek 复盘分析器（为本次交易会话创建新实例） ──
-            # DeepSeek 功能已禁用（按需求移除轮询/后台任务）
-            self._deepseek_reviewer = None
-            if hasattr(self._live_engine, "_deepseek_reviewer"):
-                self._live_engine._deepseek_reviewer = None
-            
-            # ── 注入进化后的特征权重（如果有） ──
-            self._inject_evolved_weights_to_engine()
-            
-            success = self._live_engine.start()
-            if success:
-                self._live_running = True
-                self.paper_trading_tab.control_panel.set_running(True)
-                using_evolved = getattr(self._live_engine, "_using_evolved_weights", False)
-                self.paper_trading_tab.control_panel.update_weight_mode(using_evolved)
-                # 优先从文件恢复历史记录（避免 trader._load_history 异常或路径问题导致丢失）
-                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                history_file = os.path.join(project_root, "data", "live_trade_history.json")
-                history = load_trade_history_from_file(history_file)
-                if not history:
-                    history = getattr(self._live_engine.paper_trader, "order_history", None) or []
-                if history:
-                    self._live_engine.paper_trader.order_history = list(history)
-                self.paper_trading_tab.reset()
-                if history:
-                    # 仅显示最近10笔，减少UI负担
-                    display_count = min(10, len(history))
-                    self.paper_trading_tab.load_historical_trades(history[-10:])
-                    self.paper_trading_tab.status_panel.append_event(f"成功恢复历史交易记录: 显示{display_count}笔 / 共{len(history)}笔")
-                
-                self._live_chart_dirty = True
-                self._last_live_chart_refresh_ts = 0.0
-                self._last_live_state_ui_ts = 0.0
-                self._last_live_state_bar_count = -1
-                self._last_live_state_order_id = None
-                self._last_ui_state_event = ""
-                self._live_chart_timer.start()
-                self._adaptive_dashboard_timer.start()
-                # DeepSeek 功能已禁用（不启动轮询/定时器）
-                
-                # 初始化冷启动面板状态
-                self._init_cold_start_panel_from_engine()
-                
-                if getattr(self._live_engine, "use_signal_mode", False):
-                    self.statusBar().showMessage(
-                        f"模拟交易已启动: {config['symbol']} | 精品+高频信号模式（精品优先）"
-                    )
-                elif has_prototypes:
-                    mode_msg = f"聚合指纹图模式({ '已验证原型' if use_verified_protos else '全原型' })"
-                    self.statusBar().showMessage(f"模拟交易已启动: {config['symbol']} | {mode_msg}")
-                else:
-                    self.statusBar().showMessage(f"模拟交易已启动: {config['symbol']} | 模板模式")
-            else:
-                QtWidgets.QMessageBox.warning(self, "启动失败", "无法启动模拟交易，请检查网络连接。")
-                
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "错误", f"启动模拟交易失败:\n{str(e)}")
-            import traceback
-            traceback.print_exc()
+            engine.set_cold_start_enabled(desired_cold_start)
+            engine._deepseek_reviewer = None
+
+            for attr_name, val in evolved_weights.items():
+                setattr(engine, attr_name, val)
+
+            emit_progress("正在连接交易所...")
+            ok = engine.start()
+            return engine, ok
+
+        # ── 后台线程启动 ──
+        self._paper_start_thread = QtCore.QThread(self)
+        worker = PaperTradingStartWorker(_build_engine)
+        worker.moveToThread(self._paper_start_thread)
+        self._paper_start_worker = worker
+
+        worker.progress.connect(
+            lambda msg: self.statusBar().showMessage(msg))
+        worker.succeeded.connect(
+            lambda engine: self._on_paper_engine_ready(engine, config, has_prototypes, use_verified_protos))
+        worker.failed.connect(self._on_paper_engine_failed)
+        self._paper_start_thread.started.connect(worker.run)
+        worker.succeeded.connect(self._paper_start_thread.quit)
+        worker.failed.connect(self._paper_start_thread.quit)
+        self._paper_start_thread.start()
+
+    # ── 后台线程回调 ──────────────────────────────────────────────
+    def _on_paper_engine_ready(self, engine, config, has_prototypes, use_verified_protos):
+        """LiveTradingEngine 在后台创建+start 成功，回到主线程更新 UI"""
+        self._live_engine = engine
+        self._live_running = True
+        self.paper_trading_tab.control_panel.set_running(True)
+        using_evolved = getattr(engine, "_using_evolved_weights", False)
+        self.paper_trading_tab.control_panel.update_weight_mode(using_evolved)
+
+        self._deepseek_reviewer = None
+        if hasattr(engine, "_deepseek_reviewer"):
+            engine._deepseek_reviewer = None
+
+        self.paper_trading_tab.reset()
+        display_limit = PaperTradingTradeLog.MAX_DISPLAY_TRADES
+
+        def _apply_history(history):
+            final_history = history or []
+            if not final_history:
+                final_history = getattr(engine.paper_trader, "order_history", None) or []
+            if final_history:
+                engine.paper_trader.order_history = list(final_history)
+                display_count = min(display_limit, len(final_history))
+                self.paper_trading_tab.load_historical_trades(final_history[-display_count:])
+                self.paper_trading_tab.status_panel.append_event(
+                    f"成功恢复历史交易记录: 显示{display_count}笔 / 共{len(final_history)}笔"
+                )
+
+        self._start_trade_history_io_worker("load", on_loaded=_apply_history)
+
+        self._live_chart_dirty = True
+        self._last_live_chart_refresh_ts = 0.0
+        self._last_live_state_ui_ts = 0.0
+        self._last_live_state_bar_count = -1
+        self._last_live_state_order_id = None
+        self._last_ui_state_event = ""
+        self._live_chart_timer.start()
+        self._adaptive_dashboard_timer.start()
+
+        self._init_cold_start_panel_from_engine()
+
+        if getattr(engine, "use_signal_mode", False):
+            self.statusBar().showMessage(
+                f"模拟交易已启动: {config['symbol']} | 精品+高频信号模式（精品优先）")
+        elif has_prototypes:
+            mode_msg = f"聚合指纹图模式({'已验证原型' if use_verified_protos else '全原型'})"
+            self.statusBar().showMessage(
+                f"模拟交易已启动: {config['symbol']} | {mode_msg}")
+        else:
+            self.statusBar().showMessage(
+                f"模拟交易已启动: {config['symbol']} | 模板模式")
+
+    def _on_paper_engine_failed(self, error_msg: str):
+        """后台启动失败"""
+        self.paper_trading_tab.control_panel.start_btn.setEnabled(True)
+        self.paper_trading_tab.control_panel.run_status_label.setText("已停止")
+        self.paper_trading_tab.control_panel.run_status_label.setStyleSheet("color: #888;")
+        self.statusBar().showMessage("模拟交易启动失败")
+        QtWidgets.QMessageBox.critical(
+            self, "启动失败", f"模拟交易启动失败:\n{error_msg}")
     
     def _on_paper_trading_stop(self):
         """停止模拟交易"""
+        if self._paper_start_thread and self._paper_start_thread.isRunning():
+            self._paper_start_thread.quit()
+            self._paper_start_thread.wait(3000)
         if self._live_engine:
             # 停止前保存当前交易记录到文件，避免重启后丢失
             trader = getattr(self._live_engine, "paper_trader", None)
@@ -3538,6 +4211,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         """窗口关闭时兜底保存交易记录，避免重启丢失"""
+        if self._paper_start_thread and self._paper_start_thread.isRunning():
+            self._paper_start_thread.quit()
+            self._paper_start_thread.wait(3000)
+        # 停止回测工作线程，避免 QThread 残留导致崩溃
+        if getattr(self, "labeling_worker", None):
+            self.labeling_worker.stop()
+        if getattr(self, "worker_thread", None) and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            self.worker_thread.wait(3000)
         try:
             if self._live_engine:
                 trader = getattr(self._live_engine, "paper_trader", None)
@@ -3611,24 +4293,27 @@ class MainWindow(QtWidgets.QMainWindow):
                         o for o in trader.order_history
                         if not self._is_same_order(o, order)
                     ]
-            
-            # 更新持久化文件
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            history_file = os.path.join(project_root, "data", "live_trade_history.json")
-            
-            # 读取现有历史
-            existing_history = load_trade_history_from_file(history_file)
-            
-            # 过滤掉要删除的记录
-            filtered_history = [
-                o for o in existing_history
-                if not self._is_same_order(o, order)
-            ]
-            
-            # 保存回文件
-            save_trade_history_to_file(filtered_history, history_file)
-            
-            self.statusBar().showMessage("交易记录已删除", 3000)
+
+            def _on_deleted(removed_count: int, remaining_count: int):
+                if removed_count > 0:
+                    self.statusBar().showMessage("交易记录已删除", 3000)
+                else:
+                    self.statusBar().showMessage("未找到匹配交易记录", 3000)
+
+            def _on_failed(msg: str):
+                self.statusBar().showMessage("删除交易记录失败", 5000)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "删除失败",
+                    f"删除交易记录时发生错误:\n{msg}"
+                )
+
+            self._start_trade_history_io_worker(
+                "delete",
+                order=order,
+                on_deleted=_on_deleted,
+                on_failed=_on_failed
+            )
             
         except Exception as e:
             import traceback

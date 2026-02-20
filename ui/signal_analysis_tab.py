@@ -99,11 +99,37 @@ class SignalAnalysisWorker(QtCore.QObject):
                     signal_store.merge_round(long_res,  direction='long',  bar_count=len(self._df))
                 if short_res:
                     signal_store.merge_round(short_res, direction='short', bar_count=len(self._df))
+                # 两次 merge 都完成后，执行一次去重并更新缓存（O(n²)，只跑一次）
+                signal_store.rebuild_pruned_cache()
 
             if not self._stop:
                 self.progress.emit(100, f"分析完成，共 {len(all_results)} 个有效组合")
                 self.finished.emit(all_results)
 
+        except Exception as e:
+            self.error.emit(str(e) + "\n" + traceback.format_exc())
+
+
+class _InitialLoadWorker(QtCore.QObject):
+    """
+    后台线程：首次激活 Tab 时一次性加载所有初始数据，预热 signal_store 内存缓存。
+    完成后主线程直接调用各 _refresh_* 方法（命中缓存，几乎无 IO）。
+    """
+    finished = QtCore.pyqtSignal(dict)
+    error    = QtCore.pyqtSignal(str)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            from core import signal_store
+            # 一次调用同时拿到 items 和 cumulative，消除重复 get_cumulative() 调用
+            combos, cumulative = signal_store.get_cumulative_results(top_n=200)
+            rounds = signal_store.get_rounds()
+            self.finished.emit({
+                'combos':     combos,
+                'cumulative': cumulative,
+                'rounds':     rounds,
+            })
         except Exception as e:
             self.error.emit(str(e) + "\n" + traceback.format_exc())
 
@@ -118,6 +144,19 @@ def _tier_color(tier: str) -> str:
         "优质": TIER_GOOD,
         "候选": TIER_CAND,
     }.get(tier, TEXT_DIM)
+
+
+def _tier_from_rate(rate: float, direction: str) -> str:
+    """根据综合命中率和方向返回层级（与 signal_analyzer 门槛一致）"""
+    if direction == 'long':
+        if rate >= 0.71: return '精品'
+        if rate >= 0.67: return '优质'
+        if rate >= 0.64: return '候选'
+    else:
+        if rate >= 0.59: return '精品'
+        if rate >= 0.55: return '优质'
+        if rate >= 0.52: return '候选'
+    return ''
 
 
 def _rate_color(rate: float, direction: str = 'long') -> str:
@@ -179,73 +218,6 @@ def _make_table(headers: List[str]) -> QtWidgets.QTableWidget:
     tbl.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
     tbl.setSortingEnabled(True)
     return tbl
-
-
-def _make_tree_widget(headers: List[str]) -> QtWidgets.QTreeWidget:
-    """创建带样式的 QTreeWidget（用于折叠式精品推荐表）"""
-    tree = QtWidgets.QTreeWidget()
-    tree.setHeaderLabels(headers)
-    tree.setAlternatingRowColors(True)
-    tree.setRootIsDecorated(True)
-    tree.setIndentation(20)
-    tree.setAnimated(True)
-    tree.setExpandsOnDoubleClick(True)
-    tree.setStyleSheet(f"""
-        QTreeWidget {{
-            background-color: {BG_CARD};
-            alternate-background-color: {BG_PANEL};
-            color: {TEXT_PRIMARY};
-            border: 1px solid {BORDER_COLOR};
-            font-size: 12px;
-            outline: none;
-        }}
-        QTreeWidget::item {{
-            padding: 4px 6px;
-            border: none;
-        }}
-        QTreeWidget::item:selected {{
-            background-color: #2A3A4A;
-            color: {TEXT_PRIMARY};
-        }}
-        QTreeWidget::item:hover {{
-            background-color: #2E3640;
-        }}
-        QTreeWidget::branch {{
-            background-color: transparent;
-        }}
-        QTreeWidget::branch:has-siblings:!adjoins-item {{
-            border-image: none;
-        }}
-        QTreeWidget::branch:has-siblings:adjoins-item {{
-            border-image: none;
-        }}
-        QTreeWidget::branch:!has-children:!has-siblings:adjoins-item {{
-            border-image: none;
-        }}
-        QTreeWidget::branch:has-children:!has-siblings:closed,
-        QTreeWidget::branch:closed:has-children:has-siblings {{
-            image: none;
-            border-image: none;
-        }}
-        QTreeWidget::branch:open:has-children:!has-siblings,
-        QTreeWidget::branch:open:has-children:has-siblings {{
-            image: none;
-            border-image: none;
-        }}
-        QHeaderView::section {{
-            background-color: {BG_PANEL};
-            color: {TEXT_DIM};
-            padding: 4px 8px;
-            border: none;
-            border-bottom: 1px solid {BORDER_COLOR};
-            font-size: 11px;
-            font-weight: bold;
-        }}
-    """)
-    header = tree.header()
-    header.setStretchLastSection(True)
-    header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-    return tree
 
 
 class _SortableItem(QtWidgets.QTableWidgetItem):
@@ -417,11 +389,11 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._df = None
         self._worker: Optional[SignalAnalysisWorker] = None
         self._thread: Optional[QtCore.QThread] = None
+        self._init_worker: Optional[_InitialLoadWorker] = None
+        self._init_thread: Optional[QtCore.QThread] = None
         self._running = False
         self._risk_state = _load_risk_state()
         self._auto_run_on_next_data = False   # 新数据到达后自动开始分析
-        self._family_sort_col = None
-        self._family_sort_desc = True
 
         self._setup_ui()
         self._apply_style()
@@ -463,11 +435,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._on_stop)
 
-        self._btn_family = QtWidgets.QPushButton("🧩  族群汇总")
-        self._btn_family.setFixedHeight(34)
-        self._btn_family.setToolTip("按指标族群聚合（忽略阈值差异）")
-        self._btn_family.clicked.connect(self._on_family_summary)
-
         info_lbl = QtWidgets.QLabel(
             "分析策略：9指标×2阈值=18条件/方向 | 2-5条件组合 | 含手续费门槛 64/67/71%"
         )
@@ -477,7 +444,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         btn_row.addWidget(self._btn_new_data)
         btn_row.addWidget(self._btn_auto_50)
         btn_row.addWidget(self._btn_stop)
-        btn_row.addWidget(self._btn_family)
         btn_row.addStretch()
         btn_row.addWidget(info_lbl)
         btn_row.addStretch()
@@ -582,8 +548,112 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         right_layout = QtWidgets.QVBoxLayout(right_box)
         right_layout.setContentsMargins(6, 6, 6, 6)
 
+        # 筛选控件 + 总数统计 + 导出按钮
+        cumul_count_row = QtWidgets.QHBoxLayout()
+        cumul_count_row.setSpacing(8)
+        
+        self._btn_export_cumul = QtWidgets.QPushButton("📄 导出TXT")
+        self._btn_export_cumul.setFixedHeight(26)
+        self._btn_export_cumul.setFixedWidth(100)
+        self._btn_export_cumul.setToolTip("导出累计结果为TXT文件")
+        self._btn_export_cumul.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {BG_CARD};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 3px;
+                font-size: 11px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                background-color: {ACCENT_CYAN};
+                color: {BG_DARK};
+                border-color: {ACCENT_CYAN};
+            }}
+        """)
+        self._btn_export_cumul.clicked.connect(self._export_cumulative_txt)
+        cumul_count_row.addWidget(self._btn_export_cumul)
+        
+        # 方向筛选
+        lbl_dir = QtWidgets.QLabel("方向:")
+        lbl_dir.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        cumul_count_row.addWidget(lbl_dir)
+        
+        self._cmb_direction = QtWidgets.QComboBox()
+        self._cmb_direction.addItems(["全部", "做多", "做空"])
+        self._cmb_direction.setFixedWidth(80)
+        self._cmb_direction.setFixedHeight(24)
+        self._cmb_direction.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {BG_CARD};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 3px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }}
+            QComboBox:hover {{
+                border-color: {ACCENT_CYAN};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {BG_CARD};
+                color: {TEXT_PRIMARY};
+                selection-background-color: {ACCENT_CYAN};
+                selection-color: {BG_DARK};
+                border: 1px solid {BORDER_COLOR};
+            }}
+        """)
+        self._cmb_direction.currentIndexChanged.connect(self._on_filter_changed)
+        cumul_count_row.addWidget(self._cmb_direction)
+        
+        cumul_count_row.addSpacing(12)
+        
+        # 最少轮次筛选
+        lbl_rounds = QtWidgets.QLabel("最少轮次:")
+        lbl_rounds.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        cumul_count_row.addWidget(lbl_rounds)
+        
+        self._spn_min_rounds = QtWidgets.QSpinBox()
+        self._spn_min_rounds.setRange(1, 50)
+        self._spn_min_rounds.setValue(3)
+        self._spn_min_rounds.setFixedWidth(60)
+        self._spn_min_rounds.setFixedHeight(24)
+        self._spn_min_rounds.setStyleSheet(f"""
+            QSpinBox {{
+                background-color: {BG_CARD};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 3px;
+                padding: 2px 6px;
+                font-size: 11px;
+            }}
+            QSpinBox:hover {{
+                border-color: {ACCENT_CYAN};
+            }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                background-color: {BG_PANEL};
+                border: none;
+                width: 16px;
+            }}
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+                background-color: {ACCENT_CYAN};
+            }}
+        """)
+        self._spn_min_rounds.valueChanged.connect(self._on_filter_changed)
+        cumul_count_row.addWidget(self._spn_min_rounds)
+        
+        cumul_count_row.addStretch(1)
+        self._cumul_count_lbl = QtWidgets.QLabel("共 0 个 | 做多 0 | 做空 0 | 精品 0 | 优质 0")
+        self._cumul_count_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        cumul_count_row.addWidget(self._cumul_count_lbl)
+        right_layout.addLayout(cumul_count_row)
+
         self._cumul_table = _make_table([
-            "#", "方向", "出现轮次", "累计触发", "累计命中",
+            "#", "方向", "层级", "出现轮次", "累计触发", "累计命中",
             "综合命中率", "平均命中率", "波动", "综合评分",
             "各状态命中率", "估算总盈亏", "条件组合"
         ])
@@ -592,16 +662,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
 
         splitter.setSizes([450, 550])
 
-        # ④-2 精品推荐表（双层策略池：精品层 + 高频层）
-        family_box = QtWidgets.QGroupBox(
-            "精品推荐 — 精品层（高质量）+ 高频层（高触发）"
-        )
-        family_box.setStyleSheet(self._group_box_style())
-        family_layout = QtWidgets.QVBoxLayout(family_box)
-        family_layout.setContentsMargins(6, 6, 6, 6)
-
-        self._family_tree = self._make_family_tree()
-        family_layout.addWidget(self._family_tree)
         # ⑤ 多轮历史文本区
         hist_box = QtWidgets.QGroupBox("多轮历史记录")
         hist_box.setStyleSheet(self._group_box_style())
@@ -634,16 +694,15 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         ])
         live_layout.addWidget(self._live_table)
 
-        # ④-2/⑤/⑥ 使用垂直分割器，允许手动调整高度
+        # ⑤/⑥ 使用垂直分割器，允许手动调整高度
         bottom_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         bottom_splitter.setHandleWidth(4)
         bottom_splitter.setStyleSheet(f"QSplitter::handle {{ background: {BORDER_COLOR}; }}")
-        bottom_splitter.addWidget(family_box)
         bottom_splitter.addWidget(hist_box)
         bottom_splitter.addWidget(live_box)
-        bottom_splitter.setSizes([280, 160, 180])
+        bottom_splitter.setSizes([280, 320])
 
-        # 总垂直分割器：上（本轮+累计表）↕ 下（族群+历史+监控）
+        # 总垂直分割器：上（本轮+累计表）↕ 下（历史+监控）
         main_vsplit = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         main_vsplit.setHandleWidth(5)
         main_vsplit.setStyleSheet(
@@ -655,12 +714,36 @@ class SignalAnalysisTab(QtWidgets.QWidget):
 
         root.addWidget(main_vsplit, stretch=5)
 
-        # 初始化：加载已有累计记录
+        self._initial_load_done = False
+
+    def ensure_initial_load(self):
+        """首次激活标签页时在后台线程加载数据，避免阻塞主线程导致 UI 卡死。"""
+        if not self._initial_load_done:
+            self._initial_load_done = True
+            self._status_lbl.setText("加载中...")
+            self._init_thread = QtCore.QThread(self)
+            self._init_worker = _InitialLoadWorker()
+            self._init_worker.moveToThread(self._init_thread)
+            self._init_thread.started.connect(self._init_worker.run)
+            self._init_worker.finished.connect(self._on_initial_load_done)
+            self._init_worker.finished.connect(self._init_thread.quit)
+            self._init_worker.error.connect(self._on_initial_load_error)
+            self._init_worker.error.connect(self._init_thread.quit)
+            self._init_thread.finished.connect(self._init_thread.deleteLater)
+            self._init_thread.start()
+
+    @QtCore.pyqtSlot(dict)
+    def _on_initial_load_done(self, _data: dict):
+        """初始数据加载完成回调（主线程）。signal_store 内存缓存已热，各 refresh 方法几乎无 IO。"""
         self._refresh_cumulative_table()
-        self._refresh_family_table()
         self._refresh_history_text()
         self._refresh_live_monitor_table()
         self._refresh_risk_display()
+        self._status_lbl.setText("就绪  —  请先在「上帝视角训练」页签加载历史K线数据")
+
+    @QtCore.pyqtSlot(str)
+    def _on_initial_load_error(self, msg: str):
+        self._status_lbl.setText(f"初始加载失败：{msg[:80]}")
 
     def _group_box_style(self) -> str:
         return f"""
@@ -684,123 +767,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                 height: 14px;
             }}
         """
-
-    def _make_family_tree(self) -> QtWidgets.QTreeWidget:
-        """创建精品推荐的折叠树形表格"""
-        tree = QtWidgets.QTreeWidget()
-        headers = [
-            "层级", "市场状态", "序号", "方向", "开仓条件组合", "出现轮次",
-            "状态触发", "状态命中", "状态命中率",
-            "综合评分", "多头命中率", "空头命中率", "震荡命中率"
-        ]
-        tree.setHeaderLabels(headers)
-        tree.setColumnCount(len(headers))
-        tree.setAlternatingRowColors(True)
-        tree.setRootIsDecorated(True)
-        tree.setIndentation(20)
-        tree.setAnimated(True)
-        tree.setExpandsOnDoubleClick(True)
-        tree.setStyleSheet(f"""
-            QTreeWidget {{
-                background-color: {BG_CARD};
-                alternate-background-color: {BG_PANEL};
-                color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR};
-                gridline-color: {BORDER_COLOR};
-                font-size: 12px;
-            }}
-            QTreeWidget::item {{
-                padding: 4px 8px;
-                border: none;
-            }}
-            QTreeWidget::item:selected {{
-                background-color: #2A3A4A;
-                color: {TEXT_PRIMARY};
-            }}
-            QTreeWidget::branch:has-children:!has-siblings:closed,
-            QTreeWidget::branch:closed:has-children:has-siblings {{
-                image: none;
-                border-image: none;
-            }}
-            QTreeWidget::branch:open:has-children:!has-siblings,
-            QTreeWidget::branch:open:has-children:has-siblings {{
-                image: none;
-                border-image: none;
-            }}
-            QHeaderView::section {{
-                background-color: {BG_PANEL};
-                color: {TEXT_DIM};
-                padding: 4px 8px;
-                border: none;
-                border-bottom: 1px solid {BORDER_COLOR};
-                font-size: 11px;
-                font-weight: bold;
-            }}
-        """)
-        header = tree.header()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        return tree
-
-    def _select_high_freq_top(self, combos: List[dict], top_n: int = 6,
-                              min_triggers: int = 20,
-                              min_score: float = 70.0,
-                              max_conditions: int = 3,
-                              max_overlap: float = 0.5,
-                              min_state_rate: Optional[float] = None) -> List[dict]:
-        """
-        高频策略筛选：
-        1. 条件数量 2-3 个
-        2. 触发次数：
-           - 普通模式：total_triggers >= min_triggers（全局）
-           - 震荡市专项（min_state_rate 已设置）：state_triggers >= min_triggers
-        3. 质量门槛：
-           - 普通模式：综合评分 >= min_score
-           - 震荡市专项：state_rate >= min_state_rate（状态专项命中率）
-        4. 排序：命中率 > 触发次数（强调胜率优先）
-        5. 多样性约束放宽到 50%
-        """
-        qualified = []
-        for c in combos:
-            conditions = c.get("conditions", [])
-            cond_count = len(conditions)
-            if min_state_rate is not None:
-                # 震荡市专项模式：用状态专项命中率替代全局综合评分
-                ok = (2 <= cond_count <= max_conditions
-                      and c.get("state_triggers", 0) >= min_triggers
-                      and c.get("state_rate", 0.0) >= min_state_rate)
-            else:
-                total_triggers = c.get("total_triggers", 0)
-                score = c.get("综合评分", 0.0)
-                ok = (2 <= cond_count <= max_conditions
-                      and total_triggers >= min_triggers
-                      and score >= min_score)
-            if ok:
-                qualified.append(c)
-
-        sorted_combos = sorted(
-            qualified,
-            key=lambda c: (c.get("overall_rate", 0.0), c.get("total_triggers", 0)),
-            reverse=True
-        )
-
-        selected: List[dict] = []
-        selected_families: List[frozenset] = []
-
-        for c in sorted_combos:
-            if len(selected) >= top_n:
-                break
-            families = self._get_family_set(c.get("conditions", []))
-            max_current_overlap = 0.0
-            for sf in selected_families:
-                overlap = self._family_overlap_ratio(families, sf)
-                max_current_overlap = max(max_current_overlap, overlap)
-
-            if max_current_overlap < max_overlap:
-                selected.append(c)
-                selected_families.append(families)
-
-        return selected
 
     def _apply_style(self):
         self.setStyleSheet(f"""
@@ -896,7 +862,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                 pass
             self._round_table.setRowCount(0)
             self._cumul_table.setRowCount(0)
-            self._family_tree.clear()
             self._live_table.setRowCount(0)
             self._history_text.clear()
             self._status_lbl.setText("记录已清空")
@@ -905,6 +870,10 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._risk_state["daily_loss_limit"]  = self._chk_daily_loss.isChecked()
         self._risk_state["streak_loss_pause"] = self._chk_streak.isChecked()
         _save_risk_state(self._risk_state)
+
+    def _on_filter_changed(self):
+        """筛选条件变化时刷新累计结果表格"""
+        self._refresh_cumulative_table()
 
     @QtCore.pyqtSlot(int, str)
     def _on_progress(self, pct: int, text: str):
@@ -916,7 +885,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._set_running(False)
         self._populate_round_table(results)
         self._refresh_cumulative_table()
-        self._refresh_family_table()
         self._refresh_history_text()
         self._refresh_live_monitor_table()
         n = len(results)
@@ -935,24 +903,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             )
             self._btn_new_data.setEnabled(True)
             self._btn_auto_50.setEnabled(True)
-
-    def _on_family_summary(self):
-        """手动刷新族群汇总视图。"""
-        self._refresh_family_table()
-
-    def _on_family_sort(self, section: int):
-        """
-        族群汇总表自定义排序：
-        0/1 列不排序；2/3/4/5/6 列用于排序父行并重绘。
-        """
-        if section < 2:
-            return
-        if self._family_sort_col == section:
-            self._family_sort_desc = not self._family_sort_desc
-        else:
-            self._family_sort_col = section
-            self._family_sort_desc = True
-        self._refresh_family_table()
 
     @QtCore.pyqtSlot(str)
     def _on_error(self, msg: str):
@@ -1024,9 +974,39 @@ class SignalAnalysisTab(QtWidgets.QWidget):
     def _refresh_cumulative_table(self):
         try:
             from core import signal_store
-            combos = signal_store.get_cumulative_results(top_n=200)
+            
+            # 读取筛选条件
+            dir_map = {"全部": None, "做多": "long", "做空": "short"}
+            direction = dir_map.get(
+                self._cmb_direction.currentText() if hasattr(self, '_cmb_direction') else "全部"
+            )
+            min_rounds = self._spn_min_rounds.value() if hasattr(self, '_spn_min_rounds') else 1
+            
+            # 获取数据（已在后台去重+层级过滤，这里只做方向和轮次过滤）
+            combos, cumulative = signal_store.get_cumulative_results(top_n=500, direction=direction)
+            
+            # 应用最少轮次筛选
+            combos = [c for c in combos if c.get("appear_rounds", 0) >= min_rounds]
+            
         except Exception:
             return
+
+        # 更新总数统计（含层级数量）- 基于过滤后的数据
+        filtered_cumulative = {c.get('combo_key', ''): c for c in combos}
+        total = len(filtered_cumulative)
+        long_count = sum(1 for c in combos if c.get("direction") == "long")
+        short_count = total - long_count
+        elite_count = good_count = 0
+        for c in combos:
+            tier = _tier_from_rate(c.get("overall_rate", 0.0), c.get("direction", "long"))
+            if tier == "精品": elite_count += 1
+            elif tier == "优质": good_count += 1
+        cumul_lbl = getattr(self, "_cumul_count_lbl", None)
+        if cumul_lbl:
+            cumul_lbl.setText(
+                f"共 {total} 个 | 做多 {long_count} | 做空 {short_count} | "
+                f"精品 {elite_count} | 优质 {good_count}"
+            )
 
         tbl = self._cumul_table
         tbl.setSortingEnabled(False)
@@ -1059,27 +1039,110 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             pnl_str    = f"{pnl_pct:+.2f}%" if pnl_pct != 0 else "0.00%"
             pnl_color  = _pnl_color(pnl_pct)
 
+            # 层级（根据综合命中率与方向）
+            tier_str   = _tier_from_rate(overall_rate, direction_val)
+            tier_color = _tier_color(tier_str) if tier_str else TEXT_DIM
+
             _set_item(tbl, row,  0, str(seq), TEXT_DIM)
             _set_item(tbl, row,  1, dir_str, dir_color, bold=True)
-            _set_item(tbl, row,  2, str(c.get("appear_rounds", 0)), ACCENT_GOLD,
+            _set_item(tbl, row,  2, tier_str or "--", tier_color, bold=bool(tier_str))
+            _set_item(tbl, row,  3, str(c.get("appear_rounds", 0)), ACCENT_GOLD,
                       sort_value=c.get("appear_rounds", 0))
-            _set_item(tbl, row,  3, str(c.get("total_triggers", "")),
+            _set_item(tbl, row,  4, str(c.get("total_triggers", "")),
                       sort_value=c.get("total_triggers", 0))
-            _set_item(tbl, row,  4, str(c.get("total_hits", "")),
+            _set_item(tbl, row,  5, str(c.get("total_hits", "")),
                       sort_value=c.get("total_hits", 0))
-            _set_item(tbl, row,  5, f"{overall_rate:.1%}", overall_color, bold=True,
+            _set_item(tbl, row,  6, f"{overall_rate:.1%}", overall_color, bold=True,
                       sort_value=overall_rate)
-            _set_item(tbl, row,  6, f"{avg_rate:.1%}", avg_color, sort_value=avg_rate)
-            _set_item(tbl, row,  7, f"{rate_std:.3f}", TEXT_DIM, sort_value=rate_std)
-            _set_item(tbl, row,  8, f"{score:.1f}", score_color, bold=True,
+            _set_item(tbl, row,  7, f"{avg_rate:.1%}", avg_color, sort_value=avg_rate)
+            _set_item(tbl, row,  8, f"{rate_std:.3f}", TEXT_DIM, sort_value=rate_std)
+            _set_item(tbl, row,  9, f"{score:.1f}", score_color, bold=True,
                       sort_value=score)
-            _set_item(tbl, row,  9, dom_state, TEXT_DIM)
-            _set_item(tbl, row, 10, pnl_str, pnl_color, bold=(pnl_pct != 0),
+            _set_item(tbl, row, 10, dom_state, TEXT_DIM)
+            _set_item(tbl, row, 11, pnl_str, pnl_color, bold=(pnl_pct != 0),
                       sort_value=pnl_pct)
-            _set_item(tbl, row, 11,
+            _set_item(tbl, row, 12,
                       _format_conditions(c.get("conditions", []), c.get("direction", "")),
                       TEXT_DIM)
         tbl.setSortingEnabled(True)
+
+    def _export_cumulative_txt(self):
+        """导出累计结果为TXT文件"""
+        try:
+            from core import signal_store
+            combos, _ = signal_store.get_cumulative_results(top_n=1000)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "导出失败", f"读取数据失败:\n{e}")
+            return
+        
+        if not combos:
+            QtWidgets.QMessageBox.information(self, "无数据", "当前没有可导出的累计结果。")
+            return
+
+        default_name = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "导出累计结果",
+            f"cumulative_results_{default_name}.txt",
+            "Text Files (*.txt)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+        
+        headers = [
+            "序号", "方向", "层级", "出现轮次", "累计触发", "累计命中",
+            "综合命中率", "平均命中率", "波动", "综合评分",
+            "各状态命中率", "估算总盈亏", "条件组合"
+        ]
+        
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\t".join(headers) + "\n")
+                
+                for seq, c in enumerate(combos, start=1):
+                    direction_val = c.get("direction", "long")
+                    dir_str = "做多" if direction_val == "long" else "做空"
+                    overall_rate = c.get("overall_rate", 0.0)
+                    avg_rate = c.get("avg_rate", 0.0)
+                    rate_std = c.get("rate_std", 0.0)
+                    score = c.get("综合评分", 0.0)
+                    pnl_pct = c.get("estimated_pnl_pct", 0.0)
+                    
+                    # 层级
+                    tier_str = _tier_from_rate(overall_rate, direction_val) or "--"
+                    
+                    # 各状态命中率明细
+                    breakdown = c.get("market_state_breakdown") or {}
+                    state_detail = _format_state_detail(breakdown, direction_val)
+                    
+                    # 条件组合
+                    conditions_str = _format_conditions(
+                        c.get("conditions", []),
+                        c.get("direction", "")
+                    )
+                    
+                    row = [
+                        str(seq),
+                        dir_str,
+                        tier_str,
+                        str(c.get("appear_rounds", 0)),
+                        str(c.get("total_triggers", 0)),
+                        str(c.get("total_hits", 0)),
+                        f"{overall_rate:.1%}",
+                        f"{avg_rate:.1%}",
+                        f"{rate_std:.3f}",
+                        f"{score:.1f}",
+                        state_detail,
+                        f"{pnl_pct:+.2f}%" if pnl_pct != 0 else "0.00%",
+                        conditions_str,
+                    ]
+                    f.write("\t".join(row) + "\n")
+            
+            QtWidgets.QMessageBox.information(self, "导出完成", f"已导出 {len(combos)} 条记录到:\n{path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "导出失败", f"写入文件失败:\n{e}")
 
     def _refresh_live_monitor_table(self):
         """刷新实盘监控面板：显示有实盘记录的组合及其命中率衰减情况。"""
@@ -1185,381 +1248,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             lines.append("")
 
         self._history_text.setPlainText("\n".join(lines))
-
-    # ── 智能合并辅助函数 ───────────────────────────────────────────────────
-
-    def _get_condition_family(self, cond: str) -> str:
-        """提取条件的指标族，如 'boll_pos_loose' → 'boll_pos'"""
-        for suffix in ('_loose', '_strict'):
-            if cond.endswith(suffix):
-                return cond[:-len(suffix)]
-        return cond
-
-    def _get_family_set(self, conditions: List[str]) -> frozenset:
-        """获取条件组合涉及的指标族集合"""
-        return frozenset(self._get_condition_family(c) for c in conditions)
-
-    def _family_overlap_ratio(self, families_a: frozenset, families_b: frozenset) -> float:
-        """计算两个指标族集合的重叠度（Jaccard）"""
-        if not families_a or not families_b:
-            return 0.0
-        intersection = len(families_a & families_b)
-        union = len(families_a | families_b)
-        return intersection / union if union > 0 else 0.0
-
-    def _is_loose_version(self, cond: str) -> bool:
-        """判断是否为宽松版条件"""
-        return cond.endswith('_loose')
-
-    def _merge_similar_combos(self, combos: List[dict]) -> List[dict]:
-        """
-        合并相似组合：
-        1. 按指标族集合分组
-        2. 同一组内，选取每个指标族的宽松版（覆盖范围更大）
-        3. 返回合并后的代表组合列表
-        """
-        from collections import defaultdict
-
-        # 按指标族集合分组
-        family_groups: Dict[frozenset, List[dict]] = defaultdict(list)
-        for c in combos:
-            families = self._get_family_set(c.get("conditions", []))
-            family_groups[families].append(c)
-
-        merged: List[dict] = []
-        for families, group in family_groups.items():
-            if len(group) == 1:
-                # 只有一个组合，直接保留
-                merged.append(group[0])
-            else:
-                # 多个组合共用相同指标族，选择最优代表
-                # 优先选：综合评分最高 + 使用宽松版条件多的
-                def score_combo(c):
-                    conds = c.get("conditions", [])
-                    loose_count = sum(1 for cd in conds if self._is_loose_version(cd))
-                    # 综合评分权重 + 宽松版数量加成
-                    return c.get("综合评分", 0.0) + loose_count * 0.5
-                best = max(group, key=score_combo)
-                # 合并统计信息：累加触发/命中次数，取最高出现轮次
-                merged_entry = dict(best)
-                merged_entry["appear_rounds"] = max(g.get("appear_rounds", 0) for g in group)
-                merged_entry["total_triggers"] = sum(int(g.get("total_triggers", 0) or 0) for g in group)
-                merged_entry["total_hits"] = sum(int(g.get("total_hits", 0) or 0) for g in group)
-                if merged_entry["total_triggers"] > 0:
-                    merged_entry["overall_rate"] = merged_entry["total_hits"] / merged_entry["total_triggers"]
-                merged_entry["_merged_count"] = len(group)  # 标记合并了多少个
-                merged.append(merged_entry)
-
-        return merged
-
-    def _select_diverse_top(self, combos: List[dict], top_n: int = 6,
-                            max_overlap: float = 0.3,
-                            min_score: float = 80.0) -> List[dict]:
-        """
-        多样性选择（质量优先 + 多样性保障）：
-        1. 只考虑综合评分 >= min_score 的策略
-        2. 按综合评分降序
-        3. 逐个加入，如果与已选组合重叠度 < max_overlap 才加入
-        4. 宁缺毋滥：不足 top_n 时不补充低质量策略
-        """
-        # 质量门槛：只考虑高分策略
-        qualified = [c for c in combos if c.get("综合评分", 0.0) >= min_score]
-        sorted_combos = sorted(qualified, key=lambda c: c.get("综合评分", 0.0), reverse=True)
-
-        selected: List[dict] = []
-        selected_families: List[frozenset] = []
-
-        for c in sorted_combos:
-            if len(selected) >= top_n:
-                break
-            families = self._get_family_set(c.get("conditions", []))
-            max_current_overlap = 0.0
-            for sf in selected_families:
-                overlap = self._family_overlap_ratio(families, sf)
-                max_current_overlap = max(max_current_overlap, overlap)
-
-            # 严格多样性：重叠度必须 < 阈值才能入选
-            if max_current_overlap < max_overlap:
-                selected.append(c)
-                selected_families.append(families)
-
-        # 宁缺毋滥：不再补充低质量/高重叠策略
-        return selected
-
-    def _refresh_family_table(self):
-        """
-        刷新精选组合表（双层策略池 + 折叠式分组）：
-        层级结构：
-          精品层（高质量）
-            ├─ 多头趋势
-            │   ├─ 做多 (6条)
-            │   └─ 做空 (6条)
-            ├─ 空头趋势
-            └─ 震荡市
-          高频层（高触发）
-            ├─ 多头趋势
-            ...
-        
-        精品层筛选：评分>=80, 多样性<30%
-        高频层筛选：2-3条件, 触发>=10, 评分>=70, 多样性<50%
-        """
-        try:
-            from core import signal_store
-            combos = signal_store.get_cumulative_results(top_n=500)
-        except Exception:
-            return
-
-        tree = self._family_tree
-        tree.clear()
-
-        _BG_LONG      = QtGui.QColor("#1E2D2A")
-        _BG_SHORT     = QtGui.QColor("#2D1E1E")
-        _BG_TIER_ELITE = QtGui.QColor("#2A2520")  # 精品层背景
-        _BG_TIER_FREQ  = QtGui.QColor("#1E2A2A")  # 高频层背景
-
-        STATES = ["多头趋势", "空头趋势", "震荡市"]
-        STATE_COLORS = {
-            "多头趋势": LONG_COLOR,
-            "空头趋势": SHORT_COLOR,
-            "震荡市":   ACCENT_GOLD,
-        }
-        TIER_COLORS = {
-            "精品": ACCENT_GOLD,
-            "高频": TIER_HIGH_FREQ,
-        }
-        TIER_BGS = {
-            "精品": _BG_TIER_ELITE,
-            "高频": _BG_TIER_FREQ,
-        }
-        MIN_STATE_TRIGGERS = 5   # 该状态触发次数不足时跳过
-
-        def _create_tier_node(tier_name: str, tier_color: str, bg_color: QtGui.QColor) -> QtWidgets.QTreeWidgetItem:
-            """创建层级根节点"""
-            node = QtWidgets.QTreeWidgetItem([tier_name])
-            node.setForeground(0, QtGui.QColor(tier_color))
-            font = node.font(0)
-            font.setBold(True)
-            font.setPointSize(11)
-            node.setFont(0, font)
-            for col in range(13):
-                node.setBackground(col, bg_color)
-            return node
-
-        def _create_state_node(parent: QtWidgets.QTreeWidgetItem, 
-                               market_state: str, count: int) -> QtWidgets.QTreeWidgetItem:
-            """创建市场状态分组节点"""
-            state_color = STATE_COLORS.get(market_state, ACCENT_GOLD)
-            node = QtWidgets.QTreeWidgetItem(parent, ["", market_state, "", "", f"共 {count} 条策略"])
-            node.setForeground(1, QtGui.QColor(state_color))
-            font = node.font(1)
-            font.setBold(True)
-            node.setFont(1, font)
-            node.setForeground(4, QtGui.QColor(TEXT_DIM))
-            return node
-
-        def _create_direction_node(parent: QtWidgets.QTreeWidgetItem,
-                                   direction: str, dir_label: str, 
-                                   count: int) -> QtWidgets.QTreeWidgetItem:
-            """创建方向分组节点"""
-            dir_color = LONG_COLOR if direction == "long" else SHORT_COLOR
-            node = QtWidgets.QTreeWidgetItem(parent, ["", "", "", dir_label, f"({count}条)"])
-            node.setForeground(3, QtGui.QColor(dir_color))
-            font = node.font(3)
-            font.setBold(True)
-            node.setFont(3, font)
-            node.setForeground(4, QtGui.QColor(TEXT_DIM))
-            return node
-
-        def _add_combo_item(parent: QtWidgets.QTreeWidgetItem, tier_label: str,
-                           tier_color: str, seq: int, c: dict,
-                           market_state: str, direction: str):
-            """添加单个策略组合到树节点"""
-            conditions   = c.get("conditions", [])
-            merged_count = c.get("_merged_count", 1)
-            appear       = c.get("appear_rounds", 0)
-            score        = c.get("综合评分", c.get("score", 0.0))
-            dir_label    = "做多" if direction == "long" else "做空"
-            dir_color    = LONG_COLOR if direction == "long" else SHORT_COLOR
-
-            # 该市场状态下的命中率和触发次数
-            state_rate, state_triggers = _get_state_rate(
-                c.get("market_state_breakdown"), market_state)
-            state_hits = round(state_triggers * state_rate)
-
-            # 三状态命中率明细
-            breakdown = c.get("market_state_breakdown") or {}
-            threshold = 0.64 if direction == "long" else 0.52
-
-            def _state_cell(st: str):
-                r, t = _get_state_rate(breakdown, st)
-                if t < 5:
-                    return "-", TEXT_DIM
-                warn = r < threshold
-                text = f"{'⚠' if warn else ''}{r:.0%}({t})"
-                color = WARN_COLOR if warn else _rate_color(r, direction)
-                return text, color
-
-            bull_text, bull_color = _state_cell("多头趋势")
-            bear_text, bear_color = _state_cell("空头趋势")
-            side_text, side_color = _state_cell("震荡市")
-
-            cond_text = _format_conditions(conditions, direction)
-            if merged_count > 1:
-                cond_text = f"[合并{merged_count}] {cond_text}"
-
-            appear_color = (ACCENT_GOLD if appear >= 5
-                           else TEXT_PRIMARY if appear >= 3
-                           else TEXT_DIM)
-            state_color_val = STATE_COLORS.get(market_state, ACCENT_GOLD)
-
-            item = QtWidgets.QTreeWidgetItem(parent, [
-                tier_label,                           # 0: 层级
-                market_state,                         # 1: 市场状态
-                str(seq),                             # 2: 序号
-                dir_label,                            # 3: 方向
-                cond_text,                            # 4: 开仓条件组合
-                str(appear),                          # 5: 出现轮次
-                str(state_triggers),                  # 6: 状态触发
-                str(state_hits),                      # 7: 状态命中
-                f"{state_rate:.1%}",                  # 8: 状态命中率
-                f"{score:.1f}",                       # 9: 综合评分
-                bull_text,                            # 10: 多头命中率
-                bear_text,                            # 11: 空头命中率
-                side_text,                            # 12: 震荡命中率
-            ])
-
-            # 设置颜色
-            item.setForeground(0, QtGui.QColor(tier_color))
-            item.setForeground(1, QtGui.QColor(state_color_val))
-            item.setForeground(2, QtGui.QColor(TEXT_DIM))
-            item.setForeground(3, QtGui.QColor(dir_color))
-            item.setForeground(4, QtGui.QColor(TEXT_PRIMARY))
-            item.setForeground(5, QtGui.QColor(appear_color))
-            item.setForeground(6, QtGui.QColor(TEXT_PRIMARY))
-            item.setForeground(7, QtGui.QColor(TEXT_PRIMARY))
-            item.setForeground(8, QtGui.QColor(_rate_color(state_rate, direction)))
-            item.setForeground(9, QtGui.QColor(TIER_ELITE if score >= 80 else ACCENT_GOLD))
-            item.setForeground(10, QtGui.QColor(bull_color))
-            item.setForeground(11, QtGui.QColor(bear_color))
-            item.setForeground(12, QtGui.QColor(side_color))
-
-            # 设置加粗
-            for col in [0, 3, 8, 9]:
-                font = item.font(col)
-                font.setBold(True)
-                item.setFont(col, font)
-            if appear >= 5:
-                font = item.font(5)
-                font.setBold(True)
-                item.setFont(5, font)
-
-            # 设置行背景色
-            row_bg = _BG_LONG if direction == "long" else _BG_SHORT
-            for col in range(13):
-                item.setBackground(col, row_bg)
-
-        def _get_tier_combos(all_combos: List[dict], market_state: str, direction: str,
-                            tier: str, elite_keys: set) -> List[dict]:
-            """获取指定层级的策略组合"""
-            # 过滤：该状态触发次数 >= MIN_STATE_TRIGGERS
-            candidates = [
-                c for c in all_combos
-                if c.get("direction") == direction
-                and _get_state_rate(
-                    c.get("market_state_breakdown"), market_state)[1] >= MIN_STATE_TRIGGERS
-            ]
-
-            if not candidates:
-                return []
-
-            # 智能合并（宽松取值）
-            merged = self._merge_similar_combos(candidates)
-
-            # 按该状态命中率降序（主排序键），综合评分为次排序键
-            merged.sort(
-                key=lambda c: (
-                    _get_state_rate(c.get("market_state_breakdown"), market_state)[0],
-                    c.get("综合评分", 0.0)
-                ),
-                reverse=True
-            )
-
-            if tier == "精品":
-                # 精品层：评分>=80, 多样性<30%
-                return self._select_diverse_top(merged, top_n=6, min_score=80.0, max_overlap=0.3)
-            elif tier == "高频":
-                high_freq_candidates = [
-                    c for c in merged
-                    if frozenset(c.get("conditions", [])) not in elite_keys
-                ]
-                if market_state == "震荡市":
-                    # 震荡市：从完整 merged 中找（包括已在精品层的 2-3 条件组合）
-                    sideways_pool = [dict(c) for c in merged]
-                    for c in sideways_pool:
-                        r, t = _get_state_rate(c.get("market_state_breakdown"), market_state)
-                        c["state_rate"] = r
-                        c["state_triggers"] = t
-                    _min_state_rate = 0.64 if direction == "long" else 0.52
-                    return self._select_high_freq_top(sideways_pool, top_n=10,
-                                                      min_triggers=5, min_score=65.0,
-                                                      max_conditions=3, max_overlap=0.5,
-                                                      min_state_rate=_min_state_rate)
-                else:
-                    return self._select_high_freq_top(high_freq_candidates, top_n=6,
-                                                      min_triggers=10, min_score=70.0,
-                                                      max_conditions=3, max_overlap=0.5)
-
-        TIERS = [
-            ("精品", "精品层（高质量：评分≥80）",               ACCENT_GOLD,    _BG_TIER_ELITE),
-            ("高频", "高频层（触发优先；震荡市扩容至10个）",      TIER_HIGH_FREQ, _BG_TIER_FREQ),
-        ]
-
-        # 先收集精品层的组合key，用于高频层去重
-        all_elite_keys: set = set()
-        for market_state in STATES:
-            for direction, _ in [("long", "做多"), ("short", "做空")]:
-                elite_combos = _get_tier_combos(combos, market_state, direction, "精品", set())
-                for ec in elite_combos:
-                    all_elite_keys.add(frozenset(ec.get("conditions", [])))
-
-        for tier_key, tier_name, tier_color, tier_bg in TIERS:
-            tier_node = _create_tier_node(tier_name, tier_color, tier_bg)
-            tier_total = 0
-
-            for market_state in STATES:
-                state_combos_by_dir = {}
-                for direction, dir_label in [("long", "做多"), ("short", "做空")]:
-                    elite_keys_for_tier = all_elite_keys if tier_key == "高频" else set()
-                    top_combos = _get_tier_combos(combos, market_state, direction, tier_key, elite_keys_for_tier)
-                    if top_combos:
-                        state_combos_by_dir[direction] = (dir_label, top_combos)
-                        tier_total += len(top_combos)
-
-                if not state_combos_by_dir:
-                    continue
-
-                # 计算该状态总策略数
-                state_count = sum(len(v[1]) for v in state_combos_by_dir.values())
-                state_node = _create_state_node(tier_node, market_state, state_count)
-
-                for direction, (dir_label, top_combos) in state_combos_by_dir.items():
-                    dir_node = _create_direction_node(state_node, direction, dir_label, len(top_combos))
-                    
-                    for seq, c in enumerate(top_combos, start=1):
-                        _add_combo_item(dir_node, tier_key, tier_color, seq, c,
-                                       market_state, direction)
-
-            # 更新层级节点显示总数
-            tier_node.setText(0, f"{tier_name} - 共 {tier_total} 条")
-            tree.addTopLevelItem(tier_node)
-
-        # 默认展开两层
-        for i in range(tree.topLevelItemCount()):
-            tier_node = tree.topLevelItem(i)
-            tier_node.setExpanded(True)
-            # 展开所有状态节点
-            for j in range(tier_node.childCount()):
-                tier_node.child(j).setExpanded(True)
 
     # ── 外部接口 ──────────────────────────────────────────────────────────
 

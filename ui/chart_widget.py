@@ -368,6 +368,10 @@ class ChartWidget(QtWidgets.QWidget):
         self._incremental_signals = False
         self._signal_range_tick = 0
         self._render_stride = 1
+        self._xrange_stride = 1
+        self._last_xrange_idx = -1
+        self._indicator_stride = 1
+        self._fast_playback = False
         self._last_tp = None
         self._last_sp = None
         
@@ -760,14 +764,19 @@ class ChartWidget(QtWidgets.QWidget):
         self._update_ohlc_text(len(self.df)-1)
 
         # === 实时渲染 KDJ 指标（独立面板）===
-        if 'k' in df_slice.columns:
+        should_update_indicators = (
+            not self._fast_playback
+            or self._indicator_stride <= 1
+            or (end_idx % self._indicator_stride == 0)
+        )
+        if should_update_indicators and 'k' in df_slice.columns:
             indices = np.arange(actual_start, actual_start + n)
             self.k_curve.setData(x=indices, y=df_slice['k'].values)
             self.d_curve.setData(x=indices, y=df_slice['d'].values)
             self.j_curve.setData(x=indices, y=df_slice['j'].values)
         
         # === 实时渲染 MACD 指标（独立面板）===
-        if 'macd' in df_slice.columns and 'macd_hist' in df_slice.columns:
+        if should_update_indicators and 'macd' in df_slice.columns and 'macd_hist' in df_slice.columns:
             indices = np.arange(actual_start, actual_start + n)
             macd_vals = df_slice['macd'].values
             signal_vals = df_slice['macd_signal'].values
@@ -842,9 +851,75 @@ class ChartWidget(QtWidgets.QWidget):
         
         return self.current_display_index < len(self.df)
 
+    def advance_to(self, target_idx: int) -> bool:
+        """
+        跳跃前进到目标索引，只触发一次重绘（高速动画专用）
+        
+        Returns:
+            True 如果还有更多数据，False 如果已到达末尾
+        """
+        if self.df is None:
+            return False
+
+        self.current_display_index = min(target_idx + 1, len(self.df))
+        self._signal_range_tick = self.current_display_index
+        if self._render_stride > 1 and (self.current_display_index % self._render_stride != 0):
+            return self.current_display_index < len(self.df)
+        self._display_range(0, self.current_display_index)
+
+        visible_range = 40
+        # 高频 setXRange 在大数据播放时成本很高，按步长节流可显著减少卡顿
+        should_update_xrange = (
+            self.current_display_index <= visible_range
+            or self._xrange_stride <= 1
+            or (self.current_display_index - self._last_xrange_idx) >= self._xrange_stride
+        )
+        if should_update_xrange:
+            self.candle_plot.setXRange(
+                self.current_display_index - visible_range + 1,
+                self.current_display_index + 1,
+                padding=0
+            )
+            self._last_xrange_idx = self.current_display_index
+        self._update_tp_sp_segment()
+
+        self._y_range_tick += 1
+        if self._y_range_tick % 5 == 0:
+            self._smart_auto_scale()
+
+        return self.current_display_index < len(self.df)
+
     def set_render_stride(self, speed: int):
         """根据速度降低渲染频率以减少卡顿"""
-        self._render_stride = 1
+        if speed <= 10:
+            self._render_stride = 2
+        elif speed <= 20:
+            self._render_stride = 3
+        elif speed <= 40:
+            self._render_stride = 4
+        else:
+            self._render_stride = 6
+        # 与速度联动：高倍速时降低视窗滚动更新频率，保留“流动感”同时避免主线程阻塞
+        if speed <= 10:
+            self._xrange_stride = 16
+        elif speed <= 20:
+            self._xrange_stride = 12
+        elif speed <= 40:
+            self._xrange_stride = 8
+        else:
+            self._xrange_stride = 6
+        if speed <= 10:
+            self._indicator_stride = 6
+        elif speed <= 20:
+            self._indicator_stride = 8
+        elif speed <= 40:
+            self._indicator_stride = 10
+        else:
+            self._indicator_stride = 12
+
+    def set_fast_playback(self, enabled: bool):
+        """启用/关闭快速播放模式（用于回测动画）"""
+        self._fast_playback = enabled
 
     def get_rightmost_signal_index(self) -> int:
         """返回当前信号标记中最大的 K 线索引，便于视图范围包含最近一笔交易"""

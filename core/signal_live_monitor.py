@@ -175,23 +175,22 @@ class SignalLiveMonitor:
             return None
 
         def _pick_by_direction(pool: List[Tuple[str, dict, str]]) -> Optional[Tuple[str, dict, str]]:
-            """按市场状态方向偏向从给定列表中选最高评分"""
+            """按状态专项命中率排序；多头/空头趋势只选对应方向，不兜底对手方"""
             if not pool:
                 return None
+
+            def _state_wr(item: Tuple[str, dict, str]) -> float:
+                bkd = (item[1].get('market_state_breakdown') or {}).get(market_state, {})
+                return bkd.get('avg_rate', 0.0)
+
             if market_state == "多头趋势":
                 longs = [x for x in pool if x[1].get('direction') == 'long']
-                if longs:
-                    return max(longs, key=lambda x: x[1].get('综合评分', 0.0))
-                shorts = [x for x in pool if x[1].get('direction') == 'short']
-                return max(shorts, key=lambda x: x[1].get('综合评分', 0.0)) if shorts else None
+                return max(longs, key=_state_wr) if longs else None
             elif market_state == "空头趋势":
                 shorts = [x for x in pool if x[1].get('direction') == 'short']
-                if shorts:
-                    return max(shorts, key=lambda x: x[1].get('综合评分', 0.0))
-                longs = [x for x in pool if x[1].get('direction') == 'long']
-                return max(longs, key=lambda x: x[1].get('综合评分', 0.0)) if longs else None
+                return max(shorts, key=_state_wr) if shorts else None
             else:  # 震荡市
-                return max(pool, key=lambda x: x[1].get('综合评分', 0.0))
+                return max(pool, key=_state_wr)
 
         # 精品 → 高频，两层兜底
         elite_pool = [x for x in valid_triggered if x[2] == "精品"]

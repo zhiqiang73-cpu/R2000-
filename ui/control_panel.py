@@ -191,7 +191,7 @@ class ControlPanel(QtWidgets.QWidget):
         # 播放按钮
         btn_layout = QtWidgets.QHBoxLayout()
         
-        self.play_btn = QtWidgets.QPushButton("▶ 开始标注")
+        self.play_btn = QtWidgets.QPushButton("▶ 开始回测")
         self.play_btn.setObjectName("playBtn")
         self.play_btn.clicked.connect(self._on_play_clicked)
         btn_layout.addWidget(self.play_btn)
@@ -349,7 +349,7 @@ class ControlPanel(QtWidgets.QWidget):
             self.stop_btn.setEnabled(True)
             self.sample_btn.setEnabled(False)
         else:
-            self.play_btn.setText("▶ 开始标注")
+            self.play_btn.setText("▶ 开始回测")
             self.stop_btn.setEnabled(False)
             self.sample_btn.setEnabled(True)
     

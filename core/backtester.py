@@ -11,7 +11,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import BACKTEST_CONFIG
+from config import BACKTEST_CONFIG, PAPER_TRADING_CONFIG
 
 
 class PositionSide(IntEnum):
@@ -30,8 +30,15 @@ class Position:
     size: float = 0.0
     stop_loss: float = 0.0
     take_profit: float = 0.0
+    take_profit_2: float = 0.0      # 保留字段（不再使用，阶段2改为追踪止损）
+    tp1_ratio: float = 0.70         # TP1 平仓比例
+    stage: int = 1                  # 当前阶段：1=初始，2=TP1已触发
     liquidation_price: float = 0.0  # 强平价格
     margin: float = 0.0             # 保证金
+    peak_pnl_pct: float = 0.0       # 持仓期间峰值浮盈（杠杆后%）
+    ever_reached_6pct: bool = False  # 是否曾达到+BREAKEVEN_THRESHOLD_PCT
+    original_stop_loss: float = 0.0  # 原始止损价（用于止损参考）
+    peak_price: float = 0.0         # 阶段2追踪最高/最低价
 
 
 @dataclass
@@ -61,6 +68,10 @@ class TradeRecord:
     pre_exit_traj: object = None        # (30, 32) 离场前轨迹 np.ndarray
     matched_template_idx: int = -1      # 匹配到的模板编号
     entry_similarity: float = 0.0       # 入场匹配度 (DTW相似度)
+    # 信号回测附加信息
+    signal_key: str = ""                # 累计结果编号（combo key）
+    signal_rate: float = 0.0            # 综合命中率 overall_rate
+    signal_score: float = 0.0           # 综合评分
 
 
 @dataclass
@@ -187,12 +198,12 @@ class Backtester:
             # 检查止盈止损
             if self.position.side != PositionSide.NONE:
                 exit_triggered, exit_price, exit_reason = self._check_exit(
-                    current_high, current_low, current_price
+                    current_high, current_low, current_price, i
                 )
-                
+
                 if exit_triggered:
                     self._close_position(i, exit_price, exit_reason)
-            
+
             # 处理新信号
             if signal != 0:
                 if self.position.side == PositionSide.NONE:
@@ -368,6 +379,11 @@ class Backtester:
             long_weights = strategy_weights
             short_weights = -strategy_weights
         
+        cfg_ptc = PAPER_TRADING_CONFIG
+        lev = BACKTEST_CONFIG.get("LEVERAGE", 10)
+        breakeven_thr = cfg_ptc.get("BREAKEVEN_THRESHOLD_PCT", 6.0)   # 杠杆后 %
+        breakeven_sl  = cfg_ptc.get("BREAKEVEN_SL_PCT", -3.0)         # 杠杆后 %
+
         for i in range(n):
             current_price = close[i]
             current_high = high[i]
@@ -380,14 +396,37 @@ class Backtester:
                     self._close_position(i, current_price, "timeout")
                     continue
             
+            # 每根K线更新持仓浮盈峰值，并触发阶梯止损上移
+            if self.position.side != PositionSide.NONE and self.position.stage == 1:
+                pos = self.position
+                is_long = (pos.side == PositionSide.LONG)
+                price_chg_pct = (current_price - pos.entry_price) / pos.entry_price
+                if not is_long:
+                    price_chg_pct = -price_chg_pct
+                pnl_pct = price_chg_pct * lev * 100  # 杠杆后收益率%
+
+                if pnl_pct > pos.peak_pnl_pct:
+                    pos.peak_pnl_pct = pnl_pct
+
+                # 阶梯止损上移：浮盈首次达到阈值 → 止损移到 BREAKEVEN_SL_PCT
+                if not pos.ever_reached_6pct and pos.peak_pnl_pct >= breakeven_thr:
+                    pos.ever_reached_6pct = True
+                    sl_price_chg = breakeven_sl / 100 / lev  # 价格变动幅度
+                    new_sl = pos.entry_price * (1 + sl_price_chg) if is_long else pos.entry_price * (1 - sl_price_chg)
+                    # 止损只能上移（对多头：新止损 > 当前止损；对空头：新止损 < 当前止损）
+                    if is_long:
+                        pos.stop_loss = max(pos.stop_loss, new_sl)
+                    else:
+                        pos.stop_loss = min(pos.stop_loss, new_sl)
+
             # 检查止盈止损
             if self.position.side != PositionSide.NONE:
                 exit_triggered, exit_price, exit_reason = self._check_exit(
-                    current_high, current_low, current_price
+                    current_high, current_low, current_price, i
                 )
                 if exit_triggered:
                     self._close_position(i, exit_price, exit_reason)
-            
+
             # 计算信号分数
             feat = features[i]
             long_score = np.dot(feat, long_weights)
@@ -421,29 +460,33 @@ class Backtester:
         return self._calculate_statistics()
     
     def _open_position(self, idx: int, price: float, side: PositionSide):
-        """开仓"""
+        """开仓（追踪止盈止损框架：TP1=70%平仓进入阶段2，阶段2用追踪止损，SL全平）"""
+        tp1_pct = BACKTEST_CONFIG.get("TAKE_PROFIT_PCT", 0.012)    # TP1 价格变动 1.2%（+12%杠杆后）
+        sl_pct  = BACKTEST_CONFIG.get("STOP_LOSS_PCT", 0.008)      # SL  价格变动 0.8%
+        tp1_ratio = BACKTEST_CONFIG.get("TP1_RATIO", 0.70)         # TP1 平仓 70%
+        pos_size_pct = BACKTEST_CONFIG.get("POSITION_SIZE_PCT", self.position_size_pct)
+
         # 计算滑点后的入场价
         if side == PositionSide.LONG:
             entry_price = price * (1 + self.slippage)
-            stop_loss = entry_price * (1 - self.stop_loss_pct)
-            take_profit = entry_price * (1 + self.take_profit_pct)
-            # 强平价格估算 (简化版：1/杠杆)
-            liquidation_price = entry_price * (1 - 1/self.leverage * 0.9) # 预留10%保证金
+            stop_loss = entry_price * (1 - sl_pct)
+            take_profit = entry_price * (1 + tp1_pct)
+            liquidation_price = entry_price * (1 - 1 / self.leverage * 0.9)
         else:
             entry_price = price * (1 - self.slippage)
-            stop_loss = entry_price * (1 + self.stop_loss_pct)
-            take_profit = entry_price * (1 - self.take_profit_pct)
-            liquidation_price = entry_price * (1 + 1/self.leverage * 0.9)
-        
+            stop_loss = entry_price * (1 + sl_pct)
+            take_profit = entry_price * (1 - tp1_pct)
+            liquidation_price = entry_price * (1 + 1 / self.leverage * 0.9)
+
         # 计算仓位大小
-        margin = self.capital * self.position_size_pct
+        margin = self.capital * pos_size_pct
         position_value = margin * self.leverage
         size = position_value / entry_price
-        
+
         # 扣除手续费
         fee = position_value * self.fee_rate
         self.capital -= fee
-        
+
         self.position = Position(
             side=side,
             entry_price=entry_price,
@@ -451,8 +494,15 @@ class Backtester:
             size=size,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            take_profit_2=0.0,
+            tp1_ratio=tp1_ratio,
+            stage=1,
             liquidation_price=liquidation_price,
-            margin=margin
+            margin=margin,
+            peak_pnl_pct=0.0,
+            ever_reached_6pct=False,
+            original_stop_loss=stop_loss,
+            peak_price=entry_price,
         )
     
     def _close_position(self, idx: int, price: float, reason: str):
@@ -524,21 +574,192 @@ class Backtester:
         # 清空持仓
         self.position = Position()
     
-    def _check_exit(self, high: float, low: float, close: float) -> Tuple[bool, float, str]:
-        """检查止盈止损"""
-        if self.position.side == PositionSide.LONG:
-            if low <= self.position.stop_loss:
-                return True, self.position.stop_loss, "sl"
-            if high >= self.position.take_profit:
-                return True, self.position.take_profit, "tp"
-        
-        elif self.position.side == PositionSide.SHORT:
-            if high >= self.position.stop_loss:
-                return True, self.position.stop_loss, "sl"
-            if low <= self.position.take_profit:
-                return True, self.position.take_profit, "tp"
-        
+    def _check_exit(self, high: float, low: float, close: float,
+                    current_idx: int = -1) -> Tuple[bool, float, str]:
+        """
+        追踪止盈止损检查。
+
+        阶段1（stage=1）：
+          - 动态止损：浮盈>=BREAKEVEN_THRESHOLD_PCT → 上移止损到BREAKEVEN_SL_PCT
+          - 时间衰减：持仓>TIME_DECAY_BAR_2 → 止损收窄到TIME_DECAY_SL_2
+                      持仓>TIME_DECAY_BAR_1 → 止损收窄到TIME_DECAY_SL_1
+          - SL 触发 → 全平
+          - TP1 触发（+STAGED_TP_PCT%）→ 部分平仓（tp1_ratio），止损移至入场价，进入阶段2
+
+        阶段2（stage=2）：
+          - 追踪止损 = 最高价×(1−TRAILING_STOP_PCT) [多] / 最低价×(1+TRAILING_STOP_PCT) [空]
+          - 止损只升不降（多）/只降不升（空）
+          - 追踪止损触发 → 全平剩余（无TP2上限，让利润奔跑）
+        """
+        pos = self.position
+        if pos.side == PositionSide.NONE:
+            return False, 0, ""
+
+        cfg = BACKTEST_CONFIG
+        lev = cfg.get("LEVERAGE", 10)
+        is_long = (pos.side == PositionSide.LONG)
+
+        if pos.stage == 1:
+            hold_bars = current_idx - pos.entry_idx if current_idx >= 0 else 0
+
+            # ── 更新峰值浮盈（杠杆后%）──
+            best_bar_price = high if is_long else low
+            if is_long:
+                bar_pnl = (best_bar_price - pos.entry_price) / pos.entry_price * lev * 100
+            else:
+                bar_pnl = (pos.entry_price - best_bar_price) / pos.entry_price * lev * 100
+            if bar_pnl > pos.peak_pnl_pct:
+                pos.peak_pnl_pct = bar_pnl
+
+            # ── 动态止损调整（优先级：阶梯上移 > 时间衰减）──
+            threshold = cfg.get("BREAKEVEN_THRESHOLD_PCT", 6.0)
+            if not pos.ever_reached_6pct and pos.peak_pnl_pct >= threshold:
+                # 第一次浮盈达到阈值：止损上移到 BREAKEVEN_SL_PCT 对应价格
+                pos.ever_reached_6pct = True
+                sl_pct = cfg.get("BREAKEVEN_SL_PCT", -3.0) / 100 / lev
+                if is_long:
+                    pos.stop_loss = max(pos.stop_loss, pos.entry_price * (1 + sl_pct))
+                else:
+                    pos.stop_loss = min(pos.stop_loss, pos.entry_price * (1 - sl_pct))
+
+            elif not pos.ever_reached_6pct:
+                # 未触发阶梯上移时：时间衰减止损收窄（止损只能收紧，不能放宽）
+                decay_enabled = cfg.get("TIME_DECAY_ENABLED", True)
+                if decay_enabled:
+                    bar2 = cfg.get("TIME_DECAY_BAR_2", 180)
+                    bar1 = cfg.get("TIME_DECAY_BAR_1", 120)
+                    sl2_pct = cfg.get("TIME_DECAY_SL_2", -5.0) / 100 / lev
+                    sl1_pct = cfg.get("TIME_DECAY_SL_1", -10.0) / 100 / lev
+                    if hold_bars > bar2:
+                        decay_sl = pos.entry_price * (1 + sl2_pct) if is_long else pos.entry_price * (1 - sl2_pct)
+                        if is_long:
+                            pos.stop_loss = max(pos.stop_loss, decay_sl)
+                        else:
+                            pos.stop_loss = min(pos.stop_loss, decay_sl)
+                    elif hold_bars > bar1:
+                        decay_sl = pos.entry_price * (1 + sl1_pct) if is_long else pos.entry_price * (1 - sl1_pct)
+                        if is_long:
+                            pos.stop_loss = max(pos.stop_loss, decay_sl)
+                        else:
+                            pos.stop_loss = min(pos.stop_loss, decay_sl)
+
+            # 检查 SL 触发（全平）
+            if is_long and low <= pos.stop_loss:
+                return True, pos.stop_loss, "sl"
+            if not is_long and high >= pos.stop_loss:
+                return True, pos.stop_loss, "sl"
+
+            # 检查 TP1 触发（部分平仓，转入阶段2）
+            if is_long and high >= pos.take_profit:
+                self._partial_close_position(pos.take_profit, pos.tp1_ratio, "tp1", current_idx)
+                pos.stop_loss = pos.entry_price  # 止损上移至保本
+                pos.stage = 2
+                pos.peak_price = pos.take_profit  # 初始化追踪最高价
+                return False, 0, ""
+            if not is_long and low <= pos.take_profit:
+                self._partial_close_position(pos.take_profit, pos.tp1_ratio, "tp1", current_idx)
+                pos.stop_loss = pos.entry_price
+                pos.stage = 2
+                pos.peak_price = pos.take_profit  # 初始化追踪最低价
+                return False, 0, ""
+
+        elif pos.stage == 2:
+            trail_pct = cfg.get("TRAILING_STOP_PCT", 0.08)
+
+            # 更新追踪最高/最低价，计算并更新追踪止损（止损只能收紧）
+            if is_long:
+                if high > pos.peak_price:
+                    pos.peak_price = high
+                trailing_sl = pos.peak_price * (1 - trail_pct)
+                pos.stop_loss = max(pos.stop_loss, trailing_sl)
+                if low <= pos.stop_loss:
+                    return True, pos.stop_loss, "trailing_sl"
+            else:
+                if pos.peak_price == 0 or low < pos.peak_price:
+                    pos.peak_price = low
+                trailing_sl = pos.peak_price * (1 + trail_pct)
+                pos.stop_loss = min(pos.stop_loss, trailing_sl)
+                if high >= pos.stop_loss:
+                    return True, pos.stop_loss, "trailing_sl"
+
         return False, 0, ""
+
+    def _partial_close_position(self, price: float, ratio: float, reason: str,
+                                 idx: int = -1) -> None:
+        """
+        按比例部分平仓，更新仓位 size 和资金，记录部分平仓盈亏。
+        剩余仓位继续持有。
+        """
+        pos = self.position
+        if pos.side == PositionSide.NONE or ratio <= 0:
+            return
+
+        close_size = pos.size * ratio
+
+        # 计算滑点后的出场价
+        if pos.side == PositionSide.LONG:
+            exit_price = price * (1 - self.slippage)
+            profit = (exit_price - pos.entry_price) * close_size
+        else:
+            exit_price = price * (1 + self.slippage)
+            profit = (pos.entry_price - exit_price) * close_size
+
+        # 扣除手续费
+        position_value = exit_price * close_size
+        fee = position_value * self.fee_rate
+        net_profit = profit - fee
+        self.capital += net_profit
+
+        # 更新剩余仓位 size（保证金和 entry_price 不变）
+        pos.size -= close_size
+
+        exit_idx = idx if idx >= 0 else pos.entry_idx
+        hold_periods = exit_idx - pos.entry_idx if idx >= 0 else 0
+
+        # 记录部分平仓交易
+        profit_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+        if pos.side == PositionSide.SHORT:
+            profit_pct = -profit_pct
+
+        self.trades.append(TradeRecord(
+            entry_idx=pos.entry_idx,
+            exit_idx=exit_idx,
+            side=int(pos.side),
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            size=close_size,
+            profit=net_profit,
+            profit_pct=profit_pct,
+            hold_periods=hold_periods,
+            exit_reason=reason,
+            stop_loss=pos.stop_loss,
+            take_profit=pos.take_profit,
+            liquidation_price=pos.liquidation_price,
+            margin=pos.margin,
+        ))
+
+        # 更新统计缓存（部分平仓计为一笔独立交易）
+        self._total_trades += 1
+        if net_profit > 0:
+            self._win_trades += 1
+            self._gross_profit += net_profit
+        else:
+            self._loss_trades += 1
+            self._gross_loss += abs(net_profit)
+        self._total_profit += net_profit
+        self._profit_pcts.append(profit_pct)
+        self._hold_periods.append(hold_periods)
+
+        if pos.side == PositionSide.LONG:
+            self._long_trades += 1
+            self._long_profit += net_profit
+            if net_profit > 0:
+                self._long_win_trades += 1
+        elif pos.side == PositionSide.SHORT:
+            self._short_trades += 1
+            self._short_profit += net_profit
+            if net_profit > 0:
+                self._short_win_trades += 1
     
     def _calculate_equity(self, current_price: float) -> float:
         """计算当前权益"""

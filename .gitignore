@@ -45,3 +45,6 @@ data/prototypes/
 *.parquet.bak
 data/signal_analysis_state.json
 data/signal_analysis_state.json.tmp
+data/signal_cumulative_cache.json
+data/signal_cumulative_cache.json.tmp
+data/signal_cumulative_cache.json

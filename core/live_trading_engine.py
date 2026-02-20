@@ -369,9 +369,6 @@ class LiveTradingEngine:
         self._last_stoploss_side: Optional[str] = None   # 上次止损方向
         self._last_stoploss_time: float = 0.0             # 上次止损时间戳
         
-        # ── 反向下单测试模式 ──
-        self._reverse_signal_mode = PAPER_TRADING_CONFIG.get("REVERSE_SIGNAL_MODE", False)
-        
         # ── 精品信号模式 ──
         self.use_signal_mode: bool = True
         self._sm_today_count: int = 0
@@ -733,15 +730,21 @@ class LiveTradingEngine:
                 self._raw_on_state_update(state)
 
     def _bg_sync_loop(self):
-        """后台线程：周期性同步交易所持仓/余额，及时检测 TP/SL 成交"""
+        """后台线程：周期性同步交易所持仓/余额，及时检测 TP/SL 成交。
+        HTTP 调用移出锁外，避免与 dispatch 线程竞争大锁导致 WS Ping 超时。"""
         _BG_SYNC_INTERVAL = 10.0
         while self._running:
             try:
+                # 1. 锁内：仅读取当前持仓快照
                 with self._lock:
                     prev_had_pos = self._paper_trader.has_position()
-                    self._paper_trader.sync_from_exchange(force=False)
+
+                # 2. 锁外：执行 HTTP 慢操作（2-3 次网络请求）
+                self._paper_trader.sync_from_exchange(force=False)
+
+                # 3. 锁内：根据同步结果更新状态并通知 UI
+                with self._lock:
                     now_has_pos = self._paper_trader.has_position()
-                    # 同步后检测"有仓→无仓"状态转变，触发 UI 刷新
                     if prev_had_pos and not now_has_pos:
                         self._reset_position_state()
                         self.state.last_event = "📡 后台同步检测到平仓"
@@ -1426,13 +1429,10 @@ class LiveTradingEngine:
                 self._signal_live_monitor = SignalLiveMonitor()
             if self._df_buffer is not None and len(self._df_buffer) > 0:
                 df_idx = self._get_df_bar_idx()
-                # 获取精品池的 combo_keys（3状态 × 多空 × Top6 = 最多36个）
                 from core import signal_store as _sig_store
-                premium_pool = _sig_store.get_premium_pool()   # 全部精品池
-                premium_keys = [item["combo_key"] for item in premium_pool]
-                # 只检测精品池内的组合
+                # 监控全量累计组合（appear_rounds >= 2 由 SignalLiveMonitor 内置保护）
                 self._pending_signal_combos = self._signal_live_monitor.on_bar(
-                    self._df_buffer, df_idx, pool_keys=premium_keys
+                    self._df_buffer, df_idx, pool_keys=None
                 )
         except Exception as _e:
             print(f"[LiveEngine] 信号监控异常: {_e}")
@@ -1708,12 +1708,7 @@ class LiveTradingEngine:
             atr = self._get_current_atr()
             if atr <= 0:
                 atr = max(order.entry_price * 0.001, 1.0)
-            tp, sl = self._calculate_dynamic_tp_sl(
-                entry_price=order.entry_price,
-                direction=direction,
-                prototype=self._current_prototype if self.use_prototypes else None,
-                atr=atr,
-            )
+            tp, sl = self._calculate_fixed_tp_sl(order.entry_price, direction)
             tp_changed = order.take_profit is None
             sl_changed = order.stop_loss is None
             if order.take_profit is None:
@@ -1789,12 +1784,7 @@ class LiveTradingEngine:
         limit_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
         
         # 计算 TP/SL（基于实际入场价）
-        take_profit, stop_loss = self._calculate_dynamic_tp_sl(
-            entry_price=limit_price,
-            direction=direction,
-            prototype=None,  # 反手单不依赖原型
-            atr=atr
-        )
+        take_profit, stop_loss = self._calculate_fixed_tp_sl(limit_price, direction)
         
         tp_pct = abs(take_profit - limit_price) / limit_price * 100
         sl_pct = abs(stop_loss - limit_price) / limit_price * 100
@@ -1869,12 +1859,7 @@ class LiveTradingEngine:
         limit_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
         
         # 计算 TP/SL
-        take_profit, stop_loss = self._calculate_dynamic_tp_sl(
-            entry_price=limit_price,
-            direction=direction,
-            prototype=flip_proto,
-            atr=atr
-        )
+        take_profit, stop_loss = self._calculate_fixed_tp_sl(limit_price, direction)
         
         tp_pct = abs(take_profit - limit_price) / limit_price * 100
         sl_pct = abs(stop_loss - limit_price) / limit_price * 100
@@ -1979,13 +1964,9 @@ class LiveTradingEngine:
                 self.state.last_event = "⚠ [精品信号] 策略池为空"
                 return
 
-            # 构建 tier_map：combo_key -> "精品" 或 "高频"（两层）
-            _premium_pool = _sig_store.get_premium_pool()
-            _tier_map = {item["combo_key"]: item.get("tier", "精品") for item in _premium_pool}
-
             best_res = self._signal_live_monitor.get_best_for_state(
                 self._pending_signal_combos, cumulative, current_state,
-                tier_map=_tier_map,
+                tier_map=None,
             )
 
             if not best_res:
@@ -2030,6 +2011,17 @@ class LiveTradingEngine:
 
             combo_key, combo_entry, combo_tier = best_res
             direction = combo_entry.get('direction', 'long')
+
+            # 市场状态方向门禁：多头趋势只做多，空头趋势只做空，震荡市不限
+            if current_state == '多头趋势' and direction == 'short':
+                self.state.last_event = f"[精品信号] 多头趋势，跳过做空信号: {combo_key}"
+                print(f"[LiveEngine] [精品信号] 多头趋势，拒绝做空: {combo_key}")
+                return
+            if current_state == '空头趋势' and direction == 'long':
+                self.state.last_event = f"[精品信号] 空头趋势，跳过做多信号: {combo_key}"
+                print(f"[LiveEngine] [精品信号] 空头趋势，拒绝做多: {combo_key}")
+                return
+
             # 记录匹配情况（命中哪个、层级、差多少）
             triggered_keys = list(self._pending_signal_combos or [])
             triggered_entries = []
@@ -2039,7 +2031,7 @@ class LiveTradingEngine:
                 state_info = breakdown.get(current_state, {}) or {}
                 triggered_entries.append({
                     "key": key,
-                    "tier": _tier_map.get(key, "精品"),
+                    "tier": "全量",
                     "score": entry.get('综合评分', 0.0),
                     "avg_rate": entry.get('avg_rate', 0.0),
                     "overall_rate": entry.get('overall_rate', 0.0),
@@ -2201,15 +2193,10 @@ class LiveTradingEngine:
         try:
             from core import signal_store
             triggered_set = set(info["triggered_keys"])
-            long_pool = signal_store.get_premium_pool(
-                state=current_state, direction="long"
+            cumul = signal_store.get_cumulative()
+            info["pool_total"] = sum(
+                1 for e in cumul.values() if e.get("appear_rounds", 0) >= 2
             )
-            short_pool = signal_store.get_premium_pool(
-                state=current_state, direction="short"
-            )
-            info["pool_total"] = len(long_pool) + len(short_pool)
-            info["long_pool"] = self._annotate_pool_conditions(long_pool, "long", triggered_set)
-            info["short_pool"] = self._annotate_pool_conditions(short_pool, "short", triggered_set)
         except Exception:
             return info
         return info
@@ -2389,28 +2376,39 @@ class LiveTradingEngine:
                             direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
                             chosen_match_result = short_result  # 【指纹3D图】存储匹配结果
                     else:
-                        # 未知状态：双向匹配
-                        long_result = self._proto_matcher.match_entry(
-                            pre_entry_traj, direction="LONG", regime=match_regime
-                        )
-                        short_result = self._proto_matcher.match_entry(
-                            pre_entry_traj, direction="SHORT", regime=match_regime
-                        )
-                        long_sim = long_result.get("similarity", 0.0)
-                        short_sim = short_result.get("similarity", 0.0)
-                        if long_result.get("matched") and short_result.get("matched"):
-                            if long_sim >= short_sim:
+                        # 【震荡/未知状态】用近3根K线净涨跌决定单向匹配，避免双向盲猜逆势开仓
+                        _osc_dir = None
+                        if self._df_buffer is not None and df_idx >= 2:
+                            _closes = self._df_buffer['close'].iloc[df_idx - 2: df_idx + 1].values
+                            _opens  = self._df_buffer['open'].iloc[df_idx - 2: df_idx + 1].values
+                            _net    = float(sum(_closes - _opens))
+                            if _net > 0:
+                                _osc_dir = "LONG"
+                            elif _net < 0:
+                                _osc_dir = "SHORT"
+                        if _osc_dir is None:
+                            # 近3根完全平坦，方向不明，跳过
+                            print(f"[LiveEngine] 震荡状态近3根K线方向平坦，跳过入场")
+                        elif _osc_dir == "LONG":
+                            long_result = self._proto_matcher.match_entry(
+                                pre_entry_traj, direction="LONG", regime=match_regime
+                            )
+                            long_sim = long_result.get("similarity", 0.0)
+                            short_sim = 0.0
+                            if long_result.get("matched"):
                                 direction, chosen_proto, similarity = "LONG", long_result.get("best_prototype"), long_sim
                                 chosen_match_result = long_result  # 【指纹3D图】存储匹配结果
-                            else:
+                            print(f"[LiveEngine] 震荡偏多(近3根净↑)→只匹配LONG | 相似度={long_sim:.1%}")
+                        else:  # SHORT
+                            short_result = self._proto_matcher.match_entry(
+                                pre_entry_traj, direction="SHORT", regime=match_regime
+                            )
+                            long_sim = 0.0
+                            short_sim = short_result.get("similarity", 0.0)
+                            if short_result.get("matched"):
                                 direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
                                 chosen_match_result = short_result  # 【指纹3D图】存储匹配结果
-                        elif long_result.get("matched"):
-                            direction, chosen_proto, similarity = "LONG", long_result.get("best_prototype"), long_sim
-                            chosen_match_result = long_result  # 【指纹3D图】存储匹配结果
-                        elif short_result.get("matched"):
-                            direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
-                            chosen_match_result = short_result  # 【指纹3D图】存储匹配结果
+                            print(f"[LiveEngine] 震荡偏空(近3根净↓)→只匹配SHORT | 相似度={short_sim:.1%}")
 
                     # 【指纹3D图】将轨迹矩阵存入匹配结果，用于后续保存到 PaperOrder
                     if chosen_match_result is not None:
@@ -2587,12 +2585,6 @@ class LiveTradingEngine:
                 has_pending = self._paper_trader.has_pending_stop_orders(current_bar_idx=self._current_bar_idx)
 
                 price = kline.close
-                
-                # 【反向下单测试模式】
-                if self._reverse_signal_mode:
-                    original_direction = direction
-                    direction = "SHORT" if direction == "LONG" else "LONG"
-                    print(f"[LiveEngine] 🔄 [反向模式] 信号反转: {original_direction} → {direction}")
                 
                 side = OrderSide.LONG if direction == "LONG" else OrderSide.SHORT
                 
@@ -3065,12 +3057,7 @@ class LiveTradingEngine:
                 
                 # 【修复】TP/SL 基于实际入场价（limit_price）计算，而非 kline.close
                 # 否则实际 SL 距离 < 预期距离（如预期 0.2% 实际只有 0.13%），容易被扫损
-                take_profit, stop_loss = self._calculate_dynamic_tp_sl(
-                    entry_price=limit_price,
-                    direction=direction,
-                    prototype=chosen_proto if self.use_prototypes else None,
-                    atr=atr
-                )
+                take_profit, stop_loss = self._calculate_fixed_tp_sl(limit_price, direction)
 
                 # 构建详细的开仓原因说明
                 tp_pct = ((take_profit / limit_price) - 1) * 100 if direction == "LONG" else ((limit_price / take_profit) - 1) * 100
@@ -3543,23 +3530,37 @@ class LiveTradingEngine:
                         best_match_result = sp
                         best_proto = p
                 else:
-                    # 其他状态：双向匹配，取更高的
-                    lp = self._proto_matcher.match_entry(pre_entry_traj, direction="LONG", regime=match_regime)
-                    sp = self._proto_matcher.match_entry(pre_entry_traj, direction="SHORT", regime=match_regime)
-                    long_sim = lp.get("similarity", 0.0)
-                    short_sim = sp.get("similarity", 0.0)
-                    if long_sim >= short_sim and long_sim > 0 and lp.get("best_prototype"):
-                        best_sim, best_dir = long_sim, "LONG"
-                        p = lp.get("best_prototype")
-                        best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
-                        best_match_result = lp
-                        best_proto = p
-                    elif short_sim > 0 and sp.get("best_prototype"):
-                        best_sim, best_dir = short_sim, "SHORT"
-                        p = sp.get("best_prototype")
-                        best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
-                        best_match_result = sp
-                        best_proto = p
+                    # 【震荡/其他状态】用近3根K线净涨跌决定单向匹配，避免双向盲猜逆势开仓
+                    _osc_dir = None
+                    if self._df_buffer is not None and df_idx >= 2:
+                        _closes = self._df_buffer['close'].iloc[df_idx - 2: df_idx + 1].values
+                        _opens  = self._df_buffer['open'].iloc[df_idx - 2: df_idx + 1].values
+                        _net    = float(sum(_closes - _opens))
+                        if _net > 0:
+                            _osc_dir = "LONG"
+                        elif _net < 0:
+                            _osc_dir = "SHORT"
+                    if _osc_dir == "LONG":
+                        lp = self._proto_matcher.match_entry(pre_entry_traj, direction="LONG", regime=match_regime)
+                        long_sim = lp.get("similarity", 0.0)
+                        short_sim = 0.0
+                        if long_sim > 0 and lp.get("best_prototype"):
+                            best_sim, best_dir = long_sim, "LONG"
+                            p = lp.get("best_prototype")
+                            best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
+                            best_match_result = lp
+                            best_proto = p
+                    elif _osc_dir == "SHORT":
+                        sp = self._proto_matcher.match_entry(pre_entry_traj, direction="SHORT", regime=match_regime)
+                        long_sim = 0.0
+                        short_sim = sp.get("similarity", 0.0)
+                        if short_sim > 0 and sp.get("best_prototype"):
+                            best_sim, best_dir = short_sim, "SHORT"
+                            p = sp.get("best_prototype")
+                            best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
+                            best_match_result = sp
+                            best_proto = p
+                    # else: 近3根完全平坦，方向不明，跳过不匹配
             
             # 【指纹3D图】更新多维相似度状态
             self._update_similarity_state(best_sim, best_fp, best_match_result, best_proto)
@@ -3952,7 +3953,69 @@ class LiveTradingEngine:
             self.state.hold_reason = f"新开仓保护期({protection_sec}秒，剩余{remaining:.0f}秒)，止损暂缓、允许止盈。"
             self.state.exit_reason = "保护期内不执行相似度离场和追踪止损调整。"
             return
-        
+
+        # ══════════════════════════════════════════════════════════
+        # 【追踪止盈止损系统】阶段1止损上移 + 时间衰减 + 阶段2追踪止损
+        # ══════════════════════════════════════════════════════════
+        try:
+            lev = float(getattr(self._paper_trader, 'leverage', 1) or 1)
+            stage_2_active = getattr(order, 'stage_2_active', False)
+            is_long = (order.side.value == "LONG")
+
+            if not stage_2_active and order.partial_tp_count == 0:
+                # ── 阶段1：动态止损调整 ──
+                peak_pct = order.peak_profit_pct  # 杠杆后峰值收益%
+                ever_reached = getattr(order, 'ever_reached_6pct', False)
+
+                if not ever_reached and peak_pct >= _ptc.get("BREAKEVEN_THRESHOLD_PCT", 6.0):
+                    # 浮盈首次达到阈值 → 止损上移
+                    order.ever_reached_6pct = True
+                    sl_pnl_pct = _ptc.get("BREAKEVEN_SL_PCT", -3.0) / 100  # 杠杆后
+                    sl_price_chg = sl_pnl_pct / lev                          # 价格变动幅度
+                    new_sl = order.entry_price * (1 + sl_price_chg) if is_long else order.entry_price * (1 - sl_price_chg)
+                    current_sl = order.stop_loss or 0.0
+                    # 止损只能对多头上移、空头下移
+                    if (is_long and new_sl > current_sl) or (not is_long and new_sl < current_sl):
+                        print(f"[LiveEngine] 📈 阶梯止损上移: 浮盈峰值={peak_pct:.1f}% >= {_ptc.get('BREAKEVEN_THRESHOLD_PCT', 6.0)}% "
+                              f"→ SL {current_sl:.2f} → {new_sl:.2f} (-3%)")
+                        order.stop_loss = new_sl
+                        if hasattr(self._paper_trader, '_update_stage1_sl_on_exchange'):
+                            self._paper_trader._update_stage1_sl_on_exchange(new_sl)
+
+                elif not ever_reached and _ptc.get("TIME_DECAY_ENABLED", True):
+                    # 时间衰减止损（未到达+6%阈值时）
+                    hold_bars = order.hold_bars
+                    bar2 = _ptc.get("TIME_DECAY_BAR_2", 180)
+                    bar1 = _ptc.get("TIME_DECAY_BAR_1", 120)
+                    sl2_pnl = _ptc.get("TIME_DECAY_SL_2", -5.0) / 100  # 杠杆后
+                    sl1_pnl = _ptc.get("TIME_DECAY_SL_1", -10.0) / 100
+                    decay_sl_pct = None
+                    if hold_bars > bar2:
+                        decay_sl_pct = sl2_pnl
+                    elif hold_bars > bar1:
+                        decay_sl_pct = sl1_pnl
+
+                    if decay_sl_pct is not None:
+                        sl_price_chg = decay_sl_pct / lev
+                        new_sl = order.entry_price * (1 + sl_price_chg) if is_long else order.entry_price * (1 - sl_price_chg)
+                        current_sl = order.stop_loss or 0.0
+                        if (is_long and new_sl > current_sl) or (not is_long and new_sl < current_sl):
+                            threshold = bar2 if hold_bars > bar2 else bar1
+                            pct_label = _ptc.get("TIME_DECAY_SL_2", -5.0) if hold_bars > bar2 else _ptc.get("TIME_DECAY_SL_1", -10.0)
+                            print(f"[LiveEngine] ⏱ 时间衰减止损: 持仓={hold_bars}根 > {threshold}根 "
+                                  f"→ SL {current_sl:.2f} → {new_sl:.2f} ({pct_label:.0f}%)")
+                            order.stop_loss = new_sl
+                            if hasattr(self._paper_trader, '_update_stage1_sl_on_exchange'):
+                                self._paper_trader._update_stage1_sl_on_exchange(new_sl)
+
+            elif stage_2_active or order.partial_tp_count > 0:
+                # ── 阶段2：追踪止损（每根K线更新）──
+                if hasattr(self._paper_trader, '_update_trailing_stop'):
+                    self._paper_trader._update_trailing_stop(kline.close)
+
+        except Exception as _e:
+            pass  # 止损调整失败不影响主逻辑
+
         # ══════════════════════════════════════════════════════════
         # 【新增】市场因素一致性监控：市场状态 + MACD + KDJ
         # 市场反转多数投票检测（2/3即触发）
@@ -3975,44 +4038,8 @@ class LiveTradingEngine:
         regime_change = self._classify_holding_regime_change(regime_at_entry, current_regime, order.side)
         self.state.holding_regime_change = regime_change
 
-        # ══════════════════════════════════════════════════════════
-        # 持仓思维链 3：TP/SL 要不要重算或继续等（反转/ATR 变化→重算，弱化→仅收紧 SL）
-        # ══════════════════════════════════════════════════════════
-        # 首根持仓 K 线：记录 ATR 基线，供后续 ATR 变化重算使用
-        if order.hold_bars == 1 and atr > 0:
-            self._last_tpsl_atr = atr
-        atr_change_pct = 0.0
-        if self._last_tpsl_atr is not None and self._last_tpsl_atr > 0:
-            atr_change_pct = abs(atr - self._last_tpsl_atr) / self._last_tpsl_atr
-        atr_changed_significantly = atr_change_pct >= PAPER_TRADING_CONFIG.get("TPSL_ATR_CHANGE_RECALC_PCT", 0.20)
-
-        if order.hold_bars >= 3:
-            if regime_change == "反转" or (atr_changed_significantly and regime_change != "弱化·震荡"):
-                self.state.tpsl_action = "recalc"
-                if self._current_prototype is not None and atr > 0:
-                    direction = "LONG" if order.side == OrderSide.LONG else "SHORT"
-                    new_tp, new_sl = self._calculate_dynamic_tp_sl(
-                        entry_price=order.entry_price,
-                        direction=direction,
-                        prototype=self._current_prototype,
-                        atr=atr,
-                    )
-                    order.take_profit = new_tp
-                    order.stop_loss = new_sl
-                    self._last_tpsl_atr = atr
-                    reason = "市场反转" if regime_change == "反转" else f"ATR变化{atr_change_pct:.0%}"
-                    print(f"[LiveEngine] {reason} → 重算 TP/SL: TP={new_tp:.2f}, SL={new_sl:.2f}")
-            elif regime_change == "弱化·震荡":
-                # 已移除「弱化·震荡：收紧至保本」逻辑，不再把止损挪到入场价
-                self.state.tpsl_action = "hold"
-            else:
-                self.state.tpsl_action = "hold"
-        else:
-            self.state.tpsl_action = "hold"
-
-        # 分段止损（亏损时分批减仓）、分段止盈（盈利时分批减仓）
-        self._check_staged_partial_sl(kline)
-        self._check_staged_partial_tp(kline)
+        # TP/SL 固定于入场时，不随市场状态重算
+        self.state.tpsl_action = "hold"
 
         # 已移除动量衰减离场/收紧，仅保留分段止盈与分段止损
         # 已移除市场恶化减仓（用户不需要）
@@ -4183,18 +4210,8 @@ class LiveTradingEngine:
                             print(f"  ├─ new_proto_id: {new_proto_id}")
                             print(f"  └─ regime_short: {regime_short}")
 
-                        # 【新增】同步更新 TP/SL 目标
-                        atr = self._get_current_atr()
-                        new_tp, new_sl = self._calculate_dynamic_tp_sl(
-                            entry_price=order.entry_price,
-                            direction=direction,
-                            prototype=new_proto,
-                            atr=atr
-                        )
-                        order.take_profit = new_tp
-                        order.stop_loss = new_sl
-                        self._last_tpsl_atr = atr
-                        print(f"[LiveEngine] TP/SL 已随原型同步更新: TP={new_tp:.2f}, SL={new_sl:.2f}")
+                        # TP/SL 固定于入场时，相似度重匹配不更新 TP/SL
+                        # order.take_profit / order.stop_loss 保持不变
                 
                 # ══════════════════════════════════════════════════════════
                 # 阶段3：离场模式检测
@@ -4321,144 +4338,25 @@ class LiveTradingEngine:
             print(f"[LiveEngine] 持仓追踪失败: {e}")
             traceback.print_exc()
     
-    def _calculate_dynamic_tp_sl(self, entry_price: float, direction: str,
-                                  prototype, atr: float):
+    def _calculate_fixed_tp_sl(self, entry_price: float, direction: str):
         """
-        【三因子融合 + 自适应学习】基于原型历史表现 + ATR波动率 + 固定下限 + 学习的最优TP
-        
-        三因子设计：
-        1. 原型历史表现因子：基于avg_profit_pct和win_rate
-        2. ATR波动率因子：至少2.0倍ATR，适应市场波动
-        3. 固定百分比下限：至少0.15%（BTC约$100），避免噪声止损
-        4. **自适应学习因子（新增）**：从实盘历史峰值利润学习最优 TP
-        
-        止损 = max(三因子)，永远不会太紧
-        止盈 = 学习器建议（如果有足够样本） OR 原型建议（回退）
-        
-        Args:
-            entry_price: 入场价格
-            direction: LONG/SHORT
-            prototype: 匹配的原型（Prototype对象）
-            atr: 当前ATR
-        
+        框架固定止盈止损：SL=-16%/lev（价格-0.8%），TP1=+12%/lev（价格+0.6%）
+        基于 PAPER_TRADING_CONFIG 中的 STAGED_SL_PCT 和 STAGED_TP_PCT。
+
         Returns:
             (take_profit_price, stop_loss_price)
         """
-        import numpy as np
-        from config import PAPER_TRADING_CONFIG
-        leverage = float(self._paper_trader.leverage)
-        
-        # 【新增】获取原型指纹，用于查询学习器
-        proto_fp = ""
-        if prototype and getattr(prototype, 'prototype_id', None):
-            regime_short = prototype.regime[:2] if prototype.regime else ""
-            proto_fp = f"proto_{prototype.direction}_{prototype.prototype_id}_{regime_short}"
-        
-        # ========== 因子1: 基于原型历史表现 ==========
-        if prototype and getattr(prototype, 'member_count', 0) >= 10:
-            raw_profit_pct = np.clip(prototype.avg_profit_pct, 0.5, 10.0)
-            price_move_pct = raw_profit_pct / leverage / 100.0  # 还原为价格百分比
-            win_rate = prototype.win_rate
-            
-            # 根据胜率调整止盈目标（高胜率更激进）
-            if win_rate >= 0.75:
-                price_move_pct *= 1.2
-            elif win_rate < 0.60:
-                price_move_pct *= 0.8
-        else:
-            # 回退：使用ATR倍数
-            price_move_pct = (atr * self.take_profit_atr) / entry_price
-            win_rate = 0.5
-        
-        # 【新增】因子4: 自适应学习的最优 TP（基于历史峰值利润）
-        learned_tp_pct = None
-        learned_reason = ""
-        if self._exit_learning_enabled and self._exit_learner and proto_fp:
-            min_samples = PAPER_TRADING_CONFIG.get("EXIT_LEARNING_MIN_SAMPLES", 10)
-            proto_learning = self._exit_learner.prototypes.get(proto_fp)
-            if proto_learning and len(proto_learning.peak_profit_history) >= min_samples:
-                # 使用学习到的最优 TP（ATR 倍数）
-                learned_tp_atr_mult = proto_learning.optimal_tp_atr_multiplier
-                learned_tp_pct = (atr * learned_tp_atr_mult) / entry_price
-                learned_reason = f"学习样本={len(proto_learning.peak_profit_history)}笔，最优{proto_learning.optimal_tp_pct:.1f}% → {learned_tp_atr_mult:.1f}×ATR"
-                # 使用学习的 TP 替换原型建议
-                price_move_pct = learned_tp_pct
-        
-        # ========== 因子2: ATR波动率止损（市场适应性）==========
-        atr_multiplier = PAPER_TRADING_CONFIG.get("ATR_SL_MULTIPLIER", 3.0)
-        atr_based_sl_pct = (atr / entry_price) * atr_multiplier
-        
-        # ========== 因子3: 固定百分比下限（避免噪声止损）==========
-        # BTC 1分钟线，至少 0.5% 距离（约 $475），挡住正常波动
-        min_fixed_pct = PAPER_TRADING_CONFIG.get("MIN_SL_PCT", 0.005)
-        
-        # ========== 风险收益比（基于胜率）==========
-        min_rr = float(PAPER_TRADING_CONFIG.get("MIN_RR_RATIO", 1.4))
-        if win_rate >= 0.70:
-            risk_reward_ratio = min_rr * 1.2  # 高胜率加成 20%
-        else:
-            risk_reward_ratio = min_rr
-        
-        # 原型建议的止损（按风险收益比）
-        prototype_sl_pct = price_move_pct / risk_reward_ratio
-        
-        # ========== 综合：止损取三因子最大值 ==========
-        stop_loss_pct = max(prototype_sl_pct, atr_based_sl_pct, min_fixed_pct)
-        
-        # ========== 止盈：至少要比止损大，保证盈亏比 ==========
-        take_profit_pct = max(price_move_pct, stop_loss_pct * risk_reward_ratio)
-        
-        # ========== 计算最终价格 ==========
+        from config import PAPER_TRADING_CONFIG as _ptc
+        lev = float(_ptc.get("LEVERAGE_DEFAULT", 20))
+        sl_pct  = _ptc.get("STAGED_SL_PCT",  16.0) / 100.0 / lev   # 0.008
+        tp1_pct = _ptc.get("STAGED_TP_PCT",  12.0) / 100.0 / lev   # 0.006
         if direction == "LONG":
-            take_profit = entry_price * (1 + take_profit_pct)
-            stop_loss = entry_price * (1 - stop_loss_pct)
-        else:  # SHORT
-            take_profit = entry_price * (1 - take_profit_pct)
-            stop_loss = entry_price * (1 + stop_loss_pct)
-        
-        # ========== 最终安全检查：确保止损距离至少 min_fixed_pct ==========
-        actual_sl_distance = abs(stop_loss - entry_price)
-        min_sl_distance = entry_price * min_fixed_pct
-        if actual_sl_distance < min_sl_distance:
-            print(f"[LiveEngine] ⚠️ 止损距离过小({actual_sl_distance:.2f})，强制调整到 {min_sl_distance:.2f}")
-            if direction == "LONG":
-                stop_loss = entry_price * (1 - min_fixed_pct)
-            else:
-                stop_loss = entry_price * (1 + min_fixed_pct)
-            # 重新计算实际百分比
-            stop_loss_pct = min_fixed_pct
-        
-        # ========== 位置评分微调：位置极佳时 TP 拉远（取消 SL 收紧，避免破坏最小止损保护）==========
-        pos_score, _ = self._calc_position_score(direction)
-        if pos_score > 40:
-            # TP 距离拉远 10%
-            if direction == "LONG":
-                take_profit = entry_price + (take_profit - entry_price) * 1.1
-            else:
-                take_profit = entry_price - (entry_price - take_profit) * 1.1
-            print(f"[LiveEngine] 位置评分{pos_score:.0f}>40，TP拉远10%（SL保持不变，维持最小保护）")
-        
-        # ========== 最终安全检查：确保止损距离不低于最小值（防止任何微调破坏保护）==========
-        final_sl_distance = abs(stop_loss - entry_price)
-        min_sl_distance = entry_price * min_fixed_pct
-        if final_sl_distance < min_sl_distance:
-            print(f"[LiveEngine] ⚠️ 最终SL过小({final_sl_distance:.2f})，强制修正到 {min_sl_distance:.2f}")
-            if direction == "LONG":
-                stop_loss = entry_price * (1 - min_fixed_pct)
-            else:
-                stop_loss = entry_price * (1 + min_fixed_pct)
-            stop_loss_pct = min_fixed_pct
-        
-        # 详细日志
-        print(f"[LiveEngine] 三因子TP/SL:")
-        if learned_tp_pct is not None:
-            print(f"  - 【学习因子】: {learned_reason}")
-        print(f"  - 原型因子: {prototype_sl_pct*100:.3f}% (收益{price_move_pct*100:.3f}% / RR={risk_reward_ratio})")
-        print(f"  - ATR因子:  {atr_based_sl_pct*100:.3f}% ({atr:.2f}*{atr_multiplier})")
-        print(f"  - 固定下限: {min_fixed_pct*100:.3f}%")
-        print(f"  → 最终SL={stop_loss_pct*100:.3f}% (${abs(stop_loss-entry_price):.2f}) | "
-              f"TP={take_profit_pct*100:.3f}% (${abs(take_profit-entry_price):.2f})")
-        
+            take_profit = entry_price * (1 + tp1_pct)
+            stop_loss   = entry_price * (1 - sl_pct)
+        else:
+            take_profit = entry_price * (1 - tp1_pct)
+            stop_loss   = entry_price * (1 + sl_pct)
+        print(f"[LiveEngine] 固定TP/SL: TP={take_profit:.2f}(+{tp1_pct*100:.3f}%) SL={stop_loss:.2f}(-{sl_pct*100:.3f}%)")
         return take_profit, stop_loss
     
     def _on_order_update(self, order: PaperOrder):

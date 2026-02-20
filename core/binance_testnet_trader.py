@@ -58,6 +58,9 @@ class BinanceTestnetTrader:
         # Futures Testnet
         self.base_url = "https://testnet.binancefuture.com"
         self.session = requests.Session()
+        self._time_offset_ms = 0
+        self._last_time_sync_ts = 0.0
+        self._time_sync_interval_sec = 60.0
         self._open_orders_cache = None
         self._open_orders_cache_ts = 0.0
         self._open_orders_cache_ttl = 10.0
@@ -126,6 +129,7 @@ class BinanceTestnetTrader:
 
         self._validate_credentials()
         self._load_symbol_filters()
+        self._sync_server_time(force=True)
         self._set_leverage(self.leverage)
         self._sync_from_exchange()
         # 启动时清理残留保护单（避免旧订单干扰）
@@ -143,16 +147,38 @@ class BinanceTestnetTrader:
             raise ValueError("必须提供 Binance Testnet API Key/Secret")
 
     def _timestamp(self) -> int:
-        return int(time.time() * 1000)
+        if (time.time() - self._last_time_sync_ts) > self._time_sync_interval_sec:
+            self._sync_server_time()
+        return int(time.time() * 1000 + self._time_offset_ms)
+
+    def _sync_server_time(self, force: bool = False) -> bool:
+        """同步服务器时间，避免时间戳偏移导致 -1021 错误"""
+        now = time.time()
+        if not force and (now - self._last_time_sync_ts) < self._time_sync_interval_sec:
+            return True
+        try:
+            url = f"{self.base_url}/fapi/v1/time"
+            r = self.session.get(url, timeout=5)
+            r.raise_for_status()
+            server_time = r.json().get("serverTime")
+            if server_time:
+                local_ms = int(time.time() * 1000)
+                self._time_offset_ms = int(server_time) - local_ms
+                self._last_time_sync_ts = now
+                return True
+        except Exception as e:
+            print(f"[BinanceTrader] ⚠️ 时间同步失败: {e}")
+        return False
 
     def _sign(self, params: dict) -> str:
         query = urlencode(params, doseq=True)
         return hmac.new(self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def _signed_request(self, method: str, path: str, params: Optional[dict] = None) -> dict:
+    def _signed_request(self, method: str, path: str, params: Optional[dict] = None, retry_on_timestamp: bool = True) -> dict:
         if time.time() < self._rate_limit_until:
             raise Exception("Binance API rate limit cooldown active")
         params = dict(params or {})
+        params.pop("signature", None)
         params["timestamp"] = self._timestamp()
         params["recvWindow"] = 5000
         params["signature"] = self._sign(params)
@@ -176,6 +202,9 @@ class BinanceTestnetTrader:
                 print(f"[BinanceAPI] ❌ {method} {path} 失败")
                 print(f"[BinanceAPI] 错误码: {error_code} | 消息: {error_msg}")
                 print(f"[BinanceAPI] 请求参数: {safe_params}")
+                if str(error_code) == "-1021" and retry_on_timestamp:
+                    self._sync_server_time(force=True)
+                    return self._signed_request(method, path, params, retry_on_timestamp=False)
                 if str(error_code) == "-1003" or "Too many requests" in str(error_msg):
                     self._rate_limit_until = time.time() + self._rate_limit_backoff_sec
                 raise Exception(f"Binance API {error_code}: {error_msg}")
@@ -191,6 +220,9 @@ class BinanceTestnetTrader:
             print(f"[BinanceAPI] ❌ {method} {path} 业务错误(HTTP 200)")
             print(f"[BinanceAPI] 错误码: {error_code} | 消息: {error_msg}")
             print(f"[BinanceAPI] 请求参数: {safe_params}")
+            if str(error_code) == "-1021" and retry_on_timestamp:
+                self._sync_server_time(force=True)
+                return self._signed_request(method, path, params, retry_on_timestamp=False)
             if str(error_code) == "-1003" or "Too many requests" in str(error_msg):
                 self._rate_limit_until = time.time() + self._rate_limit_backoff_sec
             raise Exception(f"Binance API {error_code}: {error_msg}")
@@ -1013,66 +1045,59 @@ class BinanceTestnetTrader:
 
     def _place_exchange_tp_sl(self, order: PaperOrder) -> None:
         """
-        【阶梯基准止盈止损系统】
-        
-        核心理念：
-        - 止盈分三档锁定利润（TP1→TP2→TP3），每档 +7%
-        - 止损不分档，始终全平剩余仓位，每档 -5%
-        - 阶梯基准：TP1基于入场价，TP2基于TP1成交价，TP3基于TP2成交价
-        - 止损跟随：SL1基于入场价，SL2基于TP1成交价，SL3基于TP2成交价
-        
-        开仓时只挂：
-        - TP1: +7%（基于入场价），平仓 50%
-        - SL:  -5%（基于入场价），全平 100%
-        
-        后续挂单由 _place_next_stage_orders 处理
+        【两档框架止盈止损系统】
+
+        开仓时挂：
+        - TP1: 杠杆后 +12%（价格 +0.60%），平仓 70%
+        - SL:  杠杆后 -16%（价格 -0.80%），全平 100%
+
+        TP1 成交后由 _place_next_stage_orders 处理：
+        - TP2: 基于入场价 +24%/lev（价格 +1.20%），平剩余 30%
+        - 保本SL: 入场价，平剩余 30%
         """
         if order is None:
             return
-        
+
         from config import PAPER_TRADING_CONFIG as _ptc
-        
-        # 获取配置：统一的止盈/止损收益率
+
         lev = max(1, int(getattr(self, "leverage", 1)))
-        tp_return = _ptc.get("STAGED_TP_PCT", 7.0) / 100   # 每档止盈收益率 7%
-        sl_return = _ptc.get("STAGED_SL_PCT", 5.0) / 100   # 止损收益率 5%
-        
+        tp_return = _ptc.get("STAGED_TP_PCT", 12.0) / 100   # TP1 杠杆后收益率 12%
+        sl_return = _ptc.get("STAGED_SL_PCT", 16.0) / 100   # SL 杠杆后收益率 16%
+
         # 价格变动 = 收益率 / 杠杆
         tp_pct = tp_return / lev
         sl_pct = sl_return / lev
-        
-        # 仓位分配
-        ratio1 = _ptc.get("STAGED_TP_RATIO_1", 0.50)  # 第1档 50%
-        
+
+        # TP1 平仓 70%
+        ratio1 = _ptc.get("STAGED_TP_RATIO_1", 0.70)
+
         entry_price = order.entry_price
         total_qty = order.quantity
         is_long = (order.side == OrderSide.LONG)
         exit_side = "SELL" if is_long else "BUY"
         p_prec = len(str(self._price_tick).split('.')[-1]) if '.' in str(self._price_tick) else 0
         q_prec = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
-        
+
         # 清除旧的保护单
         self._cancel_exchange_tp_sl(silent=True)
-        
-        # 计算第1档价格（基于入场价）
+
+        # 计算 TP1 和 SL 价格（基于入场价）
         if is_long:
             tp1_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
         else:
             tp1_price = entry_price * (1 - tp_pct)
             sl_price = entry_price * (1 + sl_pct)
-        
-        # 第1档仓位 = 总仓位 × 50%
+
+        # TP1 仓位 = 总仓位 × 70%
         qty1 = self._round_step(total_qty * ratio1, self._qty_step)
 
-        # 止损仓位 = 全部剩余（开仓时 = 100%）
+        # 止损仓位 = 全部（100%）
         sl_qty = self._round_step(total_qty, self._qty_step)
 
-        
-        # 保存阶梯配置（用于后续挂单）
+        # 保存框架配置（用于 _place_next_stage_orders）
         self._staged_config = {
             "entry_price": entry_price,
-            "current_base_price": entry_price,  # 当前阶梯基准价（会随TP成交更新）
             "total_qty": total_qty,
             "is_long": is_long,
             "exit_side": exit_side,
@@ -1082,14 +1107,14 @@ class BinanceTestnetTrader:
             "sl_return": sl_return,
             "tp_pct": tp_pct,
             "sl_pct": sl_pct,
-            "current_tier": 1,  # 当前档位
+            "current_tier": 1,
             "leverage": lev,
         }
-        
-        print(f"[BinanceTrader] 【阶梯基准系统】杠杆={lev}x | 每档TP=+{tp_return*100:.0f}% | SL=-{sl_return*100:.0f}%")
+
+        print(f"[BinanceTrader] 【两档框架系统】杠杆={lev}x | TP1=+{tp_return*100:.0f}% | SL=-{sl_return*100:.0f}%")
         print(f"[BinanceTrader] 开仓挂单: TP1={tp1_price:.{p_prec}f} (平{ratio1*100:.0f}%) | SL={sl_price:.{p_prec}f} (全平)")
-        
-        # 挂 TP1（限价单，平仓 50%）
+
+        # 挂 TP1（限价单，平仓 70%）+ SL（止损单，全平 100%）
         n = self._place_tiered_tp_sl(
             tp_price=tp1_price,
             tp_qty=qty1,
@@ -1099,9 +1124,9 @@ class BinanceTestnetTrader:
             tp_pct=tp_return * 100,
             sl_pct=sl_return * 100,
         )
-        
+
         if n == 2:
-            print(f"[BinanceTrader] 🎯 第1档就位: TP1(平50%) + SL(全平) | TP成交后将基于成交价挂第2档")
+            print(f"[BinanceTrader] 🎯 框架第1档就位: TP1(平{ratio1*100:.0f}%) + SL(全平) | TP成交后挂TP2(平剩余30%)+保本SL")
         elif n > 0:
             print(f"[BinanceTrader] ⚠ 第1档部分挂单成功 ({n}/2)")
         else:
@@ -1344,112 +1369,270 @@ class BinanceTestnetTrader:
 
     def _place_next_stage_orders(self, from_tier: int, filled_type: str, tier_fill_price: Optional[float] = None) -> None:
         """
-        【阶梯基准系统】TP成交后挂下一档
-        
+        【追踪止损框架】TP1 成交后进入阶段2
+
         核心逻辑：
-        - TP成交：基于TP成交价计算新的 TP + SL，挂下一档
-        - SL成交：全平剩余，交易结束，无需挂单
-        
-        阶梯基准：
-        - TP1成交后：TP2 = TP1成交价 + 7%，SL2 = TP1成交价 - 5%
-        - TP2成交后：TP3 = TP2成交价 + 7%，SL3 = TP2成交价 - 5%
+        - TP1 成交：仅挂保本SL（入场价），不挂TP2；追踪止损由 _update_trailing_stop() 动态维护
+        - SL 成交：全平剩余，交易结束
+        - 阶段2无TP2上限，让利润奔跑直到追踪止损触发
         """
 
         cfg = self._staged_config
         if not cfg or not self.current_position:
             return
-        
+
         # 取消同档的另一侧单（TP成交取消SL，SL成交取消TP）
         self._cancel_other_stage_order(filled_type, from_tier)
-        
-        # 如果是 SL 成交，全平剩余，交易结束
+
+        # SL 成交：全平剩余，交易结束
         if filled_type == "SL":
             print(f"[BinanceTrader] 🛑 止损第{from_tier}档成交，全平剩余仓位，交易结束")
-            # 兜底：若交易所止损成交后仍残留小数点仓位，强制市价清理
             self._force_close_remaining_position_if_any(reason=f"SL{from_tier}")
             self._staged_config = None
             self._staged_orders.clear()
             return
-        
-        # TP 成交，准备挂下一档
+
+        # TP1 成交后进入阶段2（from_tier == 1）
+        # 阶段2不再有固定TP2，追踪止损由 _update_trailing_stop() 动态维护
+        if from_tier >= 2:
+            # 追踪止损已触发（由 _update_trailing_stop 平仓），扫尾检查
+            print(f"[BinanceTrader] ✅ 阶段2已结束，扫尾检查残余仓位")
+            self._force_close_remaining_position_if_any(reason="trailing_sl_final")
+            self._staged_config = None
+            return
+
+        # 查询交易所仓位
         pos = self._get_position()
         amt = float(pos.get("positionAmt", 0.0)) if pos else 0.0
         if abs(amt) < 1e-12:
-            print(f"[BinanceTrader] ⚠ TP{from_tier}成交后仓位为0，无需挂下一档")
+            print(f"[BinanceTrader] ⚠ TP{from_tier}成交后仓位为0，无需挂第2档")
             self._staged_config = None
             return
-        
-        # 下一档
-        next_tier = from_tier + 1
-        if next_tier > 3:
-            print(f"[BinanceTrader] ✅ 所有3档止盈已完成")
-            self._staged_config = None
-            return
-        
 
-        # 获取配置参数
+        # 从配置中取参数
+        entry_price = cfg["entry_price"]
         is_long = cfg["is_long"]
-        tp_pct = cfg["tp_pct"]
-        sl_pct = cfg["sl_pct"]
-        tp_return = cfg["tp_return"]
-        sl_return = cfg["sl_return"]
         p_prec = cfg["p_prec"]
         q_prec = cfg["q_prec"]
-        
-        # 新的阶梯基准价 = 上一档 TP 成交价
-        if tier_fill_price and tier_fill_price > 0:
-            new_base_price = tier_fill_price
-        else:
-            # 如果没有成交价，用当前 mark price 估算
-            new_base_price = self._get_mark_price()
-        
-        # 更新阶梯基准
-        cfg["current_base_price"] = new_base_price
-        cfg["current_tier"] = next_tier
-        
-        # 计算新的 TP 和 SL 价格（基于新基准）
-        if is_long:
-            next_tp_price = new_base_price * (1 + tp_pct)
-            next_sl_price = new_base_price * (1 - sl_pct)
-        else:
-            next_tp_price = new_base_price * (1 - tp_pct)
-            next_sl_price = new_base_price * (1 + sl_pct)
-        
-        # 计算仓位
-        from config import PAPER_TRADING_CONFIG as _ptc
-        remaining_qty = self._round_step(abs(amt), self._qty_step)
-        
-        if next_tier == 2:
-            ratio2 = _ptc.get("STAGED_TP_RATIO_2", 0.50)  # 剩余的 50%
-            tp_qty = self._round_step(remaining_qty * ratio2, self._qty_step)
-        else:  # tier 3
-            tp_qty = remaining_qty  # 全平剩余
-        
-        sl_qty = remaining_qty  # 止损始终全平剩余
-        
-        print(f"[BinanceTrader] 📊 第{next_tier}档阶梯基准: TP{from_tier}成交价={new_base_price:.{p_prec}f}")
-        print(f"[BinanceTrader] 📊 计算: TP{next_tier}={next_tp_price:.{p_prec}f} (+{tp_return*100:.0f}%) | "
-              f"SL{next_tier}={next_sl_price:.{p_prec}f} (-{sl_return*100:.0f}%)")
-        print(f"[BinanceTrader] 📊 仓位: TP{next_tier}平{tp_qty:.{q_prec}f} | SL{next_tier}全平{sl_qty:.{q_prec}f}")
-        
-        # 挂新的 TP + SL
-        n = self._place_tiered_tp_sl(
-            tp_price=next_tp_price,
-            tp_qty=tp_qty,
-            sl_price=next_sl_price,
-            sl_qty=sl_qty,
-            tier=next_tier,
-            tp_pct=tp_return * 100,
-            sl_pct=sl_return * 100,
-        )
-        
-        if n == 2:
-            print(f"[BinanceTrader] 🎯 第{next_tier}档就位: TP(平{'全部' if next_tier == 3 else '50%'}) + SL(全平)")
-        elif n > 0:
-            print(f"[BinanceTrader] ⚠ 第{next_tier}档部分挂单成功 ({n}/2)")
-        else:
-            print(f"[BinanceTrader] 🚨 第{next_tier}档挂单失败！")
 
+        # 保本止损 = 入场价（阶段2的初始止损）
+        breakeven_sl = entry_price
+
+        # 剩余仓位（= 原始总量的 30%）
+        remaining_qty = self._round_step(abs(amt), self._qty_step)
+
+        cfg["current_tier"] = 2
+
+        # 更新本地订单止损为入场价（保本），并记录阶段2开始
+        self.current_position.stop_loss = entry_price
+        self.current_position.stage_2_active = True  # 标记阶段2追踪止损已激活
+
+        print(f"[BinanceTrader] 📊 TP1 成交，进入阶段2（追踪止损模式）")
+        print(f"[BinanceTrader] 📊 入场价={entry_price:.{p_prec}f} | 保本SL={breakeven_sl:.{p_prec}f} | 剩余={remaining_qty:.{q_prec}f}")
+
+        # 仅挂保本SL（止损单），不挂TP2
+        exit_side = cfg["exit_side"]
+        sl_price_rounded = self._round_step(breakeven_sl, self._price_tick)
+        sl_price_str = f"{sl_price_rounded:.{p_prec}f}"
+        sl_qty_str = f"{remaining_qty:.{q_prec}f}"
+
+        try:
+            params = {
+                "symbol": self.symbol, "side": exit_side, "type": "STOP_MARKET",
+                "stopPrice": sl_price_str, "quantity": sl_qty_str, "reduceOnly": "true",
+                "workingType": "CONTRACT_PRICE",
+                "newClientOrderId": self._new_client_order_id("SL2"),
+            }
+            print(f"[BinanceTrader] 📤 SL2 (保本) 下单请求: {params}")
+            resp = self._place_order(params)
+            oid = int(resp.get("orderId", 0) or 0)
+            status = str(resp.get("status", "")).upper()
+            print(f"[BinanceTrader] 📥 SL2 响应: orderId={oid} status={status}")
+
+            if oid > 0:
+                self._staged_orders.append({
+                    "order_id": oid, "type": "SL", "stage": 2,
+                    "price": sl_price_rounded, "quantity": remaining_qty,
+                    "pct": 0.0, "filled": (status == "FILLED"), "is_full_close": True,
+                })
+                print(f"[BinanceTrader] 🎯 阶段2保本SL就位: STOP @ {sl_price_str} | 追踪止损将动态更新")
+            else:
+                print(f"[BinanceTrader] 🚨 阶段2保本SL挂单失败！")
+        except Exception as e:
+            print(f"[BinanceTrader] ❌ 阶段2保本SL挂单失败: {e}")
+
+
+    def _update_stage1_sl_on_exchange(self, new_sl_price: float) -> bool:
+        """
+        【阶段1】更新交易所止损单到新价格（用于阶梯上移/时间衰减）
+
+        取消现有 SL1 订单，以新价格重新挂 STOP_MARKET 止损单（全平）。
+        返回 True 表示更新成功。
+        """
+        if not self.current_position:
+            return False
+
+        cfg = self._staged_config
+        if not cfg:
+            return False
+
+        order = self.current_position
+        p_prec = cfg["p_prec"]
+        q_prec = cfg["q_prec"]
+        exit_side = cfg["exit_side"]
+
+        # 取消旧的 SL1 订单
+        old_sl_orders = [o for o in self._staged_orders
+                         if o.get("type") == "SL" and o.get("stage") == 1 and not o.get("filled", False)]
+        for old_order in old_sl_orders:
+            old_id = old_order.get("order_id")
+            if old_id and old_id > 0:
+                try:
+                    self._signed_request("DELETE", "/fapi/v1/order", {"symbol": self.symbol, "orderId": old_id})
+                    print(f"[BinanceTrader] 🔄 SL1调整：已取消旧SL1 orderId={old_id} ({old_order.get('price', 0):.{p_prec}f})")
+                except Exception:
+                    pass
+            self._staged_orders.remove(old_order)
+
+        # 查询当前持仓数量（全平止损）
+        pos = self._get_position()
+        amt = float(pos.get("positionAmt", 0.0)) if pos else 0.0
+        if abs(amt) < 1e-12:
+            return False
+
+        sl_qty = self._round_step(abs(amt), self._qty_step)
+        new_sl_rounded = self._round_step(new_sl_price, self._price_tick)
+        sl_price_str = f"{new_sl_rounded:.{p_prec}f}"
+        sl_qty_str = f"{sl_qty:.{q_prec}f}"
+
+        try:
+            params = {
+                "symbol": self.symbol, "side": exit_side, "type": "STOP_MARKET",
+                "stopPrice": sl_price_str, "quantity": sl_qty_str, "reduceOnly": "true",
+                "workingType": "CONTRACT_PRICE",
+                "newClientOrderId": self._new_client_order_id("SL1U"),
+            }
+            resp = self._place_order(params)
+            oid = int(resp.get("orderId", 0) or 0)
+            status = str(resp.get("status", "")).upper()
+            if oid > 0:
+                self._staged_orders.append({
+                    "order_id": oid, "type": "SL", "stage": 1,
+                    "price": new_sl_rounded, "quantity": sl_qty,
+                    "pct": 0.0, "filled": (status == "FILLED"), "is_full_close": True,
+                })
+                order.stop_loss = new_sl_rounded
+                print(f"[BinanceTrader] ✅ SL1 已更新: → {sl_price_str} (全平{sl_qty_str})")
+                return True
+            else:
+                print(f"[BinanceTrader] 🚨 SL1 更新挂单失败！")
+                return False
+        except Exception as e:
+            print(f"[BinanceTrader] ❌ SL1 更新失败: {e}")
+            return False
+
+    def _update_trailing_stop(self, current_price: float) -> None:
+        """
+        【阶段2】动态更新追踪止损（TP1 成交后，每根K线调用）
+
+        逻辑：
+        - 追踪止损 = 最高价 × (1 - TRAILING_STOP_PCT) [多头]
+                   = 最低价 × (1 + TRAILING_STOP_PCT) [空头]
+        - 止损只升不降（多头）/ 只降不升（空头）
+        - 当新止损优于当前交易所止损时，取消旧SL并重新挂单
+        """
+        if not self.current_position:
+            return
+
+        order = self.current_position
+        # 仅在阶段2（TP1已成交）且追踪止损已激活时执行
+        if not getattr(order, 'stage_2_active', False):
+            return
+
+        cfg = self._staged_config
+        if not cfg:
+            return
+
+        from config import PAPER_TRADING_CONFIG as _ptc
+        trail_pct = _ptc.get("TRAILING_STOP_PCT", 0.08)
+        is_long = cfg["is_long"]
+        p_prec = cfg["p_prec"]
+        q_prec = cfg["q_prec"]
+
+        # 更新峰值价格（用于计算追踪止损）
+        if not hasattr(order, 'stage2_peak_price'):
+            order.stage2_peak_price = current_price
+
+        if is_long:
+            if current_price > order.stage2_peak_price:
+                order.stage2_peak_price = current_price
+            new_trailing_sl = order.stage2_peak_price * (1 - trail_pct)
+            # 止损只升不降
+            if new_trailing_sl <= order.stop_loss:
+                return  # 止损未改善，无需更新
+        else:
+            if current_price < order.stage2_peak_price:
+                order.stage2_peak_price = current_price
+            new_trailing_sl = order.stage2_peak_price * (1 + trail_pct)
+            # 止损只降不升
+            if new_trailing_sl >= order.stop_loss:
+                return
+
+        new_trailing_sl_rounded = self._round_step(new_trailing_sl, self._price_tick)
+        old_sl = order.stop_loss
+
+        # 更新本地止损
+        order.stop_loss = new_trailing_sl_rounded
+
+        # 取消旧的阶段2 SL 委托，重新挂更优的追踪止损单
+        pos = self._get_position()
+        amt = float(pos.get("positionAmt", 0.0)) if pos else 0.0
+        if abs(amt) < 1e-12:
+            return
+
+        remaining_qty = self._round_step(abs(amt), self._qty_step)
+        exit_side = cfg["exit_side"]
+        sl_price_str = f"{new_trailing_sl_rounded:.{p_prec}f}"
+        sl_qty_str = f"{remaining_qty:.{q_prec}f}"
+
+        # 取消旧的阶段2 SL 订单
+        old_sl_orders = [o for o in self._staged_orders if o.get("type") == "SL" and o.get("stage") == 2 and not o.get("filled", False)]
+        for old_order in old_sl_orders:
+            old_id = old_order.get("order_id")
+            if old_id and old_id > 0:
+                try:
+                    self._signed_request("DELETE", "/fapi/v1/order", {"symbol": self.symbol, "orderId": old_id})
+                    print(f"[BinanceTrader] 🔄 追踪止损：已取消旧SL2 orderId={old_id} ({old_sl:.{p_prec}f})")
+                except Exception:
+                    pass
+            self._staged_orders.remove(old_order)
+
+        # 挂新的追踪止损单
+        try:
+            params = {
+                "symbol": self.symbol, "side": exit_side, "type": "STOP_MARKET",
+                "stopPrice": sl_price_str, "quantity": sl_qty_str, "reduceOnly": "true",
+                "workingType": "CONTRACT_PRICE",
+                "newClientOrderId": self._new_client_order_id("SL2T"),
+            }
+            resp = self._place_order(params)
+            oid = int(resp.get("orderId", 0) or 0)
+            status = str(resp.get("status", "")).upper()
+            if oid > 0:
+                self._staged_orders.append({
+                    "order_id": oid, "type": "SL", "stage": 2,
+                    "price": new_trailing_sl_rounded, "quantity": remaining_qty,
+                    "pct": 0.0, "filled": (status == "FILLED"), "is_full_close": True,
+                })
+                trail_pnl = (new_trailing_sl_rounded - cfg["entry_price"]) / cfg["entry_price"] * cfg["leverage"] * 100
+                print(f"[BinanceTrader] 📈 追踪止损更新: {old_sl:.{p_prec}f} → {new_trailing_sl_rounded:.{p_prec}f} "
+                      f"(峰值={order.stage2_peak_price:.{p_prec}f}, 锁定≈{trail_pnl:+.1f}%)")
+            else:
+                print(f"[BinanceTrader] 🚨 追踪止损更新挂单失败！")
+        except Exception as e:
+            print(f"[BinanceTrader] ❌ 追踪止损更新失败: {e}")
+            # 恢复本地止损到旧值（避免本地与交易所不一致）
+            order.stop_loss = old_sl
 
     def _cancel_exchange_tp_sl(self, silent: bool = False) -> None:
         """取消交易所上的所有阶梯式止盈止损委托单"""

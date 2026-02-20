@@ -48,9 +48,21 @@ from typing import Dict, List, Optional, Tuple
 _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR  = os.path.join(os.path.dirname(_THIS_DIR), 'data')
 STATE_FILE = os.path.join(_DATA_DIR, 'signal_analysis_state.json')
+CUMULATIVE_CACHE_FILE = os.path.join(_DATA_DIR, 'signal_cumulative_cache.json')
 
 _SCHEMA_VERSION = "3.0"
 
+# ── 内存缓存（避免每次调用重新解析大文件） ──────────────────────────────────
+_cache: Optional[dict] = None
+_cache_mtime: float = 0.0
+
+# ── 轻量级 cumulative 缓存（仅缓存 cumulative 部分，~2-5MB） ──────────────
+_cumul_cache: Optional[dict] = None
+_cumul_cache_mtime: float = 0.0
+
+# ── rounds 内存缓存（避免每次重新解析大文件的 rounds 字段） ─────────────────
+_rounds_cache: Optional[list] = None
+_rounds_cache_mtime: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -63,13 +75,19 @@ def _combo_key(direction: str, conditions: List[str]) -> str:
 
 
 def _load_raw() -> dict:
-    """加载 JSON 文件，不存在则返回空骨架。"""
+    """加载 JSON 文件，不存在则返回空骨架。文件未变化时直接返回内存缓存。"""
+    global _cache, _cache_mtime
     if os.path.exists(STATE_FILE):
         try:
+            mtime = os.path.getmtime(STATE_FILE)
+            if _cache is not None and mtime == _cache_mtime:
+                return _cache
             with open(STATE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                return data
+                _cache = data
+                _cache_mtime = mtime
+                return _cache
         except (json.JSONDecodeError, OSError):
             pass
     return _empty_state()
@@ -85,23 +103,141 @@ def _empty_state() -> dict:
 
 
 def _save_raw(data: dict) -> None:
-    """保存 JSON 文件（原子写：先写临时文件再重命名，Windows 文件锁重试）。"""
+    """保存 JSON 文件（原子写：先写临时文件再重命名，Windows 文件锁重试）。写入后更新内存缓存。"""
+    global _cache, _cache_mtime, _rounds_cache, _rounds_cache_mtime
     import time
     os.makedirs(_DATA_DIR, exist_ok=True)
     tmp = STATE_FILE + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False)
     # Windows 上 os.replace 在目标文件被其他线程占用时会抛 PermissionError(WinError 5)
-    # 重试最多 5 次，每次等待 100ms
-    for attempt in range(5):
+    # 增加重试次数与等待时间，避免短暂文件锁导致写入失败
+    max_attempts = 20
+    for attempt in range(max_attempts):
         try:
             os.replace(tmp, STATE_FILE)
+            _cache = data
+            _cache_mtime = os.path.getmtime(STATE_FILE)
+            # 同步更新 rounds 内存缓存
+            _rounds_cache = data.get('rounds', [])
+            _rounds_cache_mtime = _cache_mtime
+            _save_cumulative_cache(data)
             return
         except PermissionError:
-            if attempt < 4:
-                time.sleep(0.1)
+            if attempt < max_attempts - 1:
+                time.sleep(0.1 * (attempt + 1))
             else:
                 raise
+
+
+def _save_cumulative_cache(data: dict) -> None:
+    """将 cumulative 部分单独写入轻量级缓存文件（原子写），并更新内存缓存。"""
+    global _cumul_cache, _cumul_cache_mtime
+    import time
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    cache_data = {
+        "version":      data.get("version", _SCHEMA_VERSION),
+        "last_updated": data.get("last_updated", ""),
+        "cumulative":   data.get("cumulative", {}),
+    }
+    tmp = CUMULATIVE_CACHE_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(cache_data, f, ensure_ascii=False)
+    max_attempts = 20
+    for attempt in range(max_attempts):
+        try:
+            os.replace(tmp, CUMULATIVE_CACHE_FILE)
+            _cumul_cache = cache_data["cumulative"]
+            _cumul_cache_mtime = os.path.getmtime(CUMULATIVE_CACHE_FILE)
+            return
+        except PermissionError:
+            if attempt < max_attempts - 1:
+                time.sleep(0.1 * (attempt + 1))
+            else:
+                raise
+
+
+def _load_cumulative_fast() -> dict:
+    """
+    轻量级 cumulative 加载：优先读取 2-5MB 的缓存文件，避免解析 537MB 的完整文件。
+
+    优先级：
+      1. 内存命中（_cumul_cache mtime 未变）→ 立即返回，~0ms
+      2. 缓存文件存在且 mtime 已变 → 解析 ~2-5MB，~50ms
+      3. 缓存文件不存在但 STATE_FILE 存在 → 回退到 _load_raw()，并顺便生成缓存文件
+      4. 两者都不存在 → 返回空 dict
+    """
+    global _cumul_cache, _cumul_cache_mtime
+
+    # 1. 内存命中
+    if _cumul_cache is not None and os.path.exists(CUMULATIVE_CACHE_FILE):
+        try:
+            mtime = os.path.getmtime(CUMULATIVE_CACHE_FILE)
+            if mtime == _cumul_cache_mtime:
+                return _cumul_cache
+        except OSError:
+            pass
+
+    # 2. 缓存文件存在，读取它
+    if os.path.exists(CUMULATIVE_CACHE_FILE):
+        try:
+            mtime = os.path.getmtime(CUMULATIVE_CACHE_FILE)
+            with open(CUMULATIVE_CACHE_FILE, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            if isinstance(cache_data, dict):
+                _cumul_cache = cache_data.get('cumulative', {})
+                _cumul_cache_mtime = mtime
+                return _cumul_cache
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 3. 缓存文件不存在，回退到完整文件并生成缓存
+    if os.path.exists(STATE_FILE):
+        data = _load_raw()
+        try:
+            _save_cumulative_cache(data)
+        except Exception:
+            pass
+        return data.get('cumulative', {})
+
+    # 4. 无数据
+    return {}
+
+
+def _load_rounds_fast() -> list:
+    """
+    轻量级 rounds 加载：内存命中（mtime 未变）时立即返回，否则回退到 _load_raw() 并更新缓存。
+
+    优先级：
+      1. 内存命中（_rounds_cache mtime 未变）→ 立即返回，~0ms
+      2. 缓存失效或首次调用 → 调用 _load_raw()（~50ms，STATE_FILE 内存缓存命中时），
+         并将 rounds 列表写入 _rounds_cache
+    """
+    global _rounds_cache, _rounds_cache_mtime
+
+    if _rounds_cache is not None and os.path.exists(STATE_FILE):
+        try:
+            mtime = os.path.getmtime(STATE_FILE)
+            if mtime == _rounds_cache_mtime:
+                return _rounds_cache
+        except OSError:
+            pass
+
+    data = _load_raw()
+    _rounds_cache = data.get('rounds', [])
+    _rounds_cache_mtime = _cache_mtime   # _load_raw() 已更新 _cache_mtime
+    return _rounds_cache
+
+
+def invalidate_cache() -> None:
+    """强制清除所有内存缓存，下次加载将重新读取磁盘文件。"""
+    global _cache, _cache_mtime, _cumul_cache, _cumul_cache_mtime, _rounds_cache, _rounds_cache_mtime
+    _cache = None
+    _cache_mtime = 0.0
+    _cumul_cache = None
+    _cumul_cache_mtime = 0.0
+    _rounds_cache = None
+    _rounds_cache_mtime = 0.0
 
 
 def _next_round_id(data: dict) -> int:
@@ -337,21 +473,154 @@ def merge_round(
     return updated_keys
 
 
+def _tier_from_rate(overall_rate: float, direction: str) -> str:
+    """根据综合命中率和方向返回层级，与 signal_analyzer 门槛一致。"""
+    if direction == 'long':
+        if overall_rate >= 0.71: return '精品'
+        if overall_rate >= 0.67: return '优质'
+        if overall_rate >= 0.64: return '候选'
+    else:
+        if overall_rate >= 0.59: return '精品'
+        if overall_rate >= 0.55: return '优质'
+        if overall_rate >= 0.52: return '候选'
+    return ''
+
+
+def _cond_to_family(cond: str) -> str:
+    """提取条件的指标族名称，去掉 _loose/_strict 后缀。"""
+    for suffix in ('_loose', '_strict'):
+        if cond.endswith(suffix):
+            return cond[:-len(suffix)]
+    return cond
+
+
+def _cond_is_loose(cond: str) -> bool:
+    """判断条件是否为宽松版。"""
+    return cond.endswith('_loose')
+
+
+def _cond_covers(cond_a: str, cond_b: str) -> bool:
+    """
+    判断条件 A 是否覆盖条件 B（即 A 触发范围 >= B）。
+    覆盖关系：
+      - 完全相同：A == B
+      - 同指标族，A 为宽松版，B 为严格版：宽松覆盖严格
+    """
+    if cond_a == cond_b:
+        return True
+    family_a = _cond_to_family(cond_a)
+    family_b = _cond_to_family(cond_b)
+    if family_a == family_b and _cond_is_loose(cond_a) and not _cond_is_loose(cond_b):
+        return True
+    return False
+
+
+def _combo_a_covers_b(conds_a: List[str], conds_b: List[str]) -> bool:
+    """
+    判断策略 A（条件列表）是否覆盖策略 B。
+    覆盖定义：A 中每一个条件，在 B 中都能找到一个被它覆盖的条件。
+    即：B 触发 → A 必然触发（A 的条件是 B 条件的宽松子集）。
+    注意：A 的条件数量必须 <= B，否则 A 比 B 更严格，不构成覆盖。
+    """
+    if len(conds_a) > len(conds_b):
+        return False
+    for ca in conds_a:
+        if not any(_cond_covers(ca, cb) for cb in conds_b):
+            return False
+    return True
+
+
+def _prune_redundant_subsets(entries: Dict[str, dict]) -> Dict[str, dict]:
+    """
+    强力去重：对同方向的所有策略（精品+优质），
+    若策略 A 覆盖策略 B（A 条件更少且更宽松），则 B 冗余，移除 B。
+    覆盖关系：B 触发时 A 必然触发，且 A 触发频率 >= B，且 A 命中率 == B。
+    三个前提同时满足才视为冗余：逻辑覆盖 + 触发次数 A >= B + 命中率 A == B。
+    """
+    all_list = list(entries.items())
+    to_remove: set = set()
+
+    for i, (key_b, entry_b) in enumerate(all_list):
+        if key_b in to_remove:
+            continue
+        conds_b = entry_b.get('conditions', [])
+        dir_b   = entry_b.get('direction', 'long')
+
+        for j, (key_a, entry_a) in enumerate(all_list):
+            if key_a == key_b or key_a in to_remove:
+                continue
+            if entry_a.get('direction') != dir_b:
+                continue
+            conds_a = entry_a.get('conditions', [])
+
+            rate_a     = entry_a.get('overall_rate', 0.0) or 0.0
+            rate_b     = entry_b.get('overall_rate', 0.0) or 0.0
+            triggers_a = entry_a.get('total_triggers', 0) or 0
+            triggers_b = entry_b.get('total_triggers', 0) or 0
+
+            # A 严格覆盖 B（A 条件数 < B，且 A 每个条件都覆盖 B 中对应条件）
+            # 额外前提：A 命中率 == B，且 A 触发次数 >= B（B 的额外条件没有带来质量提升）
+            if len(conds_a) < len(conds_b) and _combo_a_covers_b(conds_a, conds_b):
+                if abs(rate_a - rate_b) < 1e-9 and triggers_a >= triggers_b:
+                    to_remove.add(key_b)
+                    break
+
+            # A 与 B 条件数相同，但 A 全部为宽松版，B 含有严格版 → A 覆盖 B
+            # 额外前提：A 命中率 == B，且 A 触发次数 >= B
+            if len(conds_a) == len(conds_b) and key_a != key_b:
+                if _combo_a_covers_b(conds_a, conds_b) and conds_a != conds_b:
+                    if abs(rate_a - rate_b) < 1e-9 and triggers_a >= triggers_b:
+                        to_remove.add(key_b)
+                        break
+
+    return {k: v for k, v in entries.items() if k not in to_remove}
+
+
+def rebuild_pruned_cache() -> None:
+    """
+    对完整 cumulative 做一次层级过滤 + 去重，结果写入轻量级缓存文件。
+
+    应在后台线程调用（两次 merge_round 均完成后），只执行一次，
+    避免在主线程 get_cumulative() 中重复 O(n²) 去重操作。
+    """
+    data = _load_raw()
+    cumulative = data.get("cumulative", {})
+
+    # 层级过滤：只保留精品和优质
+    filtered = {
+        k: v for k, v in cumulative.items()
+        if _tier_from_rate(v.get('overall_rate', 0.0), v.get('direction', 'long'))
+           in ('精品', '优质')
+    }
+
+    # 去重（O(n²)），只跑一次
+    pruned = _prune_redundant_subsets(filtered)
+
+    # 写入轻量级缓存（不重写完整 STATE_FILE）
+    _save_cumulative_cache({**data, "cumulative": pruned})
+
+
 def get_cumulative(direction: Optional[str] = None) -> Dict[str, dict]:
     """
     读取所有（或指定方向的）累计结果。
+
+    去重由后台线程在两次 merge_round 完成后调用 rebuild_pruned_cache() 完成，
+    此处只做方向过滤，不再执行 O(n²) 去重操作。
 
     Args:
         direction: 'long' / 'short' / None（返回全部）
 
     Returns:
-        dict，key 为 combo_key，value 为累计条目。
+        dict，key 为 combo_key，value 为累计条目（已层级过滤+去重）。
     """
-    data = _load_raw()
-    cumulative = data.get('cumulative', {})
-    if direction is None:
-        return cumulative
-    return {k: v for k, v in cumulative.items() if v.get('direction') == direction}
+    cumulative = _load_cumulative_fast()
+
+    # 方向过滤
+    if direction is not None:
+        cumulative = {k: v for k, v in cumulative.items()
+                      if v.get('direction') == direction}
+
+    return cumulative
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -656,9 +925,8 @@ def get_premium_pool(
 
 
 def get_rounds() -> List[dict]:
-    """返回所有历史轮次记录列表（按 round_id 升序）。"""
-    data = _load_raw()
-    rounds = data.get('rounds', [])
+    """返回所有历史轮次记录列表（按 round_id 升序）。内存缓存命中时无磁盘 IO。"""
+    rounds = _load_rounds_fast()
     return sorted(rounds, key=lambda r: r.get('round_id', 0))
 
 
@@ -671,7 +939,16 @@ def get_round(round_id: int) -> Optional[dict]:
 
 
 def clear_all() -> None:
-    """清空所有历史记录（写入空骨架）。"""
+    """清空所有历史记录（写入空骨架），同时删除轻量级缓存文件。"""
+    global _cumul_cache, _cumul_cache_mtime
+    invalidate_cache()
+    if os.path.exists(CUMULATIVE_CACHE_FILE):
+        try:
+            os.remove(CUMULATIVE_CACHE_FILE)
+        except OSError:
+            pass
+    _cumul_cache = None
+    _cumul_cache_mtime = 0.0
     _save_raw(_empty_state())
 
 
@@ -807,12 +1084,18 @@ def get_live_alerts() -> List[dict]:
     return alerts
 
 
-def get_cumulative_results(top_n: int = 200, direction: Optional[str] = None) -> List[dict]:
-    """UI 调用的接口，返回按综合评分降序的累计结果列表（附加 combo_key 字段）。"""
+def get_cumulative_results(top_n: int = 1000, direction: Optional[str] = None) -> Tuple[List[dict], dict]:
+    """
+    UI 调用的接口，返回按综合评分降序的累计结果列表及原始 cumulative 字典。
+
+    返回值为 (items, cumulative)：
+      items      : List[dict]，每个元素为附加了 combo_key 字段的累计条目，按综合评分降序
+      cumulative : dict，原始 cumulative 字典，供调用方复用（避免重复调用 get_cumulative()）
+    """
     cumulative = get_cumulative(direction)
     items = [{**v, 'combo_key': k} for k, v in cumulative.items()]
     items.sort(key=lambda x: x.get('综合评分', 0.0), reverse=True)
-    return items[:top_n]
+    return items[:top_n], cumulative
 
 
 def clear() -> None:

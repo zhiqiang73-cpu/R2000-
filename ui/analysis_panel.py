@@ -274,21 +274,41 @@ class PatternLogicWidget(QtWidgets.QWidget):
 
 class TradeLogWidget(QtWidgets.QWidget):
     """交易明细显示组件"""
+    MAX_DISPLAY_TRADES = 200
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._latest_trades: List[Dict] = []
+        self._display_limit = self.MAX_DISPLAY_TRADES
         self._init_ui()
     
     def _init_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        self.export_btn = QtWidgets.QPushButton("导出TXT")
+        self.export_btn.setToolTip("导出当前回测交易明细为TXT")
+        self.export_btn.clicked.connect(self._export_trades_txt)
+        toolbar.addWidget(self.export_btn)
+        toolbar.addStretch()
+        self.limit_hint_label = QtWidgets.QLabel("")
+        self.limit_hint_label.setStyleSheet("color: #888; font-size: 11px;")
+        toolbar.addWidget(self.limit_hint_label)
+        layout.addLayout(toolbar)
         
         self.table = QtWidgets.QTableWidget()
         self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
             "方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "市场状态", "指纹摘要"
         ])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(QtCore.Qt.TextElideMode.ElideRight)
         self.table.setStyleSheet(f"""
             QTableWidget {{
                 background-color: {UI_CONFIG['THEME_SURFACE']};
@@ -307,11 +327,13 @@ class TradeLogWidget(QtWidgets.QWidget):
     
     def update_trades(self, trades: List[Dict]):
         """更新交易明细"""
-        self.table.setRowCount(len(trades))
+        self._latest_trades = trades or []
+        display_trades = self._latest_trades[-self._display_limit:]
+        self.table.setRowCount(len(display_trades))
         up_color = QtGui.QColor(UI_CONFIG['CHART_UP_COLOR'])
         down_color = QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR'])
         
-        for i, t in enumerate(trades):
+        for i, t in enumerate(display_trades):
             # 方向
             side_item = QtWidgets.QTableWidgetItem(t.get("side", ""))
             if "LONG" in t.get("side", ""):
@@ -367,6 +389,55 @@ class TradeLogWidget(QtWidgets.QWidget):
                 fp_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
             fp_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(i, 9, fp_item)
+
+        # 自动根据内容调整列宽，保持可横向滚动
+        self.table.resizeColumnsToContents()
+        self._update_limit_hint(len(self._latest_trades))
+
+    def _update_limit_hint(self, total_count: int):
+        """更新显示条数提示"""
+        if total_count > self._display_limit:
+            self.limit_hint_label.setText(f"仅展示最近{self._display_limit}条（共{total_count}条）")
+        else:
+            self.limit_hint_label.setText("")
+
+    def _export_trades_txt(self):
+        """导出交易明细为TXT文件"""
+        if not self._latest_trades:
+            QtWidgets.QMessageBox.information(self, "无数据", "当前没有可导出的交易明细。")
+            return
+        default_name = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "导出回测交易明细",
+            f"trade_history_{default_name}.txt",
+            "Text Files (*.txt)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+        headers = ["方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "市场状态", "指纹摘要"]
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\t".join(headers) + "\n")
+                for t in self._latest_trades:
+                    row = [
+                        str(t.get("side", "")),
+                        str(t.get("entry_time", "")),
+                        str(t.get("entry_price", "")),
+                        str(t.get("exit_time", "")),
+                        str(t.get("exit_price", "")),
+                        str(t.get("profit", "")),
+                        str(t.get("profit_pct", "")),
+                        str(t.get("hold", "")),
+                        str(t.get("regime", "")),
+                        str(t.get("fingerprint", "")),
+                    ]
+                    f.write("\t".join(row) + "\n")
+            QtWidgets.QMessageBox.information(self, "导出完成", f"已导出到:\n{path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "导出失败", f"写入文件失败:\n{e}")
 
 
 class MarketRegimeWidget(QtWidgets.QWidget):

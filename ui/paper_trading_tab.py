@@ -292,38 +292,6 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         """)
         self.clear_memory_btn.clicked.connect(self._on_clear_memory_clicked)
         control_layout.addWidget(self.clear_memory_btn)
-        
-        # 反向下单模式开关
-        self.reverse_signal_checkbox = QtWidgets.QCheckBox("🔄 反向下单模式")
-        self.reverse_signal_checkbox.setStyleSheet("""
-            QCheckBox {
-                color: #FF5252;
-                font-size: 12px;
-                font-weight: bold;
-                padding: 5px 0;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #FF5252;
-                border: 1px solid #FF5252;
-                border-radius: 3px;
-            }
-            QCheckBox::indicator:unchecked {
-                background-color: #333;
-                border: 1px solid #555;
-                border-radius: 3px;
-            }
-        """)
-        self.reverse_signal_checkbox.setToolTip(
-            "测试功能：将所有LONG信号变为SHORT，SHORT变为LONG\n"
-            "用于测试信号方向是否反了\n"
-            "⚠ 仅用于诊断，不要依赖此模式长期交易"
-        )
-        self.reverse_signal_checkbox.stateChanged.connect(self._on_reverse_mode_changed)
-        control_layout.addWidget(self.reverse_signal_checkbox)
 
         # 精品信号模式开关
         self.signal_mode_checkbox = QtWidgets.QCheckBox("💎 精品信号开仓")
@@ -437,59 +405,6 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         }
         self.save_api_requested.emit(config)
     
-    def _on_reverse_mode_changed(self, state):
-        """反向下单模式开关变更"""
-        enabled = (state == QtCore.Qt.CheckState.Checked.value)
-        
-        # 更新配置
-        from config import PAPER_TRADING_CONFIG
-        PAPER_TRADING_CONFIG["REVERSE_SIGNAL_MODE"] = enabled
-        
-        # 更新引擎（如果已经运行）
-        if hasattr(self, '_engine') and self._engine:
-            self._engine._reverse_signal_mode = enabled
-        
-        # UI提示
-        if enabled:
-            print(f"[UI] ⚠️ 反向模式已启用！所有信号将反向操作")
-            self.reverse_signal_checkbox.setStyleSheet("""
-                QCheckBox {
-                    color: #FF5252;
-                    font-size: 12px;
-                    font-weight: bold;
-                    padding: 5px 0;
-                    background-color: rgba(255, 82, 82, 0.15);
-                }
-                QCheckBox::indicator {
-                    width: 16px;
-                    height: 16px;
-                }
-                QCheckBox::indicator:checked {
-                    background-color: #FF5252;
-                    border: 1px solid #FF5252;
-                    border-radius: 3px;
-                }
-            """)
-        else:
-            print(f"[UI] 反向模式已关闭")
-            self.reverse_signal_checkbox.setStyleSheet("""
-                QCheckBox {
-                    color: #FF5252;
-                    font-size: 12px;
-                    font-weight: bold;
-                    padding: 5px 0;
-                }
-                QCheckBox::indicator {
-                    width: 16px;
-                    height: 16px;
-                }
-                QCheckBox::indicator:unchecked {
-                    background-color: #333;
-                    border: 1px solid #555;
-                    border-radius: 3px;
-                }
-            """)
-
     def _on_signal_mode_changed(self, state):
         """精品信号模式开关变更"""
         enabled = (state == QtCore.Qt.CheckState.Checked.value)
@@ -3502,12 +3417,15 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
 
 class PaperTradingTradeLog(QtWidgets.QWidget):
     """模拟交易记录表格"""
+    MAX_DISPLAY_TRADES = 200
     
     # 定义信号
     delete_trade_signal = QtCore.pyqtSignal(object)  # 删除交易记录信号
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._total_trades = 0
+        self._display_limit = self.MAX_DISPLAY_TRADES
         self._init_ui()
         self._rows_by_key = {}
     
@@ -3592,6 +3510,12 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         table_page = QtWidgets.QWidget()
         table_layout = QtWidgets.QVBoxLayout(table_page)
         table_layout.setContentsMargins(0, 0, 0, 0)
+        hint_row = QtWidgets.QHBoxLayout()
+        self.limit_hint_label = QtWidgets.QLabel("")
+        self.limit_hint_label.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px;")
+        hint_row.addStretch()
+        hint_row.addWidget(self.limit_hint_label)
+        table_layout.addLayout(hint_row)
         table_layout.addWidget(self.table)
         self.stacked.addWidget(table_page)
         layout.addWidget(self.stacked)
@@ -3621,16 +3545,22 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             else:
                 row = self._insert_trade_row(order)
                 self._rows_by_key[key] = row
+                self._total_trades += 1
+                self._trim_to_display_limit()
         self._update_empty_state()
+        self._update_limit_hint()
     
     def set_history(self, trades: List):
         """批量设置历史记录"""
+        self._total_trades = len(trades or [])
         self.table.setRowCount(0)
         self._rows_by_key.clear()
-        for order in trades:
+        display_trades = (trades or [])[-self._display_limit:]
+        for order in display_trades:
             row = self._insert_trade_row(order)
             self._rows_by_key[self._trade_key(order)] = row
         self._update_empty_state()
+        self._update_limit_hint()
         
         # 批量加载后，再次调整所有行高（性能优化）
         self.table.resizeRowsToContents()
@@ -3678,7 +3608,9 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             time_str = order.exit_time.strftime("%m-%d %H:%M")
         elif order.entry_time:
             time_str = order.entry_time.strftime("%m-%d %H:%M") + "(持)"
-        self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(time_str))
+        time_item = QtWidgets.QTableWidgetItem(time_str)
+        time_item.setData(QtCore.Qt.ItemDataRole.UserRole, self._trade_key(order))
+        self.table.setItem(row, 0, time_item)
         
         # 方向（翻转单加标记）
         side_val = order.side.value
@@ -3997,6 +3929,7 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             row = self._rows_by_key[key]
             self.table.removeRow(row)
             del self._rows_by_key[key]
+            self._total_trades = max(0, self._total_trades - 1)
             
             # 更新后续行的索引映射
             for k, v in list(self._rows_by_key.items()):
@@ -4004,6 +3937,7 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
                     self._rows_by_key[k] = v - 1
         
         self._update_empty_state()
+        self._update_limit_hint()
         
         # 触发删除信号，让主窗口处理数据持久化
         self.delete_trade_signal.emit(order)
@@ -4011,7 +3945,34 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
     def clear(self):
         """清空表格"""
         self.table.setRowCount(0)
+        self._rows_by_key.clear()
+        self._total_trades = 0
         self._update_empty_state()
+        self._update_limit_hint()
+
+    def _trim_to_display_limit(self):
+        """裁剪到最大显示条数，避免UI卡顿"""
+        while self.table.rowCount() > self._display_limit:
+            self.table.removeRow(0)
+        self._rebuild_row_index_cache()
+
+    def _rebuild_row_index_cache(self):
+        """重建行索引缓存"""
+        self._rows_by_key = {}
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            key = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+            if key:
+                self._rows_by_key[key] = row
+
+    def _update_limit_hint(self):
+        """更新显示条数提示"""
+        if self._total_trades > self._display_limit:
+            self.limit_hint_label.setText(
+                f"仅展示最近{self._display_limit}条（共{self._total_trades}条）"
+            )
+        else:
+            self.limit_hint_label.setText("")
 
 
 class RejectionLogCard(QtWidgets.QWidget):
