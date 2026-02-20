@@ -265,6 +265,24 @@ def _build_condition_arrays(df: pd.DataFrame, direction: str) -> Dict[str, np.nd
 # 策略 3：单条件预剪枝
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _has_intra_redundancy(cond_names: List[str]) -> bool:
+    """
+    判断条件列表中是否存在同族宽松+严格版本并存。
+    例如 ['ma5_slope_dir_loose', 'ma5_slope_dir_strict'] → True（宽松多余）
+    严格满足必然满足宽松，因此两者并存时宽松条件是冗余的。
+    """
+    families: Dict[str, str] = {}
+    for name in cond_names:
+        for suffix in ('_loose', '_strict'):
+            if name.endswith(suffix):
+                fam = name[:-len(suffix)]
+                if fam in families:
+                    return True  # 同族已有另一个版本
+                families[fam] = suffix
+                break
+    return False
+
+
 def _prune_conditions(
     cond_arrays: Dict[str, np.ndarray],
     outcome: np.ndarray,
@@ -430,6 +448,12 @@ def analyze(
 
     for r in range(2, max_r):
         for combo_indices in itertools.combinations(range(nc), r):
+            # ── 跳过同族宽松+严格并存的冗余组合 ──
+            selected_names = [cond_names[i] for i in combo_indices]
+            if _has_intra_redundancy(selected_names):
+                processed += 1
+                continue
+
             # 向量化 AND（策略2）
             trigger_mask = cond_arr_lst[combo_indices[0]].copy()
             for idx in combo_indices[1:]:

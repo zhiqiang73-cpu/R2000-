@@ -75,6 +75,37 @@ _rounds_cache_mtime: float = 0.0
 import threading as _threading
 _write_lock = _threading.Lock()
 
+def _win_long_path(path: str) -> str:
+    if os.name != "nt":
+        return path
+    abs_path = os.path.abspath(path)
+    if abs_path.startswith("\\\\?\\"):
+        return abs_path
+    return "\\\\?\\" + abs_path
+
+
+def _open_file(path: str, mode: str, encoding: Optional[str] = None):
+    try:
+        if "b" in mode:
+            return open(path, mode)
+        return open(path, mode, encoding=encoding)
+    except OSError as e:
+        if os.name == "nt" and e.errno == 22:
+            long_path = _win_long_path(path)
+            if "b" in mode:
+                return open(long_path, mode)
+            return open(long_path, mode, encoding=encoding)
+        raise
+
+
+def _safe_getmtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError as e:
+        if os.name == "nt" and e.errno == 22:
+            return os.path.getmtime(_win_long_path(path))
+        raise
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 内部工具
@@ -90,10 +121,10 @@ def _load_raw() -> dict:
     global _cache, _cache_mtime
     if os.path.exists(STATE_FILE):
         try:
-            mtime = os.path.getmtime(STATE_FILE)
+            mtime = _safe_getmtime(STATE_FILE)
             if _cache is not None and mtime == _cache_mtime:
                 return _cache
-            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            with _open_file(STATE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 _cache = data
@@ -119,13 +150,13 @@ def _save_raw(data: dict) -> None:
     os.makedirs(_DATA_DIR, exist_ok=True)
     with _write_lock:
         if _USE_ORJSON:
-            with open(STATE_FILE, 'wb') as f:
+            with _open_file(STATE_FILE, 'wb') as f:
                 f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2))
         else:
-            with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            with _open_file(STATE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False)
         _cache = data
-        _cache_mtime = os.path.getmtime(STATE_FILE)
+        _cache_mtime = _safe_getmtime(STATE_FILE)
         _rounds_cache = data.get('rounds', [])
         _rounds_cache_mtime = _cache_mtime
     _save_cumulative_cache(data)
@@ -142,13 +173,13 @@ def _save_cumulative_cache(data: dict) -> None:
     }
     with _write_lock:
         if _USE_ORJSON:
-            with open(CUMULATIVE_CACHE_FILE, 'wb') as f:
+            with _open_file(CUMULATIVE_CACHE_FILE, 'wb') as f:
                 f.write(orjson.dumps(cache_data, option=orjson.OPT_INDENT_2))
         else:
-            with open(CUMULATIVE_CACHE_FILE, 'w', encoding='utf-8') as f:
+            with _open_file(CUMULATIVE_CACHE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, ensure_ascii=False)
         _cumul_cache = cache_data["cumulative"]
-        _cumul_cache_mtime = os.path.getmtime(CUMULATIVE_CACHE_FILE)
+        _cumul_cache_mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE)
 
 
 def _load_cumulative_fast() -> dict:
@@ -166,7 +197,7 @@ def _load_cumulative_fast() -> dict:
     # 1. 内存命中
     if _cumul_cache is not None and os.path.exists(CUMULATIVE_CACHE_FILE):
         try:
-            mtime = os.path.getmtime(CUMULATIVE_CACHE_FILE)
+            mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE)
             if mtime == _cumul_cache_mtime:
                 return _cumul_cache
         except OSError:
@@ -175,8 +206,8 @@ def _load_cumulative_fast() -> dict:
     # 2. 缓存文件存在，读取它
     if os.path.exists(CUMULATIVE_CACHE_FILE):
         try:
-            mtime = os.path.getmtime(CUMULATIVE_CACHE_FILE)
-            with open(CUMULATIVE_CACHE_FILE, 'r', encoding='utf-8') as f:
+            mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE)
+            with _open_file(CUMULATIVE_CACHE_FILE, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
             if isinstance(cache_data, dict):
                 _cumul_cache = cache_data.get('cumulative', {})
@@ -211,7 +242,7 @@ def _load_rounds_fast() -> list:
 
     if _rounds_cache is not None and os.path.exists(STATE_FILE):
         try:
-            mtime = os.path.getmtime(STATE_FILE)
+            mtime = _safe_getmtime(STATE_FILE)
             if mtime == _rounds_cache_mtime:
                 return _rounds_cache
         except OSError:
@@ -572,22 +603,59 @@ def _combo_a_covers_b(conds_a: List[str], conds_b: List[str]) -> bool:
     return True
 
 
+def _simplify_conditions(conditions: List[str]) -> List[str]:
+    """
+    规范化条件列表：若同族同时含宽松+严格，仅保留严格版本。
+    ['ma5_slope_dir_loose', 'ma5_slope_dir_strict'] → ['ma5_slope_dir_strict']
+    """
+    family_to_versions: Dict[str, List[str]] = {}
+    no_family: List[str] = []
+    for c in conditions:
+        fam = _cond_to_family(c)
+        if fam != c:
+            family_to_versions.setdefault(fam, []).append(c)
+        else:
+            no_family.append(c)
+    result: List[str] = []
+    for fam, versions in family_to_versions.items():
+        if len(versions) == 1:
+            result.append(versions[0])
+        else:
+            # 同族多版本：只保留严格版
+            strict = [v for v in versions if v.endswith('_strict')]
+            result.extend(strict if strict else versions)
+    return result + no_family
+
+
+def _normalize_all_entries(entries: Dict[str, dict]) -> Dict[str, dict]:
+    """对全部条目做条件规范化，重复 key 时合并（保留触发数更多的）。"""
+    normalized: Dict[str, dict] = {}
+    for key, entry in entries.items():
+        conds = entry.get('conditions', [])
+        new_conds = _simplify_conditions(conds)
+        new_key = entry.get('direction', 'long') + ':' + ','.join(sorted(new_conds))
+        if new_key in normalized:
+            # key 碰撞：保留触发数更多的
+            if entry.get('total_triggers', 0) >= normalized[new_key].get('total_triggers', 0):
+                normalized[new_key] = {**entry, 'conditions': new_conds}
+        else:
+            normalized[new_key] = {**entry, 'conditions': new_conds}
+    return normalized
+
+
 def _prune_redundant_subsets(entries: Dict[str, dict]) -> Dict[str, dict]:
     """
-    高效去重（从 O(n²) 优化到近似 O(n)）：
+    去重：若 A 能覆盖 B，且 A 命中率 >= B，则删除 B。
 
-    核心洞察：冗余条件要求命中率 A == B（精确相等），因此只需在
-    (direction, overall_rate) 相同的小分组内两两比较，跨分组直接跳过。
-    实测 14000 条目中平均每组 < 10 条，内层循环量从 ~1亿 降到 ~10万。
+    分组仅按 direction，允许跨命中率比较（解决“新简策略替换旧复杂策略”）。
     """
     from collections import defaultdict
 
-    # 按 (direction, overall_rate) 分组，只有同组才可能互为冗余
+    # 按方向分组，同方向内比较冗余
     groups: dict = defaultdict(list)
     for key, entry in entries.items():
         dir_ = entry.get('direction', 'long')
-        rate = round(entry.get('overall_rate', 0.0) or 0.0, 9)
-        groups[(dir_, rate)].append(key)
+        groups[dir_].append(key)
 
     to_remove: set = set()
 
@@ -595,8 +663,13 @@ def _prune_redundant_subsets(entries: Dict[str, dict]) -> Dict[str, dict]:
         if len(group_keys) < 2:
             continue  # 单条目组，无需比较
 
-        # 按条件数量升序排列（条件少的在前，优先作为 A）
-        group_keys.sort(key=lambda k: len(entries[k].get('conditions', [])))
+        # 按条件数量升序 + 命中率降序（条件少&表现好优先作为 A）
+        group_keys.sort(
+            key=lambda k: (
+                len(entries[k].get('conditions', [])),
+                -(entries[k].get('overall_rate', 0.0) or 0.0),
+            )
+        )
 
         for i, key_b in enumerate(group_keys):
             if key_b in to_remove:
@@ -604,6 +677,9 @@ def _prune_redundant_subsets(entries: Dict[str, dict]) -> Dict[str, dict]:
             entry_b    = entries[key_b]
             conds_b    = entry_b.get('conditions', [])
             triggers_b = entry_b.get('total_triggers', 0) or 0
+            rate_b = entry_b.get('overall_rate', 0.0) or 0.0
+            rounds_b = max(entry_b.get('appear_rounds', 1) or 1, 1)
+            avg_trig_b = triggers_b / rounds_b
 
             for key_a in group_keys[:i]:  # 只与条件更少的比
                 if key_a in to_remove:
@@ -611,8 +687,16 @@ def _prune_redundant_subsets(entries: Dict[str, dict]) -> Dict[str, dict]:
                 entry_a    = entries[key_a]
                 conds_a    = entry_a.get('conditions', [])
                 triggers_a = entry_a.get('total_triggers', 0) or 0
+                rate_a = entry_a.get('overall_rate', 0.0) or 0.0
+                rounds_a = max(entry_a.get('appear_rounds', 1) or 1, 1)
+                avg_trig_a = triggers_a / rounds_a
 
-                if triggers_a < triggers_b:
+                # A 命中率更低则不可能替代 B
+                if rate_a + 1e-12 < rate_b:
+                    continue
+
+                # 若 A 每轮平均触发显著低于 B，跳过（避免新策略因轮次少被误杀）
+                if avg_trig_a < avg_trig_b * 0.8:
                     continue
 
                 # A 严格覆盖 B（条件数更少且逻辑覆盖）
@@ -627,6 +711,20 @@ def _prune_redundant_subsets(entries: Dict[str, dict]) -> Dict[str, dict]:
                         break
 
     return {k: v for k, v in entries.items() if k not in to_remove}
+
+
+def _ensure_pruned_cache_fresh() -> None:
+    """若去重缓存不存在或早于原始状态文件，则同步重建（同步/轻量操作）。"""
+    try:
+        cache_mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE) if os.path.exists(CUMULATIVE_CACHE_FILE) else 0.0
+    except OSError:
+        cache_mtime = 0.0
+    try:
+        state_mtime = _safe_getmtime(STATE_FILE) if os.path.exists(STATE_FILE) else 0.0
+    except OSError:
+        state_mtime = 0.0
+    if cache_mtime < state_mtime:   # 包含 cache_mtime==0（文件不存在）的情况
+        rebuild_pruned_cache()
 
 
 def rebuild_pruned_cache() -> None:
@@ -646,8 +744,11 @@ def rebuild_pruned_cache() -> None:
            in ('精品', '优质')
     }
 
+    # 对存量条目规范化（去除同族宽松+严格并存）
+    normalized = _normalize_all_entries(filtered)
+
     # 去重，只跑一次
-    pruned = _prune_redundant_subsets(filtered)
+    pruned = _prune_redundant_subsets(normalized)
 
     # 写入轻量级缓存（不重写完整 STATE_FILE）
     _save_cumulative_cache({**data, "cumulative": pruned})
@@ -666,6 +767,9 @@ def get_cumulative(direction: Optional[str] = None) -> Dict[str, dict]:
     Returns:
         dict，key 为 combo_key，value 为累计条目（已层级过滤+去重）。
     """
+    # 检测：若 cumulative_cache 不存在或比 state_file 旧，则重建
+    _ensure_pruned_cache_fresh()
+
     cumulative = _load_cumulative_fast()
 
     # 方向过滤
