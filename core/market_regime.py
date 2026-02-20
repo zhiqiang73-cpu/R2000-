@@ -203,3 +203,73 @@ class MarketRegimeClassifier:
             del s["profit_pcts"]
 
         return stats
+
+    @staticmethod
+    def compute_direction_regime_stats(trades: list, regime_map: Dict[int, str]) -> Dict:
+        """
+        返回 {('long'|'short', regime): {count, wins, losses, win_rate,
+                                        avg_win_pct, avg_loss_pct,
+                                        avg_profit_pct, total_profit}}
+        """
+        stats = {}
+        regimes = MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN]
+        for direction in ("long", "short"):
+            for regime in regimes:
+                stats[(direction, regime)] = {
+                    "count": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "win_rate": 0.0,
+                    "avg_win_pct": 0.0,
+                    "avg_loss_pct": 0.0,
+                    "avg_profit_pct": 0.0,
+                    "total_profit": 0.0,
+                    "win_pcts": [],
+                    "loss_pcts": [],
+                    "profit_pcts": [],
+                }
+
+        for i, trade in enumerate(trades):
+            regime = regime_map.get(i, MarketRegime.UNKNOWN)
+            direction = "long" if trade.side == 1 else "short"
+            key = (direction, regime)
+            if key not in stats:
+                stats[key] = {
+                    "count": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "win_rate": 0.0,
+                    "avg_win_pct": 0.0,
+                    "avg_loss_pct": 0.0,
+                    "avg_profit_pct": 0.0,
+                    "total_profit": 0.0,
+                    "win_pcts": [],
+                    "loss_pcts": [],
+                    "profit_pcts": [],
+                }
+
+            s = stats[key]
+            s["count"] += 1
+            if trade.profit > 0:
+                s["wins"] += 1
+                s["win_pcts"].append(trade.profit_pct)
+            else:
+                s["losses"] += 1
+                s["loss_pcts"].append(trade.profit_pct)
+
+            s["total_profit"] += trade.profit
+            s["profit_pcts"].append(trade.profit_pct)
+
+        for _, s in stats.items():
+            if s["count"] > 0:
+                s["win_rate"] = s["wins"] / s["count"]
+                s["avg_win_pct"] = np.mean(s["win_pcts"]) if s["win_pcts"] else 0.0
+                s["avg_loss_pct"] = np.mean(s["loss_pcts"]) if s["loss_pcts"] else 0.0
+                s["avg_profit_pct"] = (
+                    np.mean(s["profit_pcts"]) if s["profit_pcts"] else 0.0
+                )
+            del s["win_pcts"]
+            del s["loss_pcts"]
+            del s["profit_pcts"]
+
+        return stats

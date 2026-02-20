@@ -3356,7 +3356,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             from core.market_regime import MarketRegimeClassifier, MarketRegime
-            stats = MarketRegimeClassifier.compute_regime_stats(
+            stats = MarketRegimeClassifier.compute_direction_regime_stats(
                 self.rt_backtester.trades, self.regime_map
             )
             # 当前市场状态

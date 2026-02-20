@@ -9,7 +9,7 @@ R3000 模拟交易Tab
 """
 
 from PyQt6 import QtWidgets, QtCore, QtGui
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List, Set, Tuple
 import numpy as np
 import sys
 import os
@@ -293,68 +293,8 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         self.clear_memory_btn.clicked.connect(self._on_clear_memory_clicked)
         control_layout.addWidget(self.clear_memory_btn)
 
-        # 精品信号模式开关
-        self.signal_mode_checkbox = QtWidgets.QCheckBox("💎 精品信号开仓")
-        self.signal_mode_checkbox.setChecked(True)
-        self.signal_mode_checkbox.setStyleSheet(f"""
-            QCheckBox {{
-                color: {UI_CONFIG['THEME_ACCENT']};
-                font-size: 12px;
-                font-weight: bold;
-                padding: 5px 0;
-            }}
-            QCheckBox::indicator {{
-                width: 16px;
-                height: 16px;
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: {UI_CONFIG['THEME_ACCENT']};
-                border: 1px solid {UI_CONFIG['THEME_ACCENT']};
-                border-radius: 3px;
-            }}
-            QCheckBox::indicator:unchecked {{
-                background-color: #333;
-                border: 1px solid #555;
-                border-radius: 3px;
-            }}
-        """)
-        self.signal_mode_checkbox.setToolTip(
-            "勾选：按精品信号组合开仓（固定5%仓位 + 固定TP/SL）\n"
-            "取消：使用原指纹/原型匹配策略"
-        )
-        self.signal_mode_checkbox.stateChanged.connect(self._on_signal_mode_changed)
-        control_layout.addWidget(self.signal_mode_checkbox)
-        # 初始化一次标题状态，避免默认勾选时仍显示“聚合指纹图筛选”
-        self._on_signal_mode_changed(self.signal_mode_checkbox.checkState().value)
-        
         layout.addWidget(control_group)
         
-        # === 精品信号状态（紧凑） ===
-        self.signal_compact_group = QtWidgets.QGroupBox("精品信号状态")
-        signal_compact_layout = QtWidgets.QFormLayout(self.signal_compact_group)
-        signal_compact_layout.setContentsMargins(8, 6, 8, 6)
-        signal_compact_layout.setSpacing(4)
-
-        self.compact_sm_state_label = QtWidgets.QLabel("-")
-        self.compact_sm_state_label.setStyleSheet("font-size: 12px; font-weight: bold; color: #888;")
-        signal_compact_layout.addRow("状态:", self.compact_sm_state_label)
-
-        self.compact_sm_today_label = QtWidgets.QLabel("0 次")
-        self.compact_sm_today_label.setStyleSheet("font-size: 11px; color: #bbb;")
-        signal_compact_layout.addRow("今日:", self.compact_sm_today_label)
-
-        self.compact_sm_pool_label = QtWidgets.QLabel("等待引擎启动")
-        self.compact_sm_pool_label.setWordWrap(True)
-        self.compact_sm_pool_label.setStyleSheet("font-size: 11px; color: #8aa;")
-        signal_compact_layout.addRow("池子:", self.compact_sm_pool_label)
-
-        self.compact_sm_trigger_label = QtWidgets.QLabel("等待触发...")
-        self.compact_sm_trigger_label.setWordWrap(True)
-        self.compact_sm_trigger_label.setStyleSheet("font-size: 10px; color: #9aa;")
-        signal_compact_layout.addRow("触发:", self.compact_sm_trigger_label)
-
-        layout.addWidget(self.signal_compact_group)
-
         # === 运行状态 ===
         status_group = QtWidgets.QGroupBox("运行状态")
         status_layout = QtWidgets.QFormLayout(status_group)
@@ -405,53 +345,9 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         }
         self.save_api_requested.emit(config)
     
-    def _on_signal_mode_changed(self, state):
-        """精品信号模式开关变更"""
-        enabled = (state == QtCore.Qt.CheckState.Checked.value)
-        # 更新引擎（如果已经运行）
-        if hasattr(self, '_engine') and self._engine:
-            self._engine.use_signal_mode = enabled
-        if hasattr(self, "template_group"):
-            self.template_group.setTitle("信号模式（指纹匹配已暂停）" if enabled else "聚合指纹图筛选")
-        print(f"[UI] 精品信号模式: {'开启' if enabled else '关闭'}")
-
     def update_signal_mode_info(self, info: dict):
         """更新左侧紧凑版精品信号状态"""
-        market_state = info.get("state", "-") if info else "-"
-        today_count = info.get("today_count", 0) if info else 0
-        pool_total = int(info.get("pool_total", 0) or 0) if info else 0
-        combo_key = info.get("combo_key", "") if info else ""
-        direction = info.get("direction", "")
-        score = float(info.get("score", 0.0) or 0.0) if info else 0.0
-
-        # 状态颜色
-        state_color = "#888"
-        if "多头" in market_state:
-            state_color = "#089981"
-        elif "空头" in market_state:
-            state_color = "#f23645"
-        elif "震荡" in market_state:
-            state_color = "#FFB74D"
-        self.compact_sm_state_label.setText(market_state if market_state != "-" else "等待")
-        self.compact_sm_state_label.setStyleSheet(
-            f"font-size: 12px; font-weight: bold; color: {state_color};"
-        )
-        self.compact_sm_today_label.setText(f"{today_count} 次")
-        self.compact_sm_pool_label.setText(f"已加载 {pool_total} 个策略")
-
-        if combo_key:
-            dir_text = "做多" if direction == "long" else ("做空" if direction == "short" else "-")
-            dir_color = "#089981" if direction == "long" else "#f23645"
-            self.compact_sm_trigger_label.setText(
-                f"<span style='color:{dir_color};font-weight:bold;'>{dir_text}</span> "
-                f"命中 · 评分{score:.1f}"
-            )
-        elif info and info.get("warning"):
-            self.compact_sm_trigger_label.setText(
-                f"<span style='color:#f23645;'>{info['warning']}</span>"
-            )
-        else:
-            self.compact_sm_trigger_label.setText("无触发")
+        return
     
     def _on_clear_memory_clicked(self):
         """清除学习记忆按钮点击"""
@@ -772,16 +668,13 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # ══════ Tab 1: 持仓（含委托单、账户设置与统计） ══════
         self._create_position_tab()
         
-        # ══════ Tab 2: 精品 ══════
-        self._create_signal_mode_tab()
-
-        # ══════ Tab 3: 匹配 ══════
+        # ══════ Tab 2: 匹配 ══════
         self._create_matching_tab()
 
-        # ══════ Tab 4: 推理 ══════
-        self._create_monitoring_tab()
-        
-        # ══════ Tab 5: 日志 ══════
+        # ══════ Tab 3: 分析 ══════
+        self._create_analysis_tab()
+
+        # ══════ Tab 4: 日志 ══════
         self._create_log_tab()
         
         layout.addWidget(self.tabs)
@@ -904,6 +797,17 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
 
         self.tabs.addTab(tab, "精品")
 
+    def _create_analysis_tab(self):
+        """创建模拟交易分析标签页"""
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
+        tab_layout.setSpacing(6)
+
+        self.analysis_widget = PaperAnalysisWidget()
+        tab_layout.addWidget(self.analysis_widget)
+        self.tabs.addTab(tab, "📊 分析")
+
     def _get_cached_signal_pools(
         self,
         market_state: str,
@@ -953,6 +857,7 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
 
     def update_signal_mode_info(self, info: dict):
         """更新精品信号模式状态面板（由 main_window 状态回调调用）"""
+        return
         market_state = info.get("state", "-") if info else "-"
         today_count  = info.get("today_count", 0) if info else 0
         triggered_keys = set(info.get("triggered_keys", [])) if info else set()
@@ -3415,6 +3320,232 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.action_status_label.setText(message)
 
 
+class PaperAnalysisWidget(QtWidgets.QWidget):
+    """模拟交易分析面板：方向×市场状态汇总 + 策略汇总"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        # 表1：方向×市场状态
+        regime_group = QtWidgets.QGroupBox("方向 × 市场状态")
+        regime_group.setStyleSheet("QGroupBox{border:1px solid #444;border-radius:5px;margin-top:10px;padding-top:8px;font-weight:bold;}")
+        regime_layout = QtWidgets.QVBoxLayout(regime_group)
+        self.regime_table = self._make_table([
+            "方向", "市场状态", "交易数", "盈利数", "亏损数",
+            "胜率%", "盈利均值%", "亏损均值%", "净均值%", "净盈亏(USDT)"
+        ])
+        regime_layout.addWidget(self.regime_table)
+        layout.addWidget(regime_group, 1)
+
+        # 表2：策略汇总
+        strategy_group = QtWidgets.QGroupBox("策略汇总")
+        strategy_group.setStyleSheet("QGroupBox{border:1px solid #444;border-radius:5px;margin-top:10px;padding-top:8px;font-weight:bold;}")
+        strategy_layout = QtWidgets.QVBoxLayout(strategy_group)
+        self.strategy_table = self._make_table([
+            "策略名称", "使用次数", "做多次数", "做空次数",
+            "盈利金额", "亏损金额", "胜率%", "净盈亏(USDT)"
+        ])
+        strategy_layout.addWidget(self.strategy_table)
+        layout.addWidget(strategy_group, 1)
+
+    def _make_table(self, headers: List[str]) -> QtWidgets.QTableWidget:
+        tbl = QtWidgets.QTableWidget(0, len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        tbl.setAlternatingRowColors(True)
+        tbl.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {UI_CONFIG['THEME_SURFACE']};
+                color: {UI_CONFIG['THEME_TEXT']};
+                gridline-color: #444;
+                border: 1px solid #444;
+                font-size: 12px;
+            }}
+            QHeaderView::section {{
+                background-color: #333;
+                color: {UI_CONFIG['THEME_TEXT']};
+                border: 1px solid #444;
+                padding: 4px;
+                font-weight: bold;
+            }}
+        """)
+        return tbl
+
+    def _format_strategy_label(self, fp: Optional[str]) -> Tuple[str, str]:
+        if not fp:
+            return "其他", "其他"
+        if "|" in fp and (fp.startswith("long|") or fp.startswith("short|")):
+            _, cond_str = fp.split("|", 1)
+            conditions = [c for c in cond_str.split("+") if c]
+            try:
+                from core.signal_utils import _format_conditions
+                label = _format_conditions(conditions, "long")
+            except Exception:
+                label = cond_str
+            if len(label) > 30:
+                label = label[:27] + "..."
+            return cond_str or "其他", label
+        label = fp if len(fp) <= 30 else fp[:27] + "..."
+        return fp, label
+
+    def refresh(self, orders: List) -> None:
+        from core.market_regime import MarketRegime
+        from core.paper_trader import OrderSide
+        import numpy as np
+
+        regimes = MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN]
+        dir_list = ["long", "short"]
+
+        # -------- 表1：方向×市场状态 --------
+        stats = {(d, r): {
+            "count": 0, "wins": 0, "losses": 0,
+            "win_pcts": [], "loss_pcts": [], "all_pcts": [],
+            "total_profit": 0.0
+        } for d in dir_list for r in regimes}
+
+        for order in orders or []:
+            if getattr(order, "exit_time", None) is None:
+                continue
+            side = getattr(order, "side", None)
+            direction = "long" if side == OrderSide.LONG or getattr(side, "value", "") == "LONG" else "short"
+            regime = getattr(order, "regime_at_entry", "未知") or "未知"
+            profit = float(getattr(order, "realized_pnl", 0.0) or 0.0)
+            profit_pct = float(getattr(order, "profit_pct", 0.0) or 0.0)
+
+            key = (direction, regime)
+            if key not in stats:
+                stats[key] = {
+                    "count": 0, "wins": 0, "losses": 0,
+                    "win_pcts": [], "loss_pcts": [], "all_pcts": [],
+                    "total_profit": 0.0
+                }
+            s = stats[key]
+            s["count"] += 1
+            s["total_profit"] += profit
+            s["all_pcts"].append(profit_pct)
+            if profit > 0:
+                s["wins"] += 1
+                s["win_pcts"].append(profit_pct)
+            elif profit < 0:
+                s["losses"] += 1
+                s["loss_pcts"].append(profit_pct)
+
+        self.regime_table.setRowCount(len(regimes) * 2)
+        row = 0
+        for direction in dir_list:
+            for regime in regimes:
+                s = stats.get((direction, regime), {})
+                count = s.get("count", 0)
+                wins = s.get("wins", 0)
+                losses = s.get("losses", 0)
+                win_rate = (wins / count) if count > 0 else 0.0
+                avg_win = np.mean(s.get("win_pcts", [])) if s.get("win_pcts") else 0.0
+                avg_loss = np.mean(s.get("loss_pcts", [])) if s.get("loss_pcts") else 0.0
+                avg_all = np.mean(s.get("all_pcts", [])) if s.get("all_pcts") else 0.0
+                total_profit = s.get("total_profit", 0.0)
+
+                dir_text = "做多" if direction == "long" else "做空"
+                dir_color = UI_CONFIG['CHART_UP_COLOR'] if direction == "long" else UI_CONFIG['CHART_DOWN_COLOR']
+                regime_color = MarketRegime.COLORS.get(regime, "#888")
+
+                def _set_item(col, text, color=None, bold=False):
+                    item = QtWidgets.QTableWidgetItem(text)
+                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                    if color:
+                        item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
+                    if bold:
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                    self.regime_table.setItem(row, col, item)
+
+                _set_item(0, dir_text, dir_color, bold=True)
+                _set_item(1, regime, regime_color, bold=True)
+                _set_item(2, str(count))
+                _set_item(3, str(wins), UI_CONFIG['CHART_UP_COLOR'] if wins > 0 else None)
+                _set_item(4, str(losses), UI_CONFIG['CHART_DOWN_COLOR'] if losses > 0 else None)
+                _set_item(5, f"{win_rate * 100:.1f}" if count > 0 else "--",
+                          UI_CONFIG['CHART_UP_COLOR'] if win_rate >= 0.5 else UI_CONFIG['CHART_DOWN_COLOR'])
+                _set_item(6, f"{avg_win:+.2f}" if wins > 0 else "--",
+                          UI_CONFIG['CHART_UP_COLOR'] if wins > 0 else None)
+                _set_item(7, f"{avg_loss:+.2f}" if losses > 0 else "--",
+                          UI_CONFIG['CHART_DOWN_COLOR'] if losses > 0 else None)
+                _set_item(8, f"{avg_all:+.2f}" if count > 0 else "--",
+                          UI_CONFIG['CHART_UP_COLOR'] if avg_all >= 0 else UI_CONFIG['CHART_DOWN_COLOR'])
+                _set_item(9, f"{total_profit:+.2f}",
+                          UI_CONFIG['CHART_UP_COLOR'] if total_profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR'])
+                row += 1
+
+        # -------- 表2：策略汇总 --------
+        strat_stats: Dict[str, dict] = {}
+        strat_labels: Dict[str, str] = {}
+        for order in orders or []:
+            if getattr(order, "exit_time", None) is None:
+                continue
+            fp = getattr(order, "template_fingerprint", None)
+            key, label = self._format_strategy_label(fp)
+            strat_labels[key] = label
+
+            side = getattr(order, "side", None)
+            direction = "long" if side == OrderSide.LONG or getattr(side, "value", "") == "LONG" else "short"
+            profit = float(getattr(order, "realized_pnl", 0.0) or 0.0)
+
+            s = strat_stats.setdefault(key, {
+                "count": 0, "long": 0, "short": 0,
+                "wins": 0, "profit_pos": 0.0, "profit_neg": 0.0, "net": 0.0
+            })
+            s["count"] += 1
+            s["net"] += profit
+            if direction == "long":
+                s["long"] += 1
+            else:
+                s["short"] += 1
+            if profit > 0:
+                s["wins"] += 1
+                s["profit_pos"] += profit
+            elif profit < 0:
+                s["profit_neg"] += abs(profit)
+
+        rows = sorted(strat_stats.items(), key=lambda kv: kv[1]["count"], reverse=True)
+        self.strategy_table.setRowCount(len(rows))
+        for i, (key, s) in enumerate(rows):
+            count = s["count"]
+            win_rate = (s["wins"] / count) if count > 0 else 0.0
+            label = strat_labels.get(key, key)
+
+            def _set_item(col, text, color=None, bold=False):
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                if color:
+                    item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
+                if bold:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                self.strategy_table.setItem(i, col, item)
+
+            _set_item(0, label, bold=True)
+            _set_item(1, str(count))
+            _set_item(2, str(s["long"]), UI_CONFIG['CHART_UP_COLOR'] if s["long"] > 0 else None)
+            _set_item(3, str(s["short"]), UI_CONFIG['CHART_DOWN_COLOR'] if s["short"] > 0 else None)
+            _set_item(4, f"{s['profit_pos']:.2f}", UI_CONFIG['CHART_UP_COLOR'] if s["profit_pos"] > 0 else None)
+            _set_item(5, f"{s['profit_neg']:.2f}", UI_CONFIG['CHART_DOWN_COLOR'] if s["profit_neg"] > 0 else None)
+            _set_item(6, f"{win_rate * 100:.1f}" if count > 0 else "--",
+                      UI_CONFIG['CHART_UP_COLOR'] if win_rate >= 0.5 else UI_CONFIG['CHART_DOWN_COLOR'])
+            _set_item(7, f"{s['net']:+.2f}",
+                      UI_CONFIG['CHART_UP_COLOR'] if s["net"] >= 0 else UI_CONFIG['CHART_DOWN_COLOR'])
+
+
 class PaperTradingTradeLog(QtWidgets.QWidget):
     """模拟交易记录表格"""
     MAX_DISPLAY_TRADES = 200
@@ -3426,8 +3557,19 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         super().__init__(parent)
         self._total_trades = 0
         self._display_limit = self.MAX_DISPLAY_TRADES
+        self._analysis_widget = None
+        self._orders_by_key = {}
+        self._all_orders_by_key = {}
         self._init_ui()
         self._rows_by_key = {}
+
+    def bind_analysis_widget(self, widget) -> None:
+        self._analysis_widget = widget
+
+    def _refresh_analysis(self) -> None:
+        if self._analysis_widget:
+            source = self._all_orders_by_key or self._orders_by_key
+            self._analysis_widget.refresh(list(source.values()))
     
     def _init_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -3533,6 +3675,8 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             row_idx = self._rows_by_key[key]
             self._update_trade_row(row_idx, order)
             self.table.resizeRowToContents(row_idx)
+            self._orders_by_key[key] = order
+            self._all_orders_by_key[key] = order
         else:
             order_id = str(getattr(order, "order_id", "") or "")
             exit_time = getattr(order, "exit_time", None)
@@ -3542,25 +3686,40 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
                 self._update_trade_row(row_idx, order)
                 self._rows_by_key[key] = row_idx
                 self.table.resizeRowToContents(row_idx)
+                if order_id in self._orders_by_key:
+                    self._orders_by_key.pop(order_id, None)
+                self._orders_by_key[key] = order
+                if order_id in self._all_orders_by_key:
+                    self._all_orders_by_key.pop(order_id, None)
+                self._all_orders_by_key[key] = order
             else:
                 row = self._insert_trade_row(order)
                 self._rows_by_key[key] = row
                 self._total_trades += 1
                 self._trim_to_display_limit()
+                self._orders_by_key[key] = order
+                self._all_orders_by_key[key] = order
         self._update_empty_state()
         self._update_limit_hint()
+        self._refresh_analysis()
     
     def set_history(self, trades: List):
         """批量设置历史记录"""
         self._total_trades = len(trades or [])
         self.table.setRowCount(0)
         self._rows_by_key.clear()
+        self._orders_by_key.clear()
+        self._all_orders_by_key.clear()
+        for order in trades or []:
+            self._all_orders_by_key[self._trade_key(order)] = order
         display_trades = (trades or [])[-self._display_limit:]
         for order in display_trades:
             row = self._insert_trade_row(order)
             self._rows_by_key[self._trade_key(order)] = row
+            self._orders_by_key[self._trade_key(order)] = order
         self._update_empty_state()
         self._update_limit_hint()
+        self._refresh_analysis()
         
         # 批量加载后，再次调整所有行高（性能优化）
         self.table.resizeRowsToContents()
@@ -3946,9 +4105,12 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         """清空表格"""
         self.table.setRowCount(0)
         self._rows_by_key.clear()
+        self._orders_by_key.clear()
+        self._all_orders_by_key.clear()
         self._total_trades = 0
         self._update_empty_state()
         self._update_limit_hint()
+        self._refresh_analysis()
 
     def _trim_to_display_limit(self):
         """裁剪到最大显示条数，避免UI卡顿"""
@@ -4680,6 +4842,10 @@ class PaperTradingTab(QtWidgets.QWidget):
         # 右侧：状态面板（可拖拽拉宽）
         self.status_panel = PaperTradingStatusPanel()
         splitter.addWidget(self.status_panel)
+
+        # 交易记录与分析联动
+        if hasattr(self.status_panel, "analysis_widget"):
+            self.trade_log.bind_analysis_widget(self.status_panel.analysis_widget)
         
         # 将账户设置与统计移动到持仓页
         if hasattr(self.control_panel, "account_group"):

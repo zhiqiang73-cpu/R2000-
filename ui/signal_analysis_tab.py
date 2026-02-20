@@ -95,10 +95,7 @@ class SignalAnalysisWorker(QtCore.QObject):
                 self.progress.emit(99, "写入持久化状态...")
                 long_res  = [r for r in all_results if r['direction'] == 'long']
                 short_res = [r for r in all_results if r['direction'] == 'short']
-                if long_res:
-                    signal_store.merge_round(long_res,  direction='long',  bar_count=len(self._df))
-                if short_res:
-                    signal_store.merge_round(short_res, direction='short', bar_count=len(self._df))
+                signal_store.merge_rounds(long_res, short_res, bar_count=len(self._df))
                 # 两次 merge 都完成后，执行一次去重并更新缓存（O(n²)，只跑一次）
                 signal_store.rebuild_pruned_cache()
 
@@ -737,7 +734,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         """初始数据加载完成回调（主线程）。signal_store 内存缓存已热，各 refresh 方法几乎无 IO。"""
         self._refresh_cumulative_table()
         self._refresh_history_text()
-        self._refresh_live_monitor_table()
+        self._refresh_backtest_feedback_table()
         self._refresh_risk_display()
         self._status_lbl.setText("就绪  —  请先在「上帝视角训练」页签加载历史K线数据")
 
@@ -886,7 +883,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._populate_round_table(results)
         self._refresh_cumulative_table()
         self._refresh_history_text()
-        self._refresh_live_monitor_table()
+        self._refresh_backtest_feedback_table()
         n = len(results)
         
         if self._auto_count > 1:
@@ -1144,65 +1141,198 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "导出失败", f"写入文件失败:\n{e}")
 
-    def _refresh_live_monitor_table(self):
-        """刷新实盘监控面板：显示有实盘记录的组合及其命中率衰减情况。"""
+    def _refresh_backtest_feedback_table(self):
+        """刷新回测信号反馈面板：从纸交易记录统计各组合表现。"""
+        tbl = self._live_table
+        tbl.setSortingEnabled(False)
+        tbl.setRowCount(0)
+
         try:
             from core import signal_store
             cumulative = signal_store.get_cumulative()
         except Exception:
-            return
+            cumulative = {}
 
-        tbl = self._live_table
-        tbl.setRowCount(0)
+        data_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data",
+            "live_trade_history.json",
+        )
+        try:
+            with open(data_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
 
-        rows = []
-        for key, entry in cumulative.items():
-            lt = entry.get('live_tracking') or {}
-            if lt.get('total', 0) == 0:
+        trades = data.get("trades", []) if isinstance(data, dict) else []
+        stats: Dict[str, dict] = {}
+
+        def _normalize_regime_label(regime: str) -> str:
+            if not regime:
+                return "-"
+            mapping = {
+                "多头趋势": "多头",
+                "空头趋势": "空头",
+                "震荡市": "震荡",
+                "震荡偏多": "震荡偏多",
+                "震荡偏空": "震荡偏空",
+            }
+            return mapping.get(regime, regime)
+
+        def _is_market_match(direction: str, regime: str) -> bool:
+            if not regime:
+                return False
+            if direction == "long":
+                return ("多头" in regime) or ("偏多" in regime)
+            return ("空头" in regime) or ("偏空" in regime)
+
+        def _is_win(trade: dict) -> bool:
+            pnl = trade.get("realized_pnl", None)
+            if isinstance(pnl, (int, float)):
+                return pnl > 0
+            pct = trade.get("profit_pct", None)
+            if isinstance(pct, (int, float)):
+                return pct > 0
+            reason = str(trade.get("close_reason", ""))
+            return "止盈" in reason
+
+        def _is_stop_loss(trade: dict) -> bool:
+            reason = str(trade.get("close_reason", "")) + str(trade.get("close_reason_detail", ""))
+            return "止损" in reason
+
+        for trade in trades:
+            if trade.get("status") != "CLOSED":
                 continue
-            rows.append((key, entry, lt))
+            combo_keys = trade.get("signal_combo_keys") or []
+            template = trade.get("template_fingerprint")
+            if not combo_keys and isinstance(template, str):
+                tpl = template.lower()
+                if tpl.startswith("long|") or tpl.startswith("short|"):
+                    combo_keys = [template]
+            if not combo_keys:
+                continue
 
-        # 衰减最严重的排前面
-        def _decay_key(item):
-            _, entry, lt = item
-            return entry.get('avg_rate', 0.0) - lt.get('live_rate', 0.0)
-        rows.sort(key=_decay_key, reverse=True)
+            for key in combo_keys:
+                if not isinstance(key, str) or "|" not in key:
+                    continue
+                direction = key.split("|", 1)[0].lower()
+                if direction not in ("long", "short"):
+                    direction = "long" if str(trade.get("side", "")).upper() == "LONG" else "short"
 
-        for key, entry, lt in rows:
+                entry = stats.setdefault(
+                    key,
+                    {
+                        "direction": direction,
+                        "total": 0,
+                        "wins": 0,
+                        "stop_loss": 0,
+                        "market_match": 0,
+                        "regimes": {},
+                    },
+                )
+                entry["total"] += 1
+                win = _is_win(trade)
+                entry["wins"] += 1 if win else 0
+                entry["stop_loss"] += 1 if _is_stop_loss(trade) else 0
+
+                regime = trade.get("regime_at_entry", "")
+                label = _normalize_regime_label(regime)
+                reg_stats = entry["regimes"].setdefault(label, {"total": 0, "wins": 0})
+                reg_stats["total"] += 1
+                reg_stats["wins"] += 1 if win else 0
+                entry["market_match"] += 1 if _is_market_match(direction, regime) else 0
+
+        if not stats:
             row = tbl.rowCount()
             tbl.insertRow(row)
+            message = "暂无组合信号记录，请在「精品信号模式」运行模拟盘/纸交易生成回测数据。"
+            _set_item(tbl, row, 0, message, TEXT_DIM)
+            if tbl.columnCount() > 1:
+                tbl.setSpan(row, 0, 1, tbl.columnCount())
+            tbl.setSortingEnabled(True)
+            return
 
-            conditions   = entry.get('conditions', [])
-            combo_label  = _format_conditions(conditions[:3], entry.get("direction", ""))
-            if len(conditions) > 3:
-                combo_label += f" +{len(conditions) - 3}"
+        rows: List[dict] = []
+        for key, entry in stats.items():
+            total = entry["total"]
+            wins = entry["wins"]
+            hit_rate = wins / total if total else 0.0
+            market_match = entry["market_match"] / total if total else 0.0
+            stop_loss_rate = entry["stop_loss"] / total if total else 0.0
 
-            avg_rate  = entry.get('avg_rate', 0.0)
-            live_rate = lt.get('live_rate', 0.0)
-            total     = lt.get('total', 0)
-            streak    = lt.get('streak_loss', 0)
-            decay     = avg_rate - live_rate
+            cumulative_entry = cumulative.get(key) or {}
+            pool_rate = cumulative_entry.get("avg_rate", 0.0)
+            tier_rate = cumulative_entry.get("overall_rate", pool_rate)
+            tier_str = _tier_from_rate(tier_rate, entry["direction"]) or "--"
 
-            # 状态判定
-            if total < 10 or decay < 0.05:
-                status_text  = "正常"
-                status_color = GOOD_COLOR
-            elif decay < 0.10:
-                status_text  = "⚠ 轻微衰减"
-                status_color = DECAY_MILD
-            else:
-                status_text  = "⛔ 严重衰减"
-                status_color = DECAY_SEVERE
+            conditions: List[str] = []
+            if "|" in key:
+                conditions = [c for c in key.split("|", 1)[1].split("+") if c]
+            conditions_label = _format_conditions(conditions, entry["direction"]) if conditions else key
 
-            _set_item(tbl, row, 0, combo_label, TEXT_DIM)
-            _set_item(tbl, row, 1, f"{avg_rate:.1%}",
-                      _rate_color(avg_rate, entry.get("direction", "long")))
-            _set_item(tbl, row, 2, f"{live_rate:.1%}",
-                      _rate_color(live_rate, entry.get("direction", "long")), bold=True)
-            _set_item(tbl, row, 3, str(total), TEXT_DIM)
-            _set_item(tbl, row, 4, str(streak),
-                      DECAY_SEVERE if streak >= 5 else TEXT_DIM)
-            _set_item(tbl, row, 5, status_text, status_color, bold=True)
+            regime_parts = []
+            for label, reg in entry["regimes"].items():
+                if reg["total"] == 0:
+                    continue
+                reg_rate = reg["wins"] / reg["total"]
+                regime_parts.append((reg["total"], f"{label}:{reg_rate:.0%}"))
+            regime_parts.sort(key=lambda x: x[0], reverse=True)
+            regime_text = " ".join([p[1] for p in regime_parts]) if regime_parts else "-"
+
+            issues = []
+            if total < 5:
+                issues.append("样本不足")
+            if pool_rate > 0 and hit_rate < pool_rate - 0.10:
+                issues.append("命中率低于预期")
+            if market_match < 0.5:
+                issues.append("市场状态不匹配")
+            if stop_loss_rate > 0.6:
+                issues.append("止损频发")
+            issues_text = "、".join(issues) if issues else "-"
+
+            rows.append({
+                "key": key,
+                "direction": entry["direction"],
+                "tier": tier_str,
+                "conditions_label": conditions_label,
+                "total": total,
+                "hit_rate": hit_rate,
+                "pool_rate": pool_rate,
+                "regime_text": regime_text,
+                "market_match": market_match,
+                "issues": issues_text,
+                "pool_gap": pool_rate - hit_rate,
+            })
+
+        def _sort_key(r: dict):
+            pool_missing = 1 if r["pool_rate"] <= 0 else 0
+            return (pool_missing, r["market_match"], -r["pool_gap"])
+
+        rows.sort(key=_sort_key)
+
+        for seq, r in enumerate(rows, start=1):
+            row = tbl.rowCount()
+            tbl.insertRow(row)
+            dir_str = "做多" if r["direction"] == "long" else "做空"
+            dir_color = LONG_COLOR if r["direction"] == "long" else SHORT_COLOR
+            tier_color = _tier_color(r["tier"]) if r["tier"] not in ("", "--") else TEXT_DIM
+            hit_color = _rate_color(r["hit_rate"], r["direction"])
+            pool_color = _rate_color(r["pool_rate"], r["direction"])
+
+            _set_item(tbl, row, 0, str(seq), TEXT_DIM)
+            _set_item(tbl, row, 1, dir_str, dir_color, bold=True)
+            _set_item(tbl, row, 2, r["tier"], tier_color, bold=r["tier"] not in ("", "--"))
+            _set_item(tbl, row, 3, r["conditions_label"], TEXT_DIM)
+            _set_item(tbl, row, 4, str(r["total"]), TEXT_DIM, sort_value=r["total"])
+            _set_item(tbl, row, 5, f"{r['hit_rate']:.1%}", hit_color, bold=True,
+                      sort_value=r["hit_rate"])
+            _set_item(tbl, row, 6, f"{r['pool_rate']:.1%}", pool_color,
+                      sort_value=r["pool_rate"])
+            _set_item(tbl, row, 7, r["regime_text"], TEXT_DIM)
+            _set_item(tbl, row, 8, f"{r['market_match']:.0%}", TEXT_DIM,
+                      sort_value=r["market_match"])
+            _set_item(tbl, row, 9, r["issues"], WARN_COLOR if r["issues"] != "-" else TEXT_DIM)
+        tbl.setSortingEnabled(True)
 
     def _refresh_risk_display(self):
         """从 signal_store 读取最大连亏次数，更新风控显示标签。"""
@@ -1273,5 +1403,5 @@ class SignalAnalysisTab(QtWidgets.QWidget):
 
     def refresh_live_data(self):
         """外部调用：刷新实盘监控面板和风控显示（供 MainWindow 定时调用）。"""
-        self._refresh_live_monitor_table()
+        self._refresh_backtest_feedback_table()
         self._refresh_risk_display()

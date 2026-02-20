@@ -485,9 +485,10 @@ class MarketRegimeWidget(QtWidgets.QWidget):
         stats_layout = QtWidgets.QVBoxLayout(stats_group)
 
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
-            "市场状态", "交易数", "做多", "做空", "盈利数", "正确率%", "平均收益%"
+            "方向", "市场状态", "交易数", "盈利数", "亏损数", "胜率%",
+            "盈利均值%", "亏损均值%", "净均值%", "净盈亏"
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(
@@ -522,24 +523,62 @@ class MarketRegimeWidget(QtWidgets.QWidget):
         self._init_table()
 
     def _init_table(self):
-        """初始化7行（6种状态 + 1未知）"""
+        """初始化方向 × 市场状态双维表格"""
         from core.market_regime import MarketRegime
         regimes = MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN]
-        self.table.setRowCount(len(regimes))
+        self._row_specs = []
+        for direction in ("long", "short"):
+            if direction == "short":
+                self._row_specs.append({"type": "separator", "label": "做空"})
+            for regime in regimes:
+                self._row_specs.append({
+                    "type": "data",
+                    "direction": direction,
+                    "regime": regime,
+                })
 
-        for row, regime in enumerate(regimes):
-            # 市场状态名（带颜色）
-            item = QtWidgets.QTableWidgetItem(regime)
-            color = MarketRegime.COLORS.get(regime, "#888")
-            item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
-            font = item.font()
+        self.table.setRowCount(len(self._row_specs))
+
+        for row, spec in enumerate(self._row_specs):
+            if spec["type"] == "separator":
+                item = QtWidgets.QTableWidgetItem(f"—— {spec['label']} ——")
+                item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
+                item.setBackground(QtGui.QBrush(QtGui.QColor("#2a2a2a")))
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                self.table.setSpan(row, 0, 1, self.table.columnCount())
+                self.table.setItem(row, 0, item)
+                self.table.setRowHeight(row, 18)
+                continue
+
+            direction = spec["direction"]
+            regime = spec["regime"]
+
+            # 方向
+            direction_text = "做多" if direction == "long" else "做空"
+            direction_item = QtWidgets.QTableWidgetItem(direction_text)
+            direction_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            direction_color = UI_CONFIG["CHART_UP_COLOR"] if direction == "long" else UI_CONFIG["CHART_DOWN_COLOR"]
+            direction_item.setForeground(QtGui.QBrush(QtGui.QColor(direction_color)))
+            font = direction_item.font()
             font.setBold(True)
-            item.setFont(font)
-            self.table.setItem(row, 0, item)
+            direction_item.setFont(font)
+            self.table.setItem(row, 0, direction_item)
 
-            # 其余列初始化为 0 或 --
-            for col in range(1, 7):
-                cell = QtWidgets.QTableWidgetItem("0" if col < 6 else "0.0")
+            # 市场状态（带颜色）
+            regime_item = QtWidgets.QTableWidgetItem(regime)
+            regime_color = MarketRegime.COLORS.get(regime, "#888")
+            regime_item.setForeground(QtGui.QBrush(QtGui.QColor(regime_color)))
+            font = regime_item.font()
+            font.setBold(True)
+            regime_item.setFont(font)
+            self.table.setItem(row, 1, regime_item)
+
+            # 其余列初始化
+            for col in range(2, 10):
+                cell = QtWidgets.QTableWidgetItem("0" if col in (2, 3, 4) else "0.0")
                 cell.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, col, cell)
 
@@ -557,45 +596,46 @@ class MarketRegimeWidget(QtWidgets.QWidget):
         更新统计表格
 
         Args:
-            regime_stats: {regime_str: {count, long, short, wins, losses, win_rate, avg_profit_pct, total_profit}}
+            regime_stats: {(direction, regime): {count, wins, losses, win_rate,
+                                                 avg_win_pct, avg_loss_pct,
+                                                 avg_profit_pct, total_profit}}
         """
-        from core.market_regime import MarketRegime
-        regimes = MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN]
+        for row, spec in enumerate(self._row_specs):
+            if spec["type"] != "data":
+                continue
 
-        for row, regime in enumerate(regimes):
-            s = regime_stats.get(regime, {})
+            direction = spec["direction"]
+            regime = spec["regime"]
+            s = regime_stats.get((direction, regime), {})
             count = s.get("count", 0)
-            long_n = s.get("long", 0)
-            short_n = s.get("short", 0)
             wins = s.get("wins", 0)
+            losses = s.get("losses", 0)
             win_rate = s.get("win_rate", 0.0)
-            avg_pct = s.get("avg_profit_pct", 0.0)
+            avg_win = s.get("avg_win_pct", 0.0)
+            avg_loss = s.get("avg_loss_pct", 0.0)
+            avg_profit = s.get("avg_profit_pct", 0.0)
+            total_profit = s.get("total_profit", 0.0)
 
             # 交易数
             count_item = QtWidgets.QTableWidgetItem(str(count))
             count_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 1, count_item)
-
-            # 做多
-            long_item = QtWidgets.QTableWidgetItem(str(long_n))
-            long_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            if long_n > 0:
-                long_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['CHART_UP_COLOR'])))
-            self.table.setItem(row, 2, long_item)
-
-            # 做空
-            short_item = QtWidgets.QTableWidgetItem(str(short_n))
-            short_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            if short_n > 0:
-                short_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR'])))
-            self.table.setItem(row, 3, short_item)
+            self.table.setItem(row, 2, count_item)
 
             # 盈利数
             win_item = QtWidgets.QTableWidgetItem(str(wins))
             win_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 4, win_item)
+            if wins > 0:
+                win_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['CHART_UP_COLOR'])))
+            self.table.setItem(row, 3, win_item)
 
-            # 正确率%
+            # 亏损数
+            loss_item = QtWidgets.QTableWidgetItem(str(losses))
+            loss_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if losses > 0:
+                loss_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR'])))
+            self.table.setItem(row, 4, loss_item)
+
+            # 胜率%
             rate_str = f"{win_rate * 100:.1f}" if count > 0 else "--"
             rate_item = QtWidgets.QTableWidgetItem(rate_str)
             rate_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -607,14 +647,39 @@ class MarketRegimeWidget(QtWidgets.QWidget):
                 rate_item.setFont(font)
             self.table.setItem(row, 5, rate_item)
 
-            # 平均收益%
-            avg_str = f"{avg_pct:.2f}" if count > 0 else "--"
-            avg_item = QtWidgets.QTableWidgetItem(avg_str)
-            avg_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            # 盈利均值%
+            avg_win_str = f"{avg_win:.2f}" if count > 0 else "--"
+            avg_win_item = QtWidgets.QTableWidgetItem(avg_win_str)
+            avg_win_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if count > 0 and avg_win != 0:
+                avg_win_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['CHART_UP_COLOR'])))
+            self.table.setItem(row, 6, avg_win_item)
+
+            # 亏损均值%
+            avg_loss_str = f"{avg_loss:.2f}" if count > 0 else "--"
+            avg_loss_item = QtWidgets.QTableWidgetItem(avg_loss_str)
+            avg_loss_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if count > 0 and avg_loss != 0:
+                avg_loss_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR'])))
+            self.table.setItem(row, 7, avg_loss_item)
+
+            # 净均值%
+            avg_profit_str = f"{avg_profit:.2f}" if count > 0 else "--"
+            avg_profit_item = QtWidgets.QTableWidgetItem(avg_profit_str)
+            avg_profit_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             if count > 0:
-                avg_color = UI_CONFIG['CHART_UP_COLOR'] if avg_pct >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
-                avg_item.setForeground(QtGui.QBrush(QtGui.QColor(avg_color)))
-            self.table.setItem(row, 6, avg_item)
+                avg_profit_color = UI_CONFIG['CHART_UP_COLOR'] if avg_profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
+                avg_profit_item.setForeground(QtGui.QBrush(QtGui.QColor(avg_profit_color)))
+            self.table.setItem(row, 8, avg_profit_item)
+
+            # 净盈亏
+            total_str = f"{total_profit:.2f}" if count > 0 else "--"
+            total_item = QtWidgets.QTableWidgetItem(total_str)
+            total_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if count > 0:
+                total_color = UI_CONFIG['CHART_UP_COLOR'] if total_profit >= 0 else UI_CONFIG['CHART_DOWN_COLOR']
+                total_item.setForeground(QtGui.QBrush(QtGui.QColor(total_color)))
+            self.table.setItem(row, 9, total_item)
 
 
 class TrajectoryMatchWidget(QtWidgets.QWidget):
