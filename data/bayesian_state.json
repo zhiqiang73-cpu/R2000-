@@ -1,0 +1,251 @@
+{
+  "config": {
+    "prior_strength": 10.0,
+    "min_win_rate_threshold": 0.4,
+    "thompson_sampling": false,
+    "decay_enabled": true,
+    "decay_interval_hours": 24.0,
+    "decay_factor": 0.95
+  },
+  "state": {
+    "data_version": 2,
+    "created_at": 1771599749.2784688,
+    "last_save_time": 1771648141.200334,
+    "last_decay_time": 1771599570.0629427,
+    "total_signals_received": 0,
+    "total_signals_accepted": 0,
+    "total_signals_rejected": 0
+  },
+  "distributions": {
+    "proto_LONG_2_震荡偏空": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0785544,
+      "trade_count": 0,
+      "total_win_profit": 14.245175913281935,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_16_震荡偏空": {
+      "alpha": 7.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0786157,
+      "trade_count": 0,
+      "total_win_profit": 31.695926283470936,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_29_震荡偏多": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0786645,
+      "trade_count": 0,
+      "total_win_profit": 16.329736191361782,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_59_强多头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0787032,
+      "trade_count": 0,
+      "total_win_profit": 19.475638787223257,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_83_强空头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.078742,
+      "trade_count": 0,
+      "total_win_profit": 18.392123094643086,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_100_强空头": {
+      "alpha": 3.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0787785,
+      "trade_count": 0,
+      "total_win_profit": 8.714862090897393,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_106_弱空头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0788188,
+      "trade_count": 0,
+      "total_win_profit": 17.541369992274127,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_109_弱空头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0788682,
+      "trade_count": 0,
+      "total_win_profit": 22.952111127380963,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_137_弱多头": {
+      "alpha": 3.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.078905,
+      "trade_count": 0,
+      "total_win_profit": 7.293523062793238,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_LONG_150_弱多头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.078944,
+      "trade_count": 0,
+      "total_win_profit": 18.117566747204723,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_5_震荡偏空": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0789802,
+      "trade_count": 0,
+      "total_win_profit": 14.858948479176412,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_28_震荡偏多": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0790184,
+      "trade_count": 0,
+      "total_win_profit": 15.633892842512846,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_56_强多头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0790606,
+      "trade_count": 0,
+      "total_win_profit": 15.94521258806819,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_58_强多头": {
+      "alpha": 6.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.079099,
+      "trade_count": 0,
+      "total_win_profit": 33.21248538800405,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_80_强空头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0791345,
+      "trade_count": 0,
+      "total_win_profit": 19.58927631240773,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_85_强空头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0791688,
+      "trade_count": 0,
+      "total_win_profit": 25.6980408995854,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_100_强空头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0792131,
+      "trade_count": 0,
+      "total_win_profit": 18.466818236115138,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_128_弱空头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.079247,
+      "trade_count": 0,
+      "total_win_profit": 17.793945717628578,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "proto_SHORT_149_弱多头": {
+      "alpha": 10.0,
+      "beta": 1.0,
+      "last_update_time": 1771599570.0792792,
+      "trade_count": 0,
+      "total_win_profit": 16.424448482132345,
+      "total_loss_amount": 1.0,
+      "win_count_real": 0,
+      "loss_count_real": 0
+    },
+    "short|close_vs_ma5_mod_loose+j_strict+vol_ratio_strict_震荡市": {
+      "alpha": 1.0,
+      "beta": 3.0,
+      "last_update_time": 1771599749.9595335,
+      "trade_count": 2,
+      "total_win_profit": 0.0,
+      "total_loss_amount": 35.17918190121217,
+      "win_count_real": 0,
+      "loss_count_real": 2
+    },
+    "long|close_vs_ma5_mod_loose+macd_hist_turn_loose+obv_trend_loose_多头趋势": {
+      "alpha": 1.0,
+      "beta": 3.0,
+      "last_update_time": 1771600585.2858624,
+      "trade_count": 2,
+      "total_win_profit": 0.0,
+      "total_loss_amount": 34.59153090589103,
+      "win_count_real": 0,
+      "loss_count_real": 2
+    },
+    "long:k_loose,macd_hist_turn_strict,rsi_loose_多头趋势": {
+      "alpha": 3.0,
+      "beta": 1.0,
+      "last_update_time": 1771622957.7729855,
+      "trade_count": 2,
+      "total_win_profit": 28.322489885078113,
+      "total_loss_amount": 0.0,
+      "win_count_real": 2,
+      "loss_count_real": 0
+    },
+    "short:consec_bull_strict,j_loose,macd_hist_turn_loose,obv_trend_loose,upper_shd_strict_空头趋势": {
+      "alpha": 1.0,
+      "beta": 3.0,
+      "last_update_time": 1771648141.2001219,
+      "trade_count": 2,
+      "total_win_profit": 0.0,
+      "total_loss_amount": 588.7969726499059,
+      "win_count_real": 0,
+      "loss_count_real": 2
+    }
+  }
+}

@@ -5,13 +5,13 @@
   "euclidean_threshold": 0.35,
   "dtw_threshold": 0.3,
   "auto_relax_count": 0,
-  "last_trade_time": 1771460916.693746,
-  "trades_today": 1,
-  "trades_today_date": "2026-02-19",
+  "last_trade_time": 1771666820.815555,
+  "trades_today": 6,
+  "trades_today_date": "2026-02-21",
   "graduated": false,
   "graduation_time": null,
   "trade_results": [],
   "created_at": 1771460922.2470858,
-  "last_save_time": 1771555919.871615,
-  "saved_at": "2026-02-20T10:51:59.871626"
+  "last_save_time": 1771666860.7119586,
+  "saved_at": "2026-02-21T17:41:00.711964"
 }

@@ -162,6 +162,7 @@ class LiveTradingEngine:
                  use_qualified_only: bool = True,
                  qualified_fingerprints: Optional[set] = None,
                  qualified_prototype_fingerprints: Optional[set] = None,
+                 oscillation_filter_enabled: bool = True,
                  # API配置
                  api_key: Optional[str] = None,
                  api_secret: Optional[str] = None,
@@ -201,6 +202,7 @@ class LiveTradingEngine:
             use_qualified_only: 是否只用合格模板
             qualified_fingerprints: 合格模板指纹集合
             qualified_prototype_fingerprints: 合格原型指纹集合（proto_LONG_x / proto_SHORT_x）
+            oscillation_filter_enabled: 震荡/未知状态是否启用单向过滤
             api_key: API Key
             api_secret: API Secret
             use_testnet: 是否使用测试网
@@ -246,6 +248,7 @@ class LiveTradingEngine:
         self.use_qualified_only = use_qualified_only
         self.qualified_fingerprints = qualified_fingerprints or set()
         self.qualified_prototype_fingerprints = qualified_prototype_fingerprints or set()
+        self.oscillation_filter_enabled = bool(oscillation_filter_enabled)
         self.use_qualified_prototypes = bool(self.qualified_prototype_fingerprints)
         
         # 回调
@@ -347,6 +350,9 @@ class LiveTradingEngine:
         self._pending_signal_combos: List[str] = []
         self._signal_pool_cond_cache: Dict[str, dict] = {}
         self._signal_pool_cond_cache_bar: int = -1
+
+        # 模拟交易结构化日志（开仓 / TP1 / 止损 / 平仓等关键事件）
+        self.paper_trade_logs: List[dict] = []
 
         # 线程控制
         self._running = False
@@ -573,6 +579,40 @@ class LiveTradingEngine:
             self._clear_entry_candidate("候选超时过期")
             return None
         return self._entry_candidate
+
+    def _lookup_avg_hold(self, template_fingerprint: Optional[str]) -> int:
+        """
+        从 signal_cumulative_cache 查询策略平均持仓根数。
+        样本 < 10 或未找到时返回 0（调用方使用全局配置）。
+        """
+        if not template_fingerprint:
+            return 0
+        try:
+            from core.signal_store import _load_cumulative_fast
+            cumulative = _load_cumulative_fast()
+            entry = cumulative.get(template_fingerprint)
+            if not entry:
+                return 0
+            sample = entry.get("hold_bars_sample_count", 0)
+            if sample < 10:
+                return 0
+            return int(entry.get("avg_hold_bars", 0) or 0)
+        except Exception:
+            return 0
+
+    def _apply_avg_hold_to_order(self, order: Optional[PaperOrder], template_fingerprint: Optional[str]) -> None:
+        """开仓后写入 avg_hold_bars / decay_bar_1 / decay_bar_2 到 order。"""
+        if order is None:
+            return
+        from config import PAPER_TRADING_CONFIG as _ptc
+        _avg = self._lookup_avg_hold(template_fingerprint)
+        order.avg_hold_bars = _avg
+        if _avg >= 10:
+            order.decay_bar_1 = int(_avg * 0.50)
+            order.decay_bar_2 = int(_avg * 0.70)
+        else:
+            order.decay_bar_1 = _ptc.get("TIME_DECAY_BAR_1", 30)
+            order.decay_bar_2 = _ptc.get("TIME_DECAY_BAR_2", 60)
 
     # ─── 冷启动系统回调 ─────────────────────────
 
@@ -1430,7 +1470,7 @@ class LiveTradingEngine:
             if self._df_buffer is not None and len(self._df_buffer) > 0:
                 df_idx = self._get_df_bar_idx()
                 from core import signal_store as _sig_store
-                # 监控全量累计组合（appear_rounds >= 2 由 SignalLiveMonitor 内置保护）
+                # 监控全量累计组合（appear_rounds >= 3 由 SignalLiveMonitor 内置保护）
                 self._pending_signal_combos = self._signal_live_monitor.on_bar(
                     self._df_buffer, df_idx, pool_keys=None
                 )
@@ -1777,17 +1817,12 @@ class LiveTradingEngine:
         
         print(f"[LiveEngine] 🔄 执行反手单: {direction} @ {price:.2f} | 市场={current_regime}")
         
-        # 计算限价入场价
-        from config import VECTOR_SPACE_CONFIG
-        confirm_pct = VECTOR_SPACE_CONFIG.get("ENTRY_CONFIRM_PCT", 0.001)
-        timeout = VECTOR_SPACE_CONFIG.get("TRIGGER_TIMEOUT_BARS", 5)
-        limit_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
+        # 使用K线收盘价直接市价入场
+        entry_price = price
+        take_profit, stop_loss = self._calculate_fixed_tp_sl(entry_price, direction)
         
-        # 计算 TP/SL（基于实际入场价）
-        take_profit, stop_loss = self._calculate_fixed_tp_sl(limit_price, direction)
-        
-        tp_pct = abs(take_profit - limit_price) / limit_price * 100
-        sl_pct = abs(stop_loss - limit_price) / limit_price * 100
+        tp_pct = abs(take_profit - entry_price) / entry_price * 100
+        sl_pct = abs(stop_loss - entry_price) / entry_price * 100
         
         reason = (
             f"[反手单] 止损反手 | {direction} | "
@@ -1795,23 +1830,22 @@ class LiveTradingEngine:
         )
         
         # 下单（不检查指标门控，反手是确定性信号）
-        order_id = self._paper_trader.place_stop_order(
+        order = self._paper_trader.open_position(
             side=side,
-            trigger_price=limit_price,
+            price=entry_price,
             bar_idx=self._current_bar_idx,
             take_profit=take_profit,
             stop_loss=stop_loss,
             template_fingerprint="REVERSE",
             entry_similarity=0.0,
             entry_reason=reason,
-            timeout_bars=timeout,
             regime_at_entry=self.state.market_regime,
         )
-        
-        if order_id:
-            print(f"[LiveEngine] 🔄 反手限价单已挂: {direction} @ {limit_price:.2f} "
-                  f"(当前={price:.2f}, TP={take_profit:.2f}, SL={stop_loss:.2f})")
-            self.state.last_event = f"[反手单] {direction} @ {limit_price:.2f}"
+        self._apply_avg_hold_to_order(order, "REVERSE")
+        if order:
+            print(f"[LiveEngine] 🔄 反手市价单已成交: {direction} @ {entry_price:.2f} "
+                  f"(TP={take_profit:.2f}, SL={stop_loss:.2f})")
+            self.state.last_event = f"[反手单] {direction} @ {entry_price:.2f}"
             self.state.decision_reason = reason
             self.state.matching_phase = "反手入场"
         else:
@@ -1852,48 +1886,42 @@ class LiveTradingEngine:
         print(f"[LiveEngine] 🔄🔄 执行翻转入场: {direction} @ {price:.2f} | "
               f"价格在区间{pos_label}({pos_pct:.0%}) | 原型={flip_fp}({flip_sim:.1%})")
         
-        # 计算限价入场价
-        from config import VECTOR_SPACE_CONFIG
-        confirm_pct = VECTOR_SPACE_CONFIG.get("ENTRY_CONFIRM_PCT", 0.001)
-        timeout = VECTOR_SPACE_CONFIG.get("TRIGGER_TIMEOUT_BARS", 5)
-        limit_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
-        
         # 计算 TP/SL
-        take_profit, stop_loss = self._calculate_fixed_tp_sl(limit_price, direction)
-        
-        tp_pct = abs(take_profit - limit_price) / limit_price * 100
-        sl_pct = abs(stop_loss - limit_price) / limit_price * 100
-        
+        entry_price = kline.close
+        take_profit, stop_loss = self._calculate_fixed_tp_sl(entry_price, direction)
+
+        tp_pct = abs(take_profit - entry_price) / entry_price * 100
+        sl_pct = abs(stop_loss - entry_price) / entry_price * 100
+
         reason = (
             f"[翻转单] 价格{pos_label}({pos_pct:.0%})翻转 | {direction} | "
             f"原型={flip_fp}({flip_sim:.1%}) | "
             f"TP={take_profit:.2f}(+{tp_pct:.1f}%) SL={stop_loss:.2f}(-{sl_pct:.1f}%)"
         )
-        
+
         # 下单（翻转单跳过MACD门控 — 已在检测时确认MACD支持）
-        order_id = self._paper_trader.place_stop_order(
+        order = self._paper_trader.open_position(
             side=side,
-            trigger_price=limit_price,
+            price=entry_price,
             bar_idx=self._current_bar_idx,
             take_profit=take_profit,
             stop_loss=stop_loss,
             template_fingerprint=flip_fp or "FLIP",
             entry_similarity=flip_sim,
             entry_reason=reason,
-            timeout_bars=timeout,
             regime_at_entry=self.state.market_regime,
         )
-        
-        if order_id:
+        self._apply_avg_hold_to_order(order, flip_fp or "FLIP")
+        if order:
             # 标记这是一个翻转单（通过回调在开仓时设置）
             self._pending_flip_mark = True
-            
-            print(f"[LiveEngine] 🔄 翻转限价单已挂: {direction} @ {limit_price:.2f} "
-                  f"(当前={price:.2f}, TP={take_profit:.2f}, SL={stop_loss:.2f})")
-            self.state.last_event = f"🔄 [翻转单] {direction} @ {limit_price:.2f} | {pos_label}({pos_pct:.0%})"
+
+            print(f"[LiveEngine] 🔄 翻转市价开仓: {direction} @ {entry_price:.2f} "
+                  f"(TP={take_profit:.2f}, SL={stop_loss:.2f})")
+            self.state.last_event = f"🔄 [翻转单] {direction} @ {entry_price:.2f} | {pos_label}({pos_pct:.0%})"
             self.state.decision_reason = reason
             self.state.matching_phase = "翻转入场"
-            
+
             # 重置止损反手计数（翻转不计入连续止损反手）
             self._reverse_count = 0
             self._reverse_pending = False
@@ -2012,15 +2040,36 @@ class LiveTradingEngine:
             combo_key, combo_entry, combo_tier = best_res
             direction = combo_entry.get('direction', 'long')
 
-            # 市场状态方向门禁：多头趋势只做多，空头趋势只做空，震荡市不限
+            # 市场状态方向门禁：逆势信号需在该状态下胜率 ≥ 标准候选门槛+10pp 且触发次数足够
+            # 做多逆势（空头趋势做多）：需 ≥ 74%（64%+10pp）且触发次数 ≥ 10
+            # 做空逆势（多头趋势做空）：需 ≥ 62%（52%+10pp）且触发次数 ≥ 10
+            _COUNTER_TREND_LONG_THRESH  = 0.74
+            _COUNTER_TREND_SHORT_THRESH = 0.62
+            _COUNTER_TREND_MIN_TRIGGERS = 10
+
+            _breakdown = combo_entry.get('market_state_breakdown', {}) or {}
+
             if current_state == '多头趋势' and direction == 'short':
-                self.state.last_event = f"[精品信号] 多头趋势，跳过做空信号: {combo_key}"
-                print(f"[LiveEngine] [精品信号] 多头趋势，拒绝做空: {combo_key}")
-                return
+                _si = _breakdown.get('多头趋势', {}) or {}
+                _sr = float(_si.get('avg_rate', 0.0))
+                _st = int(_si.get('total_triggers', 0))
+                if _sr >= _COUNTER_TREND_SHORT_THRESH and _st >= _COUNTER_TREND_MIN_TRIGGERS:
+                    print(f"[LiveEngine] [逆势放行] 多头趋势做空 | state_rate={_sr:.1%} triggers={_st} | {combo_key}")
+                else:
+                    self.state.last_event = f"[精品信号] 多头趋势，拒绝做空(逆势胜率{_sr:.0%}<62%或样本不足{_st}): {combo_key}"
+                    print(f"[LiveEngine] [精品信号] 多头趋势，拒绝做空(state_rate={_sr:.1%} triggers={_st}): {combo_key}")
+                    return
+
             if current_state == '空头趋势' and direction == 'long':
-                self.state.last_event = f"[精品信号] 空头趋势，跳过做多信号: {combo_key}"
-                print(f"[LiveEngine] [精品信号] 空头趋势，拒绝做多: {combo_key}")
-                return
+                _si = _breakdown.get('空头趋势', {}) or {}
+                _sr = float(_si.get('avg_rate', 0.0))
+                _st = int(_si.get('total_triggers', 0))
+                if _sr >= _COUNTER_TREND_LONG_THRESH and _st >= _COUNTER_TREND_MIN_TRIGGERS:
+                    print(f"[LiveEngine] [逆势放行] 空头趋势做多 | state_rate={_sr:.1%} triggers={_st} | {combo_key}")
+                else:
+                    self.state.last_event = f"[精品信号] 空头趋势，拒绝做多(逆势胜率{_sr:.0%}<74%或样本不足{_st}): {combo_key}"
+                    print(f"[LiveEngine] [精品信号] 空头趋势，拒绝做多(state_rate={_sr:.1%} triggers={_st}): {combo_key}")
+                    return
 
             # 记录匹配情况（命中哪个、层级、差多少）
             triggered_keys = list(self._pending_signal_combos or [])
@@ -2076,9 +2125,9 @@ class LiveTradingEngine:
 
         # 7. 固定 5% 仓位下单
         # combo_key 格式已经是 "long|cond1+cond2+..." ，直接用作 template_fingerprint
-        order_id = self._paper_trader.place_stop_order(
+        order = self._paper_trader.open_position(
             side=side,
-            trigger_price=entry_price,
+            price=entry_price,
             bar_idx=self._current_bar_idx,
             take_profit=tp_price,
             stop_loss=sl_price,
@@ -2087,8 +2136,8 @@ class LiveTradingEngine:
             position_size_pct=0.05,
             regime_at_entry=current_state,
         )
-
-        if order_id:
+        self._apply_avg_hold_to_order(order, combo_key)
+        if order:
             today_str = kline.open_time.strftime("%Y-%m-%d")
             if today_str != self._sm_last_date:
                 self._sm_today_count = 1
@@ -2195,7 +2244,7 @@ class LiveTradingEngine:
             triggered_set = set(info["triggered_keys"])
             cumul = signal_store.get_cumulative()
             info["pool_total"] = sum(
-                1 for e in cumul.values() if e.get("appear_rounds", 0) >= 2
+                1 for e in cumul.values() if e.get("appear_rounds", 0) >= 3
             )
         except Exception:
             return info
@@ -2376,39 +2425,60 @@ class LiveTradingEngine:
                             direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
                             chosen_match_result = short_result  # 【指纹3D图】存储匹配结果
                     else:
-                        # 【震荡/未知状态】用近3根K线净涨跌决定单向匹配，避免双向盲猜逆势开仓
-                        _osc_dir = None
-                        if self._df_buffer is not None and df_idx >= 2:
-                            _closes = self._df_buffer['close'].iloc[df_idx - 2: df_idx + 1].values
-                            _opens  = self._df_buffer['open'].iloc[df_idx - 2: df_idx + 1].values
-                            _net    = float(sum(_closes - _opens))
-                            if _net > 0:
-                                _osc_dir = "LONG"
-                            elif _net < 0:
-                                _osc_dir = "SHORT"
-                        if _osc_dir is None:
-                            # 近3根完全平坦，方向不明，跳过
-                            print(f"[LiveEngine] 震荡状态近3根K线方向平坦，跳过入场")
-                        elif _osc_dir == "LONG":
+                        if not self.oscillation_filter_enabled:
+                            # 震荡/未知状态：双向匹配，择优而入
                             long_result = self._proto_matcher.match_entry(
                                 pre_entry_traj, direction="LONG", regime=match_regime
                             )
-                            long_sim = long_result.get("similarity", 0.0)
-                            short_sim = 0.0
-                            if long_result.get("matched"):
-                                direction, chosen_proto, similarity = "LONG", long_result.get("best_prototype"), long_sim
-                                chosen_match_result = long_result  # 【指纹3D图】存储匹配结果
-                            print(f"[LiveEngine] 震荡偏多(近3根净↑)→只匹配LONG | 相似度={long_sim:.1%}")
-                        else:  # SHORT
                             short_result = self._proto_matcher.match_entry(
                                 pre_entry_traj, direction="SHORT", regime=match_regime
                             )
-                            long_sim = 0.0
+                            long_sim = long_result.get("similarity", 0.0)
                             short_sim = short_result.get("similarity", 0.0)
-                            if short_result.get("matched"):
-                                direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
-                                chosen_match_result = short_result  # 【指纹3D图】存储匹配结果
-                            print(f"[LiveEngine] 震荡偏空(近3根净↓)→只匹配SHORT | 相似度={short_sim:.1%}")
+                            long_ok = bool(long_result.get("matched"))
+                            short_ok = bool(short_result.get("matched"))
+                            if long_ok or short_ok:
+                                if long_ok and (not short_ok or long_sim >= short_sim):
+                                    direction, chosen_proto, similarity = "LONG", long_result.get("best_prototype"), long_sim
+                                    chosen_match_result = long_result  # 【指纹3D图】存储匹配结果
+                                elif short_ok:
+                                    direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
+                                    chosen_match_result = short_result  # 【指纹3D图】存储匹配结果
+                            print(f"[LiveEngine] 震荡状态双向匹配 | LONG={long_sim:.1%} SHORT={short_sim:.1%}")
+                        else:
+                            # 【震荡/未知状态】用近3根K线净涨跌决定单向匹配，避免双向盲猜逆势开仓
+                            _osc_dir = None
+                            if self._df_buffer is not None and df_idx >= 2:
+                                _closes = self._df_buffer['close'].iloc[df_idx - 2: df_idx + 1].values
+                                _opens  = self._df_buffer['open'].iloc[df_idx - 2: df_idx + 1].values
+                                _net    = float(sum(_closes - _opens))
+                                if _net > 0:
+                                    _osc_dir = "LONG"
+                                elif _net < 0:
+                                    _osc_dir = "SHORT"
+                            if _osc_dir is None:
+                                # 近3根完全平坦，方向不明，跳过
+                                print(f"[LiveEngine] 震荡状态近3根K线方向平坦，跳过入场")
+                            elif _osc_dir == "LONG":
+                                long_result = self._proto_matcher.match_entry(
+                                    pre_entry_traj, direction="LONG", regime=match_regime
+                                )
+                                long_sim = long_result.get("similarity", 0.0)
+                                short_sim = 0.0
+                                if long_result.get("matched"):
+                                    direction, chosen_proto, similarity = "LONG", long_result.get("best_prototype"), long_sim
+                                    chosen_match_result = long_result  # 【指纹3D图】存储匹配结果
+                                print(f"[LiveEngine] 震荡偏多(近3根净↑)→只匹配LONG | 相似度={long_sim:.1%}")
+                            else:  # SHORT
+                                short_result = self._proto_matcher.match_entry(
+                                    pre_entry_traj, direction="SHORT", regime=match_regime
+                                )
+                                long_sim = 0.0
+                                short_sim = short_result.get("similarity", 0.0)
+                                if short_result.get("matched"):
+                                    direction, chosen_proto, similarity = "SHORT", short_result.get("best_prototype"), short_sim
+                                    chosen_match_result = short_result  # 【指纹3D图】存储匹配结果
+                                print(f"[LiveEngine] 震荡偏空(近3根净↓)→只匹配SHORT | 相似度={short_sim:.1%}")
 
                     # 【指纹3D图】将轨迹矩阵存入匹配结果，用于后续保存到 PaperOrder
                     if chosen_match_result is not None:
@@ -3039,30 +3109,13 @@ class LiveTradingEngine:
                     kelly_reason = f"贝叶斯低胜率试探，强制仓位 {kelly_position_pct:.1%}"
                     self.state.kelly_position_pct = kelly_position_pct
 
-                # D. 所有门控通过后，再决定是否替换已有挂单，避免链路中途换轨
-                if has_pending:
-                    # 只有当指纹变化，或者相似度显著提升（>1%）时，才重新布防
-                    is_different = (chosen_fp != self.state.best_match_template)
-                    sim_improved = (similarity > (self.state.best_match_similarity + 0.01))
-                    if is_different or sim_improved:
-                        print(f"[LiveEngine] 检测到更佳或更符合当下的信号，正在替换挂单: {self.state.best_match_template} -> {chosen_fp}")
-                        self._paper_trader.cancel_entry_stop_orders()
-                    else:
-                        # 维持原样，不重复下单
-                        self.state.last_event = "[入场跳过] 挂单未变化"
-                        return
-                
-                # C. 计算挂单价格（限价单入场价）
-                limit_price = price * (1 + confirm_pct) if side == OrderSide.LONG else price * (1 - confirm_pct)
-                
-                # 【修复】TP/SL 基于实际入场价（limit_price）计算，而非 kline.close
-                # 否则实际 SL 距离 < 预期距离（如预期 0.2% 实际只有 0.13%），容易被扫损
-                take_profit, stop_loss = self._calculate_fixed_tp_sl(limit_price, direction)
+                # D. 市价单直接以 K 线收盘价开仓
+                entry_price = kline.close
+                take_profit, stop_loss = self._calculate_fixed_tp_sl(entry_price, direction)
 
-                # 构建详细的开仓原因说明
-                tp_pct = ((take_profit / limit_price) - 1) * 100 if direction == "LONG" else ((limit_price / take_profit) - 1) * 100
-                sl_pct = ((limit_price / stop_loss) - 1) * 100 if direction == "LONG" else ((stop_loss / limit_price) - 1) * 100
-                
+                tp_pct = ((take_profit / entry_price) - 1) * 100 if direction == "LONG" else ((entry_price / take_profit) - 1) * 100
+                sl_pct = ((entry_price / stop_loss) - 1) * 100 if direction == "LONG" else ((stop_loss / entry_price) - 1) * 100
+
                 proto_info = ""
                 if self.use_prototypes and chosen_proto and getattr(chosen_proto, 'member_count', 0) >= 10:
                     proto_info = (
@@ -3072,56 +3125,48 @@ class LiveTradingEngine:
                     )
                 else:
                     proto_info = f"原型={chosen_fp}"
-                
+
                 reason = (
                     f"[开仓] 市场={self.state.market_regime} | {direction} | "
                     f"{proto_info} | 相似度={similarity:.1%} | "
                     f"TP={take_profit:.2f}(+{tp_pct:.1f}%) SL={stop_loss:.2f}(-{sl_pct:.1f}%)"
                 )
-                self.state.last_event = (
-                    f"[门控] 通过 | MACD={self.state.macd_ready} KDJ={self.state.kdj_ready} | "
-                    f"限价={limit_price:.2f}"
+
+                final_position_pct = (
+                    min(kelly_position_pct, flip_degraded_position_cap)
+                    if (kelly_position_pct is not None and flip_degraded_position_cap is not None)
+                    else (flip_degraded_position_cap or kelly_position_pct)
                 )
-                
-                # C. 直接向交易器下达“预埋开火单” (Exchange-side Stop Order)
-                order_id = self._paper_trader.place_stop_order(
+
+                order = self._paper_trader.open_position(
                     side=side,
-                    trigger_price=limit_price,
+                    price=entry_price,
                     bar_idx=self._current_bar_idx,
                     take_profit=take_profit,
                     stop_loss=stop_loss,
                     template_fingerprint=chosen_fp,
                     entry_similarity=similarity,
                     entry_reason=reason,
-                    timeout_bars=timeout,
-                    position_size_pct=(
-                        min(kelly_position_pct, flip_degraded_position_cap)
-                        if (kelly_position_pct is not None and flip_degraded_position_cap is not None)
-                        else (flip_degraded_position_cap if flip_degraded_position_cap is not None else kelly_position_pct)
-                    ),  # 凯利动态仓位 / 翻转降级仓位上限
-                    # 【指纹3D图】从匹配结果中提取轨迹矩阵用于后续增量训练
-                    entry_trajectory=chosen_match_result.get("entry_trajectory") if chosen_match_result else None,
+                    position_size_pct=final_position_pct,
                     regime_at_entry=self.state.market_regime,
                 )
-                
-                print(f"[LiveEngine] 🎯 挂限价单入场: {direction} @ {limit_price:.2f} "
-                      f"(当前价={price:.2f}, 需涨跌{abs(limit_price-price):.2f})")
-                
-                # 【指纹3D图】更新多维相似度状态
-                self._update_similarity_state(
-                    similarity, chosen_fp, chosen_match_result, chosen_proto
-                )
-                self.state.matching_phase = "待定执行"
-                self.state.fingerprint_status = "等待成交"
-                self.state.decision_reason = (
-                    f"[🎯挂单中] 限价单已挂({similarity:.1%}) @ {limit_price:.2f} "
-                    f"(MACD={self.state.macd_ready}, KDJ={self.state.kdj_ready})"
-                )
-                self.state.last_event = (
-                    f"🎯限价单 {direction} | 挂单价 {limit_price:.2f} | "
-                    f"当前价 {price:.2f} | 等待触发成交"
-                )
-                self._clear_entry_candidate("已挂单，候选锁完成使命")
+                self._apply_avg_hold_to_order(order, chosen_fp)
+                if order is not None and chosen_match_result:
+                    order.entry_trajectory = chosen_match_result.get("entry_trajectory")
+
+                if order:
+                    print(f"[LiveEngine] 🎯 市价开仓: {direction} @ {entry_price:.2f}")
+                    # 【指纹3D图】更新多维相似度状态
+                    self._update_similarity_state(
+                        similarity, chosen_fp, chosen_match_result, chosen_proto
+                    )
+                    self.state.matching_phase = "持仓中"
+                    self.state.fingerprint_status = "已开仓"
+                    self.state.last_event = f"市价开仓 {direction} @ {entry_price:.2f}"
+                else:
+                    self.state.last_event = "[开仓失败] 交易所拒绝或已有持仓"
+
+                self._clear_entry_candidate("已开仓，候选锁完成使命")
                 return
             else:
                 self._clear_entry_candidate("未匹配到有效候选")
@@ -3530,37 +3575,59 @@ class LiveTradingEngine:
                         best_match_result = sp
                         best_proto = p
                 else:
-                    # 【震荡/其他状态】用近3根K线净涨跌决定单向匹配，避免双向盲猜逆势开仓
-                    _osc_dir = None
-                    if self._df_buffer is not None and df_idx >= 2:
-                        _closes = self._df_buffer['close'].iloc[df_idx - 2: df_idx + 1].values
-                        _opens  = self._df_buffer['open'].iloc[df_idx - 2: df_idx + 1].values
-                        _net    = float(sum(_closes - _opens))
-                        if _net > 0:
-                            _osc_dir = "LONG"
-                        elif _net < 0:
-                            _osc_dir = "SHORT"
-                    if _osc_dir == "LONG":
+                    if not self.oscillation_filter_enabled:
+                        # 震荡/其他状态：双向匹配，择优展示
                         lp = self._proto_matcher.match_entry(pre_entry_traj, direction="LONG", regime=match_regime)
-                        long_sim = lp.get("similarity", 0.0)
-                        short_sim = 0.0
-                        if long_sim > 0 and lp.get("best_prototype"):
-                            best_sim, best_dir = long_sim, "LONG"
-                            p = lp.get("best_prototype")
-                            best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
-                            best_match_result = lp
-                            best_proto = p
-                    elif _osc_dir == "SHORT":
                         sp = self._proto_matcher.match_entry(pre_entry_traj, direction="SHORT", regime=match_regime)
-                        long_sim = 0.0
+                        long_sim = lp.get("similarity", 0.0)
                         short_sim = sp.get("similarity", 0.0)
-                        if short_sim > 0 and sp.get("best_prototype"):
-                            best_sim, best_dir = short_sim, "SHORT"
-                            p = sp.get("best_prototype")
-                            best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
-                            best_match_result = sp
-                            best_proto = p
-                    # else: 近3根完全平坦，方向不明，跳过不匹配
+                        long_ok = long_sim > 0 and lp.get("best_prototype")
+                        short_ok = short_sim > 0 and sp.get("best_prototype")
+                        if long_ok or short_ok:
+                            if long_ok and (not short_ok or long_sim >= short_sim):
+                                best_sim, best_dir = long_sim, "LONG"
+                                p = lp.get("best_prototype")
+                                best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
+                                best_match_result = lp
+                                best_proto = p
+                            elif short_ok:
+                                best_sim, best_dir = short_sim, "SHORT"
+                                p = sp.get("best_prototype")
+                                best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
+                                best_match_result = sp
+                                best_proto = p
+                    else:
+                        # 【震荡/其他状态】用近3根K线净涨跌决定单向匹配，避免双向盲猜逆势开仓
+                        _osc_dir = None
+                        if self._df_buffer is not None and df_idx >= 2:
+                            _closes = self._df_buffer['close'].iloc[df_idx - 2: df_idx + 1].values
+                            _opens  = self._df_buffer['open'].iloc[df_idx - 2: df_idx + 1].values
+                            _net    = float(sum(_closes - _opens))
+                            if _net > 0:
+                                _osc_dir = "LONG"
+                            elif _net < 0:
+                                _osc_dir = "SHORT"
+                        if _osc_dir == "LONG":
+                            lp = self._proto_matcher.match_entry(pre_entry_traj, direction="LONG", regime=match_regime)
+                            long_sim = lp.get("similarity", 0.0)
+                            short_sim = 0.0
+                            if long_sim > 0 and lp.get("best_prototype"):
+                                best_sim, best_dir = long_sim, "LONG"
+                                p = lp.get("best_prototype")
+                                best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
+                                best_match_result = lp
+                                best_proto = p
+                        elif _osc_dir == "SHORT":
+                            sp = self._proto_matcher.match_entry(pre_entry_traj, direction="SHORT", regime=match_regime)
+                            long_sim = 0.0
+                            short_sim = sp.get("similarity", 0.0)
+                            if short_sim > 0 and sp.get("best_prototype"):
+                                best_sim, best_dir = short_sim, "SHORT"
+                                p = sp.get("best_prototype")
+                                best_fp = f"proto_{p.direction}_{p.prototype_id}" if p else ""
+                                best_match_result = sp
+                                best_proto = p
+                        # else: 近3根完全平坦，方向不明，跳过不匹配
             
             # 【指纹3D图】更新多维相似度状态
             self._update_similarity_state(best_sim, best_fp, best_match_result, best_proto)
@@ -3875,18 +3942,15 @@ class LiveTradingEngine:
         if not self.state.exit_reason:
             self.state.exit_reason = "形态配合良好，暂无平仓预兆。"
         
-        # 【新增】更新详细的离场/持有说明（含空间位置评分细项 + 止损层级监控）
+        # 更新持仓说明（含空间位置评分细项）
         pnl_pct = order.profit_pct
         score_suffix = ""
         if self._df_buffer is not None and len(self._df_buffer) >= 20:
             pos_score, score_detail = self._calc_position_score(order.side.value)
             self.state.position_score = pos_score
             score_suffix = f" | 位置评分={pos_score:.0f} ({score_detail})" if score_detail else ""
-        
-        # 【止损层级监控】显示当前距离各档止损的距离
-        sl_monitor = self._get_stop_loss_monitor(order, pnl_pct)
-        
-        self.state.decision_reason = f"[持仓中] {order.side.value} | 相似度={order.current_similarity:.1%} | 收益={pnl_pct:+.2f}%{score_suffix}{sl_monitor}"
+
+        self.state.decision_reason = f"[持仓中] {order.side.value} | 收益={pnl_pct:+.2f}%{score_suffix}"
         
         # 新开仓保护期：保护期内止损暂缓触发，允许止盈
         from config import PAPER_TRADING_CONFIG as _ptc
@@ -3985,10 +4049,10 @@ class LiveTradingEngine:
                 elif not ever_reached and _ptc.get("TIME_DECAY_ENABLED", True):
                     # 时间衰减止损（未到达+6%阈值时）
                     hold_bars = order.hold_bars
-                    bar2 = _ptc.get("TIME_DECAY_BAR_2", 180)
-                    bar1 = _ptc.get("TIME_DECAY_BAR_1", 120)
-                    sl2_pnl = _ptc.get("TIME_DECAY_SL_2", -5.0) / 100  # 杠杆后
-                    sl1_pnl = _ptc.get("TIME_DECAY_SL_1", -10.0) / 100
+                    bar1 = getattr(order, "decay_bar_1", 0) or _ptc.get("TIME_DECAY_BAR_1", 30)
+                    bar2 = getattr(order, "decay_bar_2", 0) or _ptc.get("TIME_DECAY_BAR_2", 60)
+                    sl2_pnl = _ptc.get("TIME_DECAY_SL_2", -3.0) / 100  # 杠杆后
+                    sl1_pnl = _ptc.get("TIME_DECAY_SL_1", -6.0) / 100  # 杠杆后
                     decay_sl_pct = None
                     if hold_bars > bar2:
                         decay_sl_pct = sl2_pnl
@@ -4359,6 +4423,49 @@ class LiveTradingEngine:
         print(f"[LiveEngine] 固定TP/SL: TP={take_profit:.2f}(+{tp1_pct*100:.3f}%) SL={stop_loss:.2f}(-{sl_pct*100:.3f}%)")
         return take_profit, stop_loss
     
+    def _add_paper_log(self, event: str, side: str, price: float,
+                       info: Optional[dict] = None) -> None:
+        """追加一条模拟交易结构化日志（entry / tp1 / tp / sl / trailing_sl / exit）"""
+        from datetime import datetime
+        payload = {
+            "time":  datetime.now().strftime("%m-%d %H:%M:%S"),
+            "event": event,
+            "side":  side,
+            "price": price,
+            "info":  info or {},
+        }
+        self.paper_trade_logs.append(payload)
+        # 保留最近 500 条
+        if len(self.paper_trade_logs) > 500:
+            self.paper_trade_logs = self.paper_trade_logs[-500:]
+
+        # 同步简洁文本到 UI 事件日志
+        try:
+            info = payload.get("info") or {}
+            profit_pct = info.get("profit_pct")
+            hold_bars = info.get("hold_bars")
+            entry_price = info.get("entry_price")
+            extra = []
+            if profit_pct is not None:
+                sign = "+" if profit_pct >= 0 else ""
+                extra.append(f"{sign}{profit_pct:.2f}%")
+            if hold_bars is not None:
+                extra.append(f"{hold_bars}根")
+            if entry_price:
+                extra.append(f"入场{entry_price}")
+            extra_text = f" ({' | '.join(extra)})" if extra else ""
+            event_cn = {
+                "entry": "开仓",
+                "tp1": "TP1",
+                "tp": "止盈",
+                "sl": "止损",
+                "trailing_sl": "追踪止损",
+                "exit": "平仓",
+            }.get(event, event)
+            self.state.last_event = f"[{event_cn}] {side} {price:.2f}{extra_text}"
+        except Exception:
+            pass
+
     def _on_order_update(self, order: PaperOrder):
         """订单更新回调"""
         try:
@@ -4377,11 +4484,62 @@ class LiveTradingEngine:
                         order.signal_combo_keys = [fp]
                     else:
                         order.signal_combo_keys = list(self._pending_signal_combos)
+                # ── 记录开仓日志（每单仅一次） ──
+                try:
+                    if not getattr(order, "_logged_entry", False):
+                        lev = getattr(order, 'leverage', None) or getattr(self._paper_trader, 'leverage', 1)
+                        self._add_paper_log("entry", getattr(order.side, 'value', ''), order.entry_price, {
+                            "stop_loss":   getattr(order, 'stop_loss', None),
+                            "take_profit": getattr(order, 'take_profit', None),
+                            "leverage":    lev,
+                            "regime":      getattr(order, 'regime_at_entry', ''),
+                        })
+                        order._logged_entry = True
+                except Exception:
+                    pass
+                
+                # 委托单挂出后触发一次 UI 刷新（避免等待下一次收线/状态更新）
+                try:
+                    if (order.take_profit is not None or order.stop_loss is not None) and not getattr(order, "_logged_protection", False):
+                        self.state.last_event = "[委托单] TP/SL已挂"
+                        order._logged_protection = True
+                        if self.on_state_update:
+                            self.on_state_update(self.state)
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[LiveEngine] 入场状态回填失败: {e}")
     
     def _on_trade_closed_internal(self, order: PaperOrder):
         """交易关闭内部回调 — 安全网，确保任何平仓路径都能清理状态"""
+
+        # ── 记录止盈止损/追踪止损等关键日志 ──
+        try:
+            close_reason = getattr(order, "close_reason", None)
+            side = getattr(order.side, "value", "")
+            event = None
+            if close_reason == CloseReason.PARTIAL_TP:
+                event = "tp1"
+            elif close_reason == CloseReason.TAKE_PROFIT:
+                event = "tp"
+            elif close_reason == CloseReason.STOP_LOSS:
+                event = "sl"
+            elif close_reason == CloseReason.TRAILING_STOP:
+                event = "trailing_sl"
+            elif close_reason in (CloseReason.SIGNAL, CloseReason.MANUAL,
+                                  CloseReason.MAX_HOLD, CloseReason.EXCHANGE_CLOSE,
+                                  CloseReason.POSITION_FLIP, CloseReason.DERAIL):
+                event = "exit"
+            if event:
+                self._add_paper_log(event, side, getattr(order, "exit_price", 0.0) or 0.0, {
+                    "profit_pct": getattr(order, "profit_pct", None),
+                    "hold_bars": getattr(order, "hold_bars", None),
+                    "entry_price": getattr(order, "entry_price", None),
+                    "stop_loss": getattr(order, "stop_loss", None),
+                    "take_profit": getattr(order, "take_profit", None),
+                })
+        except Exception:
+            pass
 
         # 【信号组合实盘命中率】记录本次交易结果到 signal_store
         try:
@@ -5089,54 +5247,6 @@ class LiveTradingEngine:
         
         return f"[平仓决策] {logic_str} | 触发={reason}"
     
-    def _get_stop_loss_monitor(self, order, pnl_pct: float) -> str:
-        """
-        生成止损层级监控信息
-        
-        显示当前距离各档止损的距离和已触发的分段止损次数
-        
-        Args:
-            order: 当前订单
-            pnl_pct: 当前盈亏百分比
-        
-        Returns:
-            止损层级监控字符串
-        """
-        from config import PAPER_TRADING_CONFIG as _ptc
-        
-        # 获取分段止损配置
-        stage1_pct = _ptc.get("STAGED_SL_1_PCT", 5.0)
-        stage2_pct = _ptc.get("STAGED_SL_2_PCT", 10.0)
-        min_sl_pct = _ptc.get("MIN_SL_PCT", 0.15) * 100  # 转为百分比
-        
-        # 获取已触发的分段次数
-        partial_sl = getattr(order, 'partial_sl_count', 0)
-        
-        # 判断当前在哪个区间
-        if pnl_pct >= 0:
-            # 盈利状态，不显示止损层级
-            return ""
-        
-        abs_loss = abs(pnl_pct)
-        
-        if abs_loss < stage1_pct:
-            # 安全区：未触及第1档
-            status = f"安全区(距第1档 {stage1_pct - abs_loss:.1f}%)"
-        elif abs_loss < stage2_pct:
-            # 第1档已触发
-            status = f"⚠第1档已触(距第2档 {stage2_pct - abs_loss:.1f}%)"
-        elif abs_loss < min_sl_pct:
-            # 第2档已触发
-            status = f"⚠⚠第2档已触(距硬止损 {min_sl_pct - abs_loss:.1f}%)"
-        else:
-            # 接近硬止损
-            status = f"🚨危险区(硬止损{min_sl_pct:.0f}%)"
-        
-        # 显示已减仓次数
-        if partial_sl > 0:
-            status += f" 已减仓{partial_sl}次"
-        
-        return f" | 止损层级: {status}"
     
     def _get_tp_sl_trigger_reason(self, order, close_reason: CloseReason, kline) -> str:
         """
@@ -5361,145 +5471,6 @@ class LiveTradingEngine:
             print(f"[LiveEngine] {msg}")
             self.state.last_event = msg
 
-    def _check_momentum_decay_exit(self, order: PaperOrder, kline: KlineData) -> dict:
-        """
-        价格动量衰减检测 — 识别高点并提前离场
-        
-        核心逻辑：
-        1. 只在有一定利润时检测（防止刚开仓就被触发）
-        2. 检测K线实体是否在缩小（动能衰减）
-        3. 检测从峰值利润的回撤程度
-        4. 结合 KDJ/MACD 确认动量减弱
-        
-        Returns:
-            {"should_exit": bool, "reason": str, "details": dict}
-        """
-        result = {"should_exit": False, "reason": "", "details": {}}
-        
-        # 读取配置
-        enabled = PAPER_TRADING_CONFIG.get("MOMENTUM_EXIT_ENABLED", True)
-        if not enabled:
-            return result
-        
-        min_profit = PAPER_TRADING_CONFIG.get("MOMENTUM_MIN_PROFIT_PCT", 1.5)
-        lookback = PAPER_TRADING_CONFIG.get("MOMENTUM_LOOKBACK_BARS", 3)
-        decay_threshold = PAPER_TRADING_CONFIG.get("MOMENTUM_DECAY_THRESHOLD", 0.5)
-        retracement_threshold = PAPER_TRADING_CONFIG.get("MOMENTUM_PEAK_RETRACEMENT", 0.3)
-        
-        # 1. 利润门槛：至少有一定利润才检测
-        peak_pct = order.peak_profit_pct
-        current_pct = order.profit_pct
-        if peak_pct < min_profit:
-            return result
-        
-        # 2. 回撤检测：从峰值利润回撤超过阈值
-        if peak_pct > 0:
-            retracement = (peak_pct - current_pct) / peak_pct
-        else:
-            retracement = 0
-        
-        retracement_triggered = retracement >= retracement_threshold
-        
-        # 3. K线实体衰减检测（需要 df_buffer）
-        body_decay = False
-        if self._df_buffer is not None and len(self._df_buffer) >= lookback + 1:
-            direction = order.side.value
-            recent = self._df_buffer.iloc[-lookback:]
-            
-            # 计算最近几根K线的实体大小
-            bodies = []
-            for _, row in recent.iterrows():
-                body = abs(row['close'] - row['open'])
-                bodies.append(body)
-            
-            if len(bodies) >= 2:
-                # 峰值实体 vs 当前实体
-                peak_body = max(bodies[:-1]) if len(bodies) > 1 else bodies[0]
-                current_body = bodies[-1]
-                
-                if peak_body > 0:
-                    body_ratio = current_body / peak_body
-                    body_decay = body_ratio < decay_threshold
-                    
-                    result["details"]["peak_body"] = peak_body
-                    result["details"]["current_body"] = current_body
-                    result["details"]["body_ratio"] = body_ratio
-        
-        # 4. KDJ/MACD 动量确认
-        indicator_weak = False
-        if self._df_buffer is not None and len(self._df_buffer) >= 2:
-            curr = self._df_buffer.iloc[-1]
-            prev = self._df_buffer.iloc[-2]
-            direction = order.side.value
-            
-            if direction == "LONG":
-                # 做多：J线下降 或 MACD柱缩小
-                j_declining = curr['j'] < prev['j']
-                macd_shrinking = curr['macd_hist'] < prev['macd_hist']
-                indicator_weak = j_declining or macd_shrinking
-            else:
-                # 做空：J线上升 或 MACD柱回升
-                j_rising = curr['j'] > prev['j']
-                macd_rising = curr['macd_hist'] > prev['macd_hist']
-                indicator_weak = j_rising or macd_rising
-            
-            result["details"]["j_current"] = curr['j']
-            result["details"]["j_prev"] = prev['j']
-            result["details"]["macd_current"] = curr['macd_hist']
-            result["details"]["macd_prev"] = prev['macd_hist']
-        
-        # 综合判断：回撤触发 + (实体衰减 或 指标走弱)
-        signal_triggered = retracement_triggered and (body_decay or indicator_weak)
-        if signal_triggered:
-            reasons = []
-            reasons.append(f"回撤{retracement:.0%}")
-            if body_decay:
-                reasons.append("K线实体缩小")
-            if indicator_weak:
-                reasons.append("指标动量减弱")
-            result["reason"] = " + ".join(reasons)
-            
-            # 【新增】查询信号可信度，决定响应策略
-            if self._exit_learning_enabled and self._exit_learner:
-                proto_fp = order.template_fingerprint
-                confidence, conf_reason = self._exit_learner.get_signal_confidence(
-                    proto_fp, "momentum_decay"
-                )
-                strategy, strategy_reason = self._exit_learner.get_response_strategy(confidence)
-                
-                result["confidence"] = confidence
-                result["strategy"] = strategy
-                result["strategy_reason"] = strategy_reason
-                
-                # 根据可信度决定是否立即平仓
-                if strategy == "immediate_exit":
-                    result["should_exit"] = True
-                    result["reason"] = f"{result['reason']} | 可信度{confidence:.0%}(高) → 立即平仓"
-                elif strategy == "tighten_stop":
-                    result["should_exit"] = False  # 不立即平，改为收紧止损
-                    result["should_tighten_stop"] = True
-                    result["reason"] = f"{result['reason']} | 可信度{confidence:.0%}(中高) → 收紧止损"
-                elif strategy == "monitor":
-                    result["should_exit"] = False
-                    result["reason"] = f"{result['reason']} | 可信度{confidence:.0%}(中性) → 监控但保持"
-                else:  # ignore
-                    result["should_exit"] = False
-                    result["reason"] = f"{result['reason']} | 可信度{confidence:.0%}(低) → 忽略信号"
-                
-                # 记录信号触发（即使不立即平仓）
-                if not hasattr(order, 'exit_signals_triggered'):
-                    order.exit_signals_triggered = []
-                order.exit_signals_triggered.append(("momentum_decay", current_pct))
-            else:
-                # 未启用学习，保持原有逻辑
-                result["should_exit"] = True
-        
-        result["details"]["retracement"] = retracement
-        result["details"]["retracement_triggered"] = retracement_triggered
-        result["details"]["body_decay"] = body_decay
-        result["details"]["indicator_weak"] = indicator_weak
-        
-        return result
 
     def _check_exit_indicator_gate(self, df: pd.DataFrame, direction: str) -> dict:
         """

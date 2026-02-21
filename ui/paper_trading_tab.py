@@ -262,6 +262,16 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_requested.emit)
         control_layout.addWidget(self.stop_btn)
+
+        # 震荡单向过滤开关
+        self.oscillation_filter_chk = QtWidgets.QCheckBox("震荡单向过滤")
+        self.oscillation_filter_chk.setToolTip(
+            "开启后：震荡/未知状态只按近3根K线方向进行单向匹配，\n"
+            "避免双向盲猜导致逆势开仓。"
+        )
+        self.oscillation_filter_chk.setStyleSheet("color: #7fb0ff; font-size: 12px;")
+        self.oscillation_filter_chk.setChecked(True)
+        control_layout.addWidget(self.oscillation_filter_chk)
         
         # 清除学习记忆按钮
         self.clear_memory_btn = QtWidgets.QPushButton("🗑 清除学习记忆")
@@ -333,6 +343,7 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
             "initial_balance": self.balance_spin.value(),
             "leverage": self.leverage_spin.value(),
             "use_qualified_only": self.use_qualified_radio.isChecked(),
+            "oscillation_filter_enabled": self.oscillation_filter_chk.isChecked(),
         }
         self.start_requested.emit(config)
     
@@ -381,6 +392,7 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         self.save_api_btn.setEnabled(not running)
         self.balance_spin.setEnabled(not running)
         self.leverage_spin.setEnabled(not running)
+        self.oscillation_filter_chk.setEnabled(not running)
         
         if running:
             self.run_status_label.setText("运行中")
@@ -436,6 +448,10 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         else:
             self.weight_mode_label.setText("进化前")
             self.weight_mode_label.setStyleSheet("color: #888;")
+
+    def get_oscillation_filter_enabled(self) -> bool:
+        """获取震荡单向过滤开关状态"""
+        return self.oscillation_filter_chk.isChecked()
 
     def update_match_preview(self, fp: str, similarity: float, fp_status: str = "", 
                              prototype_confidence: float = 0.0):
@@ -674,7 +690,10 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         # ══════ Tab 3: 分析 ══════
         self._create_analysis_tab()
 
-        # ══════ Tab 4: 日志 ══════
+        # ══════ Tab 4: 推理 ══════
+        self._create_monitoring_tab()
+
+        # ══════ Tab 5: 日志 ══════
         self._create_log_tab()
         
         layout.addWidget(self.tabs)
@@ -1366,6 +1385,17 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
         self.position_current_label = QtWidgets.QLabel("-")
         self.position_current_label.setStyleSheet("color: #FFD54F;")
         position_form.addRow("当前价:", self.position_current_label)
+        
+        # 策略名 + 衰减计划（自适应持仓时间）
+        self.position_strategy_label = QtWidgets.QLabel("-")
+        self.position_strategy_label.setStyleSheet("color: #9ad1ff; font-size: 12px;")
+        self.position_strategy_label.setWordWrap(True)
+        position_form.addRow("策略名:", self.position_strategy_label)
+        
+        self.position_decay_label = QtWidgets.QLabel("-")
+        self.position_decay_label.setStyleSheet("color: #FFB74D; font-size: 12px;")
+        self.position_decay_label.setWordWrap(True)
+        position_form.addRow("衰减计划:", self.position_decay_label)
         
         # 分隔线
         separator1 = QtWidgets.QFrame()
@@ -2763,6 +2793,10 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             self.position_qty_label.setText("-")
             self.position_margin_label.setText("-")
             self.position_leverage_label.setText("-")
+            if hasattr(self, "position_strategy_label"):
+                self.position_strategy_label.setText("-")
+            if hasattr(self, "position_decay_label"):
+                self.position_decay_label.setText("-")
             self.position_leverage_label.setStyleSheet("color: #888;")
             self.update_adaptive_leverage_lamp(False)
             self.position_entry_label.setText("-")
@@ -2776,7 +2810,10 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             # 方向
             side_text = order.side.value
             side_color = "#089981" if order.side.value == "LONG" else "#f23645"
-            self.position_side_label.setText(side_text)
+            fp = getattr(order, 'template_fingerprint', '') or ''
+            fp_short = fp[:12] if fp else ''
+            side_display = f"{side_text} ({fp_short})" if fp_short else side_text
+            self.position_side_label.setText(side_display)
             self.position_side_label.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {side_color};")
             
             # 数量
@@ -2824,6 +2861,19 @@ class PaperTradingStatusPanel(QtWidgets.QWidget):
             
             self.tracking_status_label.setText(f"{tracking_icon} {tracking}")
             self.tracking_status_label.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {tracking_color};")
+            
+            # 策略名 + 衰减计划
+            if hasattr(self, "position_strategy_label"):
+                fp = getattr(order, "template_fingerprint", "") or ""
+                self.position_strategy_label.setText(fp if fp else "-")
+            if hasattr(self, "position_decay_label"):
+                avg = getattr(order, "avg_hold_bars", 0) or 0
+                d1 = getattr(order, "decay_bar_1", 0) or 0
+                d2 = getattr(order, "decay_bar_2", 0) or 0
+                if avg >= 10 and d1 and d2:
+                    self.position_decay_label.setText(f"均持{avg}根 → {d1}根/-6% | {d2}根/-3%")
+                else:
+                    self.position_decay_label.setText("-")
             
     def update_adaptive_leverage_lamp(self, is_active: bool):
         """亮灯=自适应杠杆在用（绿），灰=未用"""
@@ -3587,11 +3637,11 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         
         # 表格页
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(16)  # 原13列 + 新增3列 = 16列
+        self.table.setColumnCount(17)  # 16列 + 衰减列
         self.table.setHorizontalHeaderLabels([
             "时间", "方向", "数量", "入场价", "出场价", "止盈", "止损", 
-            "盈亏%", "峰值%", "精准度", "信号",  # 新增3列：峰值利润、止盈精准度、信号触发
-            "盈亏(USDT)", "手续费", "原因", "持仓", "操作"
+            "盈亏%", "峰值%", "精准度", "信号",  # 峰值利润、止盈精准度、信号触发
+            "盈亏(USDT)", "手续费", "原因", "持仓", "衰减", "操作"
         ])
         
         # 【自动调整列宽】确保所有内容都能完整显示
@@ -3618,7 +3668,8 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             12: 70,  # 手续费：0.0000
             13: 80,  # 原因：追踪止盈
             14: 50,  # 持仓：12
-            15: 60,  # 操作：删除按钮
+            15: 60,  # 衰减：16/23根
+            16: 60,  # 操作：删除按钮
         }
         
         for col, min_width in min_widths.items():
@@ -3919,6 +3970,14 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         # 持仓时长（索引 +3）
         self.table.setItem(row, 14, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
         
+        # 衰减（decay_bar_1/decay_bar_2）
+        d1 = getattr(order, "decay_bar_1", 0) or 0
+        d2 = getattr(order, "decay_bar_2", 0) or 0
+        decay_text = f"{d1}/{d2}根" if (d1 and d2) else "-"
+        decay_item = QtWidgets.QTableWidgetItem(decay_text)
+        decay_item.setForeground(QtGui.QColor("#9e9e9e"))
+        self.table.setItem(row, 15, decay_item)
+        
         # 操作按钮（索引 +3）
         delete_btn = QtWidgets.QPushButton("删除")
         delete_btn.setStyleSheet("""
@@ -3938,7 +3997,7 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             }
         """)
         delete_btn.clicked.connect(lambda checked=False, o=order: self._on_delete_clicked(o))
-        self.table.setCellWidget(row, 15, delete_btn)
+        self.table.setCellWidget(row, 16, delete_btn)
 
     def _format_signal_description(self, order) -> str:
         """格式化信号列描述，支持精品信号解析"""

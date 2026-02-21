@@ -141,6 +141,11 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 kelly_position_pct=float(t.get("kelly_position_pct", 0)),
                 # 信号组合跟踪
                 signal_combo_keys=t.get("signal_combo_keys", []) or [],
+                trailing_stage=int(t.get("trailing_stage", 0) or 0),
+                stage_2_active=bool(t.get("stage_2_active", False)),
+                avg_hold_bars=int(t.get("avg_hold_bars", 0) or 0),
+                decay_bar_1=int(t.get("decay_bar_1", 0) or 0),
+                decay_bar_2=int(t.get("decay_bar_2", 0) or 0),
             )
             loaded.append(order)
         return loaded
@@ -211,6 +216,12 @@ class PaperOrder:
     alert_mode: bool = False          # 是否处于警戒模式
     current_similarity: float = 0.0   # 当前相似度
     
+    # 追踪止盈止损（阶段2）
+    stage_2_active: bool = False
+    stage2_peak_price: float = 0.0   # 阶段2追踪峰值价
+    trailing_stage: int = 0          # 追踪阶段标记（0=未启用，1=进入阶段2，2=追踪更新）
+    ever_reached_6pct: bool = False  # 阶段1阶梯止损是否触发过
+    
     # 持仓时长
     hold_bars: int = 0
     
@@ -254,6 +265,11 @@ class PaperOrder:
 
     # 信号组合跟踪（用于实盘命中率统计）
     signal_combo_keys: List[str] = field(default_factory=list)  # 开仓时触发的组合key列表
+
+    # 策略持仓时间自适应衰减（来自 signal_cumulative_cache）
+    avg_hold_bars: int = 0       # 策略平均持仓（开仓时写入，0=使用全局配置）
+    decay_bar_1: int = 0         # 衰减第1档触发点（50% × avg）
+    decay_bar_2: int = 0         # 衰减第2档触发点（70% × avg）
 
     def update_pnl(self, current_price: float, leverage: float = 10):
         """更新未实现盈亏 + 追踪峰值"""
@@ -349,6 +365,11 @@ class PaperOrder:
             "kelly_position_pct": self.kelly_position_pct,
             # 信号组合跟踪
             "signal_combo_keys": self.signal_combo_keys,
+            "trailing_stage": self.trailing_stage,
+            "stage_2_active": self.stage_2_active,
+            "avg_hold_bars": getattr(self, "avg_hold_bars", 0),
+            "decay_bar_1": getattr(self, "decay_bar_1", 0),
+            "decay_bar_2": getattr(self, "decay_bar_2", 0),
         }
 
 
@@ -786,15 +807,115 @@ class PaperTrader:
         
         # 更新未实现盈亏（供实时展示）
         order.update_pnl(price, self.leverage)
+
+        # 实时权益/回撤统计（包含未实现盈亏）
+        equity = self.balance + order.unrealized_pnl
+        self.stats.current_balance = equity
+        self.stats.total_pnl = equity - self.initial_balance
+        if self.initial_balance > 0:
+            self.stats.total_pnl_pct = (equity / self.initial_balance - 1) * 100
+        else:
+            self.stats.total_pnl_pct = 0.0
+        if equity > self.stats.max_balance:
+            self.stats.max_balance = equity
+        drawdown = self.stats.max_balance - equity
+        if drawdown > self.stats.max_drawdown:
+            self.stats.max_drawdown = drawdown
+            self.stats.max_drawdown_pct = drawdown / self.stats.max_balance * 100 if self.stats.max_balance > 0 else 0.0
         
-        # 仅保留分段止盈/分段止损（5%、10%），不再按价格检查硬止盈/硬止损
-        # 限价平仓单成交逻辑已删除，始终市价平仓
+        # ── 追踪止盈止损（阶段1/2）──
+        # 阶段1：硬止损 + TP1（可进入阶段2追踪止损）
+        # 阶段2：追踪止损（止损只收紧）
+        if order.status == OrderStatus.FILLED:
+            from config import PAPER_TRADING_CONFIG as _ptc
+            is_long = (order.side == OrderSide.LONG)
+            stage2 = bool(getattr(order, "stage_2_active", False)) or order.partial_tp_count > 0 or getattr(order, "trailing_stage", 0) > 0
+            trail_enabled = bool(_ptc.get("TRAILING_STOP_ENABLED", True))
+
+            # 阶段2追踪止损更新（每次价格更新均可触发）
+            if stage2 and trail_enabled:
+                self._update_trailing_stop(price, high=high, low=low)
+
+            # 止损触发（保护期内可暂缓）
+            if not protection_mode and order.stop_loss is not None:
+                if is_long and low <= order.stop_loss:
+                    reason = CloseReason.TRAILING_STOP if stage2 else CloseReason.STOP_LOSS
+                    self.close_position(order.stop_loss, self.current_bar_idx, reason)
+                    return reason
+                if (not is_long) and high >= order.stop_loss:
+                    reason = CloseReason.TRAILING_STOP if stage2 else CloseReason.STOP_LOSS
+                    self.close_position(order.stop_loss, self.current_bar_idx, reason)
+                    return reason
+
+            # 阶段1 TP1 触发（仅在未进入阶段2时）
+            if (not stage2) and order.take_profit is not None:
+                hit_tp = (is_long and high >= order.take_profit) or ((not is_long) and low <= order.take_profit)
+                if hit_tp:
+                    if trail_enabled:
+                        # TP1 触发：部分平仓后进入阶段2追踪止损
+                        tp_ratio = float(_ptc.get("STAGED_TP_RATIO_1", 0.70))
+                        tp_ratio = max(0.0, min(tp_ratio, 1.0))
+                        close_qty = order.quantity * tp_ratio
+                        closed = self.close_position(order.take_profit, self.current_bar_idx,
+                                                     CloseReason.PARTIAL_TP, quantity=close_qty)
+                        remaining = self.current_position
+                        if closed and remaining is not None:
+                            remaining.partial_tp_count = order.partial_tp_count + 1
+                            self._enter_stage2(remaining, trigger_price=order.take_profit)
+                    else:
+                        # 未启用追踪止损时：TP 全平
+                        self.close_position(order.take_profit, self.current_bar_idx, CloseReason.TAKE_PROFIT)
+                        return CloseReason.TAKE_PROFIT
 
         # 常规UI回调
         if self.on_order_update:
             self.on_order_update(order)
         
         return None
+
+    def _enter_stage2(self, order: PaperOrder, trigger_price: float) -> None:
+        """进入阶段2追踪止损：SL 上移至入场价，初始化追踪峰值"""
+        if order is None:
+            return
+        order.stage_2_active = True
+        order.trailing_stage = max(getattr(order, "trailing_stage", 0), 1)
+        # 保本止损：入场价
+        order.stop_loss = order.entry_price
+        # 阶段2初始峰值（用于追踪止损计算）
+        order.stage2_peak_price = trigger_price or order.entry_price
+        # 进入阶段2后不再使用固定 TP1
+        order.take_profit = None
+
+    def _update_trailing_stop(self, current_price: float, high: float = None, low: float = None) -> None:
+        """阶段2追踪止损更新：止损只收紧"""
+        if self.current_position is None:
+            return
+        order = self.current_position
+        if not getattr(order, "stage_2_active", False):
+            return
+        from config import PAPER_TRADING_CONFIG as _ptc
+        trail_pct = float(_ptc.get("TRAILING_STOP_PCT", 0.08))
+        is_long = (order.side == OrderSide.LONG)
+        high = high or current_price
+        low = low or current_price
+
+        if not getattr(order, "stage2_peak_price", 0.0):
+            order.stage2_peak_price = current_price
+
+        if is_long:
+            if high > order.stage2_peak_price:
+                order.stage2_peak_price = high
+            new_trailing_sl = order.stage2_peak_price * (1 - trail_pct)
+            if order.stop_loss is None or new_trailing_sl > order.stop_loss:
+                order.stop_loss = new_trailing_sl
+                order.trailing_stage = max(getattr(order, "trailing_stage", 0), 2)
+        else:
+            if low < order.stage2_peak_price or order.stage2_peak_price == 0:
+                order.stage2_peak_price = low
+            new_trailing_sl = order.stage2_peak_price * (1 + trail_pct)
+            if order.stop_loss is None or new_trailing_sl < order.stop_loss:
+                order.stop_loss = new_trailing_sl
+                order.trailing_stage = max(getattr(order, "trailing_stage", 0), 2)
 
     def _check_pending_stop_orders(self, price, high, low, bar_idx):
         """检查并执行止损入场单的成交"""
@@ -1031,6 +1152,11 @@ class PaperTrader:
             order.update_pnl(actual_price, self.leverage)
             if self.on_order_update:
                 self.on_order_update(order)
+            # 部分止盈后进入追踪止损阶段2（仅首段触发）
+            if reason == CloseReason.PARTIAL_TP:
+                from config import PAPER_TRADING_CONFIG as _ptc
+                if _ptc.get("TRAILING_STOP_ENABLED", True) and not getattr(order, "stage_2_active", False):
+                    self._enter_stage2(order, trigger_price=actual_price)
             # 增强部分平仓日志
             partial_tp = getattr(closed_order, 'partial_tp_count', 0)
             partial_sl = getattr(closed_order, 'partial_sl_count', 0)

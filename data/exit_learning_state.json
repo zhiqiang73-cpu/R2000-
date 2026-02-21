@@ -1,0 +1,48 @@
+{
+  "config": {
+    "decay_enabled": true,
+    "decay_interval_hours": 48.0,
+    "decay_factor": 0.95
+  },
+  "state": {
+    "last_decay_time": 1771599570.0630405
+  },
+  "prototypes": {
+    "long|close_vs_ma5_mod_loose+macd_hist_turn_loose+obv_trend_loose": {
+      "prototype_fingerprint": "long|close_vs_ma5_mod_loose+macd_hist_turn_loose+obv_trend_loose",
+      "peak_profit_history": [
+        5.151972792351503,
+        5.151972792351503
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 2,
+      "last_update_time": 1771600585.2871802
+    },
+    "long:k_loose,macd_hist_turn_strict,rsi_loose": {
+      "prototype_fingerprint": "long:k_loose,macd_hist_turn_strict,rsi_loose",
+      "peak_profit_history": [
+        14.746982094301107,
+        27.12478979850179
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 2,
+      "last_update_time": 1771622957.773671
+    },
+    "short:consec_bull_strict,j_loose,macd_hist_turn_loose,obv_trend_loose,upper_shd_strict": {
+      "prototype_fingerprint": "short:consec_bull_strict,j_loose,macd_hist_turn_loose,obv_trend_loose,upper_shd_strict",
+      "peak_profit_history": [
+        6.714976701333965,
+        6.714976701333965
+      ],
+      "optimal_tp_pct": 0.0,
+      "optimal_tp_atr_multiplier": 0.0,
+      "signal_performances": {},
+      "total_trades": 2,
+      "last_update_time": 1771648141.201032
+    }
+  }
+}

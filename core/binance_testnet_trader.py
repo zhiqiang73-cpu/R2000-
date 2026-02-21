@@ -1072,13 +1072,28 @@ class BinanceTestnetTrader:
         ratio1 = _ptc.get("STAGED_TP_RATIO_1", 0.70)
 
         entry_price = order.entry_price
+
+        # 从交易所实际持仓量验证 order.quantity，防止在成交确认前读到错误数量
+        try:
+            pos = self._get_position()
+            exchange_qty = abs(float(pos.get("positionAmt", 0.0))) if pos else 0.0
+            if exchange_qty > self._qty_step * 2:
+                if abs(exchange_qty - order.quantity) > self._qty_step:
+                    print(f"[BinanceTrader] ⚠ 仓位数量修正: order={order.quantity:.4f} → exchange={exchange_qty:.4f}")
+                    order.quantity = exchange_qty
+            elif exchange_qty <= self._qty_step:
+                print(f"[BinanceTrader] ⚠ 交易所仓位为 {exchange_qty:.4f}，跳过挂保护单")
+                return
+        except Exception as _ve:
+            print(f"[BinanceTrader] ⚠ 数量验证失败，使用本地记录 qty={order.quantity:.4f}: {_ve}")
+
         total_qty = order.quantity
         is_long = (order.side == OrderSide.LONG)
         exit_side = "SELL" if is_long else "BUY"
         p_prec = len(str(self._price_tick).split('.')[-1]) if '.' in str(self._price_tick) else 0
         q_prec = len(str(self._qty_step).split('.')[-1]) if '.' in str(self._qty_step) else 0
 
-        # 清除旧的保护单
+        # 清除旧的保护单（含全量交易所扫描，消除孤儿单）
         self._cancel_exchange_tp_sl(silent=True)
 
         # 计算 TP1 和 SL 价格（基于入场价）
@@ -1227,6 +1242,9 @@ class BinanceTestnetTrader:
         
         if success_count > 0:
             self._verify_staged_orders_on_exchange()
+            # Invalidate open-orders cache so UI reflects new TP/SL on next refresh
+            self._open_orders_cache = None
+            self._open_orders_cache_ts = 0.0
         
         return success_count
 
@@ -1635,23 +1653,17 @@ class BinanceTestnetTrader:
             order.stop_loss = old_sl
 
     def _cancel_exchange_tp_sl(self, silent: bool = False) -> None:
-        """取消交易所上的所有阶梯式止盈止损委托单"""
-        if not self._staged_orders:
-            return
-        
-        for stage_order in self._staged_orders:
+        """取消交易所上的所有阶梯式止盈止损委托单（本地缓存 + 交易所全量扫描）"""
+        # 第一步：取消本地缓存中记录的订单（快速路径）
+        for stage_order in list(self._staged_orders):
             order_id = stage_order.get("order_id")
             if not order_id or order_id <= 0:
                 continue
-            
+            if stage_order.get("filled", False):
+                continue
             stage_type = stage_order.get("type", "")
             stage_num = stage_order.get("stage", 0)
             label = f"{'止盈' if stage_type == 'TP' else '止损'}第{stage_num}档"
-            
-            if stage_order.get("filled", False):
-                # 已成交的订单不需要取消
-                continue
-            
             try:
                 self._signed_request("DELETE", "/fapi/v1/order", {
                     "symbol": self.symbol,
@@ -1660,11 +1672,30 @@ class BinanceTestnetTrader:
                 if not silent:
                     print(f"[BinanceTrader] 🔄 已取消交易所{label}单 orderId={order_id}")
             except Exception as e:
-                # 订单可能已被执行或已取消，忽略错误
                 if not silent:
                     print(f"[BinanceTrader] ⚠ 取消{label}单异常(可能已成交): {e}")
-        
-        # 清空委托单列表
+
+        # 第二步：全量扫描交易所，清除所有带本系统标签的孤儿保护单
+        # 防止 _staged_orders 缓存不完整时遗留旧单
+        try:
+            open_orders = self._get_open_orders_cached(force=True, source="cancel_exchange_tp_sl_full")
+            for o in open_orders:
+                cid = str(o.get("clientOrderId", "") or "")
+                if any(tag in cid for tag in ("R3000_TP", "R3000_SL", "R3K_TP", "R3K_SL")):
+                    try:
+                        self._signed_request("DELETE", "/fapi/v1/order", {
+                            "symbol": self.symbol,
+                            "orderId": o["orderId"],
+                        })
+                        if not silent:
+                            print(f"[BinanceTrader] 🧹 清除孤儿保护单: {cid}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            if not silent:
+                print(f"[BinanceTrader] ⚠ 全量扫描清除保护单失败: {e}")
+
+        # 清空本地缓存
         self._staged_orders.clear()
 
     def _update_exchange_sl(self, new_sl: float, force: bool = False) -> bool:
@@ -2125,7 +2156,8 @@ class BinanceTestnetTrader:
                       entry_similarity: float = 0.0,
                       entry_reason: str = "",
                       position_size_pct: Optional[float] = None,
-                      regime_at_entry: str = "未知") -> Optional[PaperOrder]:
+                      regime_at_entry: str = "未知",
+                      entry_trajectory: Optional[object] = None) -> Optional[PaperOrder]:
         self._sync_from_exchange(force=True)
         if self.current_position is not None:
             print("[BinanceTrader] 交易所已有持仓，跳过开仓")
@@ -2208,6 +2240,8 @@ class BinanceTestnetTrader:
             kelly_position_pct=kelly_pct,
             regime_at_entry=regime_at_entry,
         )
+        if entry_trajectory is not None:
+            order.entry_trajectory = entry_trajectory
         # 记录最近一次入场的TP/SL，供交易所同步建仓时回填
         self._last_entry_tp = take_profit
         self._last_entry_sl = stop_loss

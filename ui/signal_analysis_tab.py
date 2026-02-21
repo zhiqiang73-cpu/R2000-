@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import traceback
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -20,6 +21,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _RISK_STATE_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     'data', 'risk_control_state.json'
+)
+_SIGNAL_SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'data', 'signal_analysis_settings.json'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,9 +64,11 @@ class SignalAnalysisWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(list)            # List[dict] 本轮结果
     error    = QtCore.pyqtSignal(str)
 
-    def __init__(self, df, parent=None):
+    def __init__(self, df, excluded_families=None, validation_split=0.0, parent=None):
         super().__init__(parent)
         self._df = df
+        self._excluded_families = excluded_families or []
+        self._validation_split = validation_split
         self._stop = False
 
     def stop(self):
@@ -84,11 +91,19 @@ class SignalAnalysisWorker(QtCore.QObject):
                     self.progress.emit(50 + max(0, min(pct // 2, 49)), f"[做空] {text}")
 
             if not self._stop:
-                long_results = analyze(self._df, 'long', progress_cb=cb_long)
+                long_results = analyze(
+                    self._df, 'long', progress_cb=cb_long,
+                    excluded_families=self._excluded_families,
+                    validation_split=self._validation_split,
+                )
                 all_results.extend(long_results)
 
             if not self._stop:
-                short_results = analyze(self._df, 'short', progress_cb=cb_short)
+                short_results = analyze(
+                    self._df, 'short', progress_cb=cb_short,
+                    excluded_families=self._excluded_families,
+                    validation_split=self._validation_split,
+                )
                 all_results.extend(short_results)
 
             if not self._stop:
@@ -177,6 +192,17 @@ def _pnl_color(pnl: float) -> str:
     return TEXT_DIM
 
 
+def _ev_per_trigger_pct(overall_rate: float, direction: str) -> float:
+    """单次触发期望盈亏（百分比，未考虑杠杆）。"""
+    # 含费后净值（与 signal_store.py 保持一致）
+    if direction == "short":
+        tp_pct, sl_pct = 0.0074, 0.0066
+    else:
+        tp_pct, sl_pct = 0.0054, 0.0086
+    per_trade = overall_rate * tp_pct - (1.0 - overall_rate) * sl_pct
+    return round(per_trade * 100, 4)
+
+
 def _make_table(headers: List[str]) -> QtWidgets.QTableWidget:
     tbl = QtWidgets.QTableWidget(0, len(headers))
     tbl.setHorizontalHeaderLabels(headers)
@@ -235,7 +261,7 @@ class _SortableItem(QtWidgets.QTableWidgetItem):
 
 def _set_item(tbl: QtWidgets.QTableWidget, row: int, col: int,
               text: str, color: Optional[str] = None, bold: bool = False,
-              sort_value: Optional[float] = None):
+              sort_value: Optional[float] = None, tooltip: Optional[str] = None):
     if sort_value is None:
         item = QtWidgets.QTableWidgetItem(text)
     else:
@@ -247,6 +273,8 @@ def _set_item(tbl: QtWidgets.QTableWidget, row: int, col: int,
         font = item.font()
         font.setBold(True)
         item.setFont(font)
+    if tooltip:
+        item.setToolTip(tooltip)
     tbl.setItem(row, col, item)
 
 
@@ -362,6 +390,25 @@ def _save_risk_state(state: dict) -> None:
         pass
 
 
+def _load_signal_settings() -> dict:
+    try:
+        if os.path.exists(_SIGNAL_SETTINGS_FILE):
+            with open(_SIGNAL_SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_signal_settings(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_SIGNAL_SETTINGS_FILE), exist_ok=True)
+        with open(_SIGNAL_SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 主 Tab 组件
 # ─────────────────────────────────────────────────────────────────────────────
@@ -389,6 +436,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._init_worker: Optional[_InitialLoadWorker] = None
         self._init_thread: Optional[QtCore.QThread] = None
         self._running = False
+        self._main_window = None
         self._risk_state = _load_risk_state()
         self._auto_run_on_next_data = False   # 新数据到达后自动开始分析
 
@@ -446,6 +494,97 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         btn_row.addStretch()
         btn_row.addWidget(self._btn_clear)
         root.addLayout(btn_row)
+
+        # ①b 排除条件族（可折叠，下次分析生效）
+        _sig_settings = _load_signal_settings()
+        exclude_row = QtWidgets.QHBoxLayout()
+        exclude_row.setSpacing(20)
+        exclude_row.setContentsMargins(10, 6, 10, 6)
+
+        self._chk_exclude_ma5 = QtWidgets.QCheckBox("排除偏离MA5类条件（下次分析生效）")
+        self._chk_exclude_ma5.setChecked(bool(_sig_settings.get("exclude_ma5", False)))
+        self._chk_exclude_ma5.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
+        self._chk_exclude_ma5.stateChanged.connect(self._on_exclude_changed)
+
+        self._chk_exclude_ma5_slope = QtWidgets.QCheckBox("排除均线斜率类条件")
+        self._chk_exclude_ma5_slope.setChecked(bool(_sig_settings.get("exclude_ma5_slope", False)))
+        self._chk_exclude_ma5_slope.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
+        self._chk_exclude_ma5_slope.stateChanged.connect(self._on_exclude_changed)
+
+        self._chk_validation_split = QtWidgets.QCheckBox("启用70/30训练验证分割（推荐）")
+        self._chk_validation_split.setChecked(
+            bool(_sig_settings.get("validation_split_enabled", True))
+        )
+        self._chk_validation_split.setStyleSheet(f"color: {ACCENT_GOLD}; font-size: 12px;")
+        self._chk_validation_split.stateChanged.connect(self._on_exclude_changed)
+
+        exclude_row.addWidget(self._chk_exclude_ma5)
+        exclude_row.addWidget(self._chk_exclude_ma5_slope)
+        exclude_row.addWidget(self._chk_validation_split)
+        exclude_row.addStretch()
+
+        exclude_frame = QtWidgets.QFrame()
+        exclude_frame.setStyleSheet(
+            f"background-color: {BG_PANEL}; border: 1px solid {BORDER_COLOR}; "
+            f"border-radius: 3px; padding: 6px 12px;"
+        )
+        exclude_frame.setLayout(exclude_row)
+        root.addWidget(exclude_frame)
+
+        # ①c 数据模式（专项市场状态分析）
+        data_mode_row = QtWidgets.QHBoxLayout()
+        data_mode_row.setSpacing(10)
+        data_mode_row.setContentsMargins(10, 6, 10, 6)
+
+        lbl_mode = QtWidgets.QLabel("数据模式:")
+        lbl_mode.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        data_mode_row.addWidget(lbl_mode)
+
+        self._cmb_regime_filter = QtWidgets.QComboBox()
+        self._cmb_regime_filter.addItems(["全量", "仅空头趋势", "仅多头趋势", "仅震荡市"])
+        self._cmb_regime_filter.setFixedWidth(120)
+        self._cmb_regime_filter.setFixedHeight(24)
+        self._cmb_regime_filter.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {BG_CARD};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 3px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }}
+            QComboBox:hover {{
+                border-color: {ACCENT_CYAN};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {BG_CARD};
+                color: {TEXT_PRIMARY};
+                selection-background-color: {ACCENT_CYAN};
+                selection-color: {BG_DARK};
+                border: 1px solid {BORDER_COLOR};
+            }}
+        """)
+        _mode_val = _sig_settings.get("regime_filter", "全量")
+        if _mode_val in ["全量", "仅空头趋势", "仅多头趋势", "仅震荡市"]:
+            self._cmb_regime_filter.setCurrentText(_mode_val)
+        data_mode_row.addWidget(self._cmb_regime_filter)
+
+        mode_tip = QtWidgets.QLabel("（下次分析生效）")
+        mode_tip.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        data_mode_row.addWidget(mode_tip)
+        data_mode_row.addStretch()
+
+        data_mode_frame = QtWidgets.QFrame()
+        data_mode_frame.setStyleSheet(
+            f"background-color: {BG_PANEL}; border: 1px solid {BORDER_COLOR}; "
+            f"border-radius: 3px; padding: 6px 12px;"
+        )
+        data_mode_frame.setLayout(data_mode_row)
+        root.addWidget(data_mode_frame)
 
         # ② 风控开关栏（紧凑横排）
         risk_row = QtWidgets.QHBoxLayout()
@@ -616,7 +755,8 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         
         self._spn_min_rounds = QtWidgets.QSpinBox()
         self._spn_min_rounds.setRange(1, 50)
-        self._spn_min_rounds.setValue(3)
+        _settings = _load_signal_settings()
+        self._spn_min_rounds.setValue(int(_settings.get('min_rounds', 5)))
         self._spn_min_rounds.setFixedWidth(60)
         self._spn_min_rounds.setFixedHeight(24)
         self._spn_min_rounds.setStyleSheet(f"""
@@ -642,6 +782,25 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         """)
         self._spn_min_rounds.valueChanged.connect(self._on_filter_changed)
         cumul_count_row.addWidget(self._spn_min_rounds)
+
+        self._btn_save_settings = QtWidgets.QPushButton("保存")
+        self._btn_save_settings.setFixedWidth(50)
+        self._btn_save_settings.setFixedHeight(24)
+        self._btn_save_settings.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {BG_PANEL};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 3px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{
+                border-color: {ACCENT_CYAN};
+                background-color: {BG_CARD};
+            }}
+        """)
+        self._btn_save_settings.clicked.connect(self._on_save_settings)
+        cumul_count_row.addWidget(self._btn_save_settings)
         
         cumul_count_row.addStretch(1)
         self._cumul_count_lbl = QtWidgets.QLabel("共 0 个 | 做多 0 | 做空 0 | 精品 0 | 优质 0")
@@ -652,7 +811,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._cumul_table = _make_table([
             "#", "方向", "层级", "出现轮次", "累计触发", "累计命中",
             "综合命中率", "平均命中率", "波动", "综合评分",
-            "各状态命中率", "估算总盈亏", "条件组合"
+            "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
         ])
         right_layout.addWidget(self._cumul_table)
         splitter.addWidget(right_box)
@@ -832,6 +991,11 @@ class SignalAnalysisTab(QtWidgets.QWidget):
 
     def _on_auto_50(self):
         """自动执行 50 轮验证"""
+        if self._is_backtest_running():
+            QtWidgets.QMessageBox.warning(
+                self, "提示", "正在回测，请先停止回测再开始自动验证。"
+            )
+            return
         if self._running:
             return
         self._auto_count = 50
@@ -868,9 +1032,28 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._risk_state["streak_loss_pause"] = self._chk_streak.isChecked()
         _save_risk_state(self._risk_state)
 
+    def _on_exclude_changed(self):
+        """排除条件族勾选变化时保存到 signal_analysis_settings.json"""
+        _settings = _load_signal_settings()
+        _settings["exclude_ma5"] = self._chk_exclude_ma5.isChecked()
+        _settings["exclude_ma5_slope"] = self._chk_exclude_ma5_slope.isChecked()
+        _settings["validation_split_enabled"] = self._chk_validation_split.isChecked()
+        _save_signal_settings(_settings)
+
     def _on_filter_changed(self):
         """筛选条件变化时刷新累计结果表格"""
         self._refresh_cumulative_table()
+
+    def _on_save_settings(self):
+        """保存 min_rounds、排除条件族等到 signal_analysis_settings.json"""
+        state = _load_signal_settings()
+        state['min_rounds'] = self._spn_min_rounds.value()
+        state['exclude_ma5'] = self._chk_exclude_ma5.isChecked()
+        state['exclude_ma5_slope'] = self._chk_exclude_ma5_slope.isChecked()
+        state['validation_split_enabled'] = self._chk_validation_split.isChecked()
+        if hasattr(self, "_cmb_regime_filter"):
+            state['regime_filter'] = self._cmb_regime_filter.currentText()
+        _save_signal_settings(state)
 
     @QtCore.pyqtSlot(int, str)
     def _on_progress(self, pct: int, text: str):
@@ -916,8 +1099,50 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._progress.setValue(0)
         self._status_lbl.setText("正在初始化...")
 
+        df_to_use = self._df
+        # 专项市场状态过滤（下次分析生效）
+        if hasattr(self, "_cmb_regime_filter"):
+            regime_filter = self._cmb_regime_filter.currentText()
+            if regime_filter and regime_filter != "全量":
+                try:
+                    import numpy as np
+                    adx_vals = df_to_use['adx'].values.astype(float)
+                    slope_vals = df_to_use['ma5_slope'].values.astype(float)
+                    state_arr = np.where(
+                        adx_vals > 25,
+                        np.where(slope_vals > 0, "仅多头趋势", "仅空头趋势"),
+                        "仅震荡市",
+                    )
+                    df_to_use = df_to_use[state_arr == regime_filter].reset_index(drop=True)
+                    if len(df_to_use) < 200:
+                        self._set_running(False)
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "提示",
+                            f"当前数据段中「{regime_filter}」K线不足200根，请换新数据。"
+                        )
+                        return
+                except Exception:
+                    # 如果缺少列或过滤失败，回退为全量
+                    df_to_use = self._df
+
+        # 构建排除条件族列表（排除偏离MA5类 → close_vs_ma5，排除均线斜率类 → ma5_slope）
+        excluded_families: List[str] = []
+        if self._chk_exclude_ma5.isChecked():
+            excluded_families.append("close_vs_ma5")
+        if self._chk_exclude_ma5_slope.isChecked():
+            excluded_families.append("ma5_slope")
+
+        validation_split = (
+            0.3 if self._chk_validation_split.isChecked() else 0.0
+        )
+
         self._thread = QtCore.QThread(self)
-        self._worker = SignalAnalysisWorker(self._df)
+        self._worker = SignalAnalysisWorker(
+            df_to_use,
+            excluded_families=excluded_families,
+            validation_split=validation_split,
+        )
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
@@ -937,6 +1162,15 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._btn_new_data.setEnabled(not running)
         self._btn_auto_50.setEnabled(not running)
         self._btn_clear.setEnabled(not running)
+
+    def set_main_window(self, main_window):
+        self._main_window = main_window
+
+    def is_busy(self) -> bool:
+        return self._running or self._auto_count > 0 or self._auto_run_on_next_data
+
+    def _is_backtest_running(self) -> bool:
+        return bool(self._main_window and getattr(self._main_window, "is_playing", False))
 
     def _populate_round_table(self, results: List[dict]):
         tbl = self._round_table
@@ -984,9 +1218,41 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             
             # 应用最少轮次筛选
             combos = [c for c in combos if c.get("appear_rounds", 0) >= min_rounds]
-            
+
+            # 方案B：条件族限额，防止"偏离MA5"类条件垄断策略池
+            MAX_PER_FAMILY = 20
+            family_count: dict = {}
+            capped_combos = []
+            for c in combos:
+                conditions = c.get("conditions", [])
+                families = set(
+                    re.sub(r"_(loose|strict|mod_loose|mod_strict)$", "", cond)
+                    for cond in conditions
+                )
+                if all(family_count.get(f, 0) < MAX_PER_FAMILY for f in families):
+                    capped_combos.append(c)
+                    for f in families:
+                        family_count[f] = family_count.get(f, 0) + 1
+            combos = capped_combos
+
+            # 做空硬门槛：空头趋势下胜率必须 ≥ 52%（有足够样本时才检查）
+            hard_filtered = []
+            for c in combos:
+                if c.get("direction") == "short":
+                    breakdown = c.get("market_state_breakdown", {}) or {}
+                    bear_info = breakdown.get("空头趋势", {}) or {}
+                    bear_rate = float(bear_info.get("avg_rate", 0.0))
+                    bear_triggers = int(bear_info.get("total_triggers", 0))
+                    if bear_triggers >= 5 and bear_rate < 0.52:
+                        continue  # 剔除：有样本但胜率不达标
+                hard_filtered.append(c)
+            combos = hard_filtered
+
         except Exception:
             return
+        
+        # 缓存当前筛选后的列表，供导出使用（保证导出与表格一致）
+        self._latest_cumulative_combos = list(combos)
 
         # 更新总数统计（含层级数量）- 基于过滤后的数据
         filtered_cumulative = {c.get('combo_key', ''): c for c in combos}
@@ -1036,6 +1302,11 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             pnl_str    = f"{pnl_pct:+.2f}%" if pnl_pct != 0 else "0.00%"
             pnl_color  = _pnl_color(pnl_pct)
 
+            # 单次EV（实时计算，避免旧数据缺字段）
+            ev_pct   = _ev_per_trigger_pct(overall_rate, direction_val)
+            ev_str   = f"{ev_pct:+.2f}%" if ev_pct != 0 else "0.00%"
+            ev_color = _pnl_color(ev_pct)
+
             # 层级（根据综合命中率与方向）
             tier_str   = _tier_from_rate(overall_rate, direction_val)
             tier_color = _tier_color(tier_str) if tier_str else TEXT_DIM
@@ -1058,19 +1329,42 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             _set_item(tbl, row, 10, dom_state, TEXT_DIM)
             _set_item(tbl, row, 11, pnl_str, pnl_color, bold=(pnl_pct != 0),
                       sort_value=pnl_pct)
-            _set_item(tbl, row, 12,
+            _set_item(tbl, row, 12, ev_str, ev_color, bold=(ev_pct != 0),
+                      sort_value=ev_pct)
+            # 平均持仓（0 显示 "-"）
+            avg_hold = c.get("avg_hold_bars", 0) or 0
+            avg_hold_str = str(avg_hold) if avg_hold else "-"
+            decay_tip = ""
+            if avg_hold >= 10:
+                d1, d2 = int(avg_hold * 0.50), int(avg_hold * 0.70)
+                decay_tip = f"衰减计划: {d1}根/-6% | {d2}根/-3%"
+            _set_item(tbl, row, 13, avg_hold_str, TEXT_DIM, sort_value=avg_hold,
+                      tooltip=decay_tip or None)
+            _set_item(tbl, row, 14,
                       _format_conditions(c.get("conditions", []), c.get("direction", "")),
                       TEXT_DIM)
         tbl.setSortingEnabled(True)
 
     def _export_cumulative_txt(self):
         """导出累计结果为TXT文件"""
-        try:
-            from core import signal_store
-            combos, _ = signal_store.get_cumulative_results(top_n=1000)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "导出失败", f"读取数据失败:\n{e}")
-            return
+        combos = None
+        # 优先使用当前表格筛选后的数据（去重后的结果）
+        if hasattr(self, "_latest_cumulative_combos"):
+            combos = list(getattr(self, "_latest_cumulative_combos") or [])
+        if combos is None:
+            try:
+                from core import signal_store
+                # 读取筛选条件，确保导出与表格一致
+                dir_map = {"全部": None, "做多": "long", "做空": "short"}
+                direction = dir_map.get(
+                    self._cmb_direction.currentText() if hasattr(self, '_cmb_direction') else "全部"
+                )
+                min_rounds = self._spn_min_rounds.value() if hasattr(self, '_spn_min_rounds') else 1
+                combos, _ = signal_store.get_cumulative_results(top_n=1000, direction=direction)
+                combos = [c for c in combos if c.get("appear_rounds", 0) >= min_rounds]
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "导出失败", f"读取数据失败:\n{e}")
+                return
         
         if not combos:
             QtWidgets.QMessageBox.information(self, "无数据", "当前没有可导出的累计结果。")
@@ -1091,14 +1385,25 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         headers = [
             "序号", "方向", "层级", "出现轮次", "累计触发", "累计命中",
             "综合命中率", "平均命中率", "波动", "综合评分",
-            "各状态命中率", "估算总盈亏", "条件组合"
+            "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
         ]
         
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\t".join(headers) + "\n")
                 
-                for seq, c in enumerate(combos, start=1):
+                # 按 combo_key 去重（确保导出为去重结果）
+                seen_keys = set()
+                seq = 0
+                exported_count = 0
+                for c in combos:
+                    combo_key = c.get("combo_key")
+                    if combo_key:
+                        if combo_key in seen_keys:
+                            continue
+                        seen_keys.add(combo_key)
+                    seq += 1
+                    exported_count = seq
                     direction_val = c.get("direction", "long")
                     dir_str = "做多" if direction_val == "long" else "做空"
                     overall_rate = c.get("overall_rate", 0.0)
@@ -1106,6 +1411,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                     rate_std = c.get("rate_std", 0.0)
                     score = c.get("综合评分", 0.0)
                     pnl_pct = c.get("estimated_pnl_pct", 0.0)
+                    ev_pct = _ev_per_trigger_pct(overall_rate, direction_val)
                     
                     # 层级
                     tier_str = _tier_from_rate(overall_rate, direction_val) or "--"
@@ -1120,6 +1426,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                         c.get("direction", "")
                     )
                     
+                    avg_hold = c.get("avg_hold_bars", 0) or 0
                     row = [
                         str(seq),
                         dir_str,
@@ -1133,11 +1440,13 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                         f"{score:.1f}",
                         state_detail,
                         f"{pnl_pct:+.2f}%" if pnl_pct != 0 else "0.00%",
+                        f"{ev_pct:+.2f}%" if ev_pct != 0 else "0.00%",
+                        str(avg_hold) if avg_hold else "-",
                         conditions_str,
                     ]
                     f.write("\t".join(row) + "\n")
             
-            QtWidgets.QMessageBox.information(self, "导出完成", f"已导出 {len(combos)} 条记录到:\n{path}")
+            QtWidgets.QMessageBox.information(self, "导出完成", f"已导出 {exported_count} 条记录到:\n{path}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "导出失败", f"写入文件失败:\n{e}")
 

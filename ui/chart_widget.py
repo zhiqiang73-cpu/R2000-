@@ -374,6 +374,8 @@ class ChartWidget(QtWidgets.QWidget):
         self._fast_playback = False
         self._last_tp = None
         self._last_sp = None
+        # 锁定为真实委托价时，避免被历史高低点覆盖
+        self._tp_sl_locked = False
         
         self._init_ui()
     
@@ -967,7 +969,7 @@ class ChartWidget(QtWidgets.QWidget):
         self.signal_marker.add_signal(idx, y, label_type)
         
         # 入场时同步更新 TP/SP（基于近端高低点）
-        if label_type in (1, -1) and 'close' in df.columns:
+        if (not self._tp_sl_locked) and label_type in (1, -1) and 'close' in df.columns:
             tp_price, sp_price = self._calc_tp_sp(idx, label_type, df)
             if tp_price is not None and sp_price is not None:
                 self._set_tp_sp(tp_price, sp_price)
@@ -1124,7 +1126,7 @@ class ChartWidget(QtWidgets.QWidget):
                 short_exit.append((i, self.df['low'].iloc[i]))
         
         self.signal_marker.update_signals(long_entry, long_exit, short_entry, short_exit)
-        if last_tp is not None and last_sp is not None:
+        if (not self._tp_sl_locked) and last_tp is not None and last_sp is not None:
             self._set_tp_sp(last_tp, last_sp)
     
     def _update_signal_markers(self, df: pd.DataFrame, labels: pd.Series):
@@ -1153,7 +1155,7 @@ class ChartWidget(QtWidgets.QWidget):
                 short_exit.append((i, df['low'].iloc[i]))
         
         self.signal_marker.update_signals(long_entry, long_exit, short_entry, short_exit)
-        if last_tp is not None and last_sp is not None:
+        if (not self._tp_sl_locked) and last_tp is not None and last_sp is not None:
             self._set_tp_sp(last_tp, last_sp)
     
     def set_labels(self, labels: pd.Series):

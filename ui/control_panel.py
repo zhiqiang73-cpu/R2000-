@@ -226,6 +226,25 @@ class ControlPanel(QtWidgets.QWidget):
         self.quick_label_btn.clicked.connect(self._on_quick_label_clicked)
         play_layout.addWidget(self.quick_label_btn)
         
+        # 严格市场状态过滤开关
+        self.strict_state_filter_chk = QtWidgets.QCheckBox("⚠ 严格状态过滤")
+        self.strict_state_filter_chk.setToolTip(
+            "开启后：回测时若某策略在当前市场状态下命中率不达标（被标 ⚠），\n"
+            "则该市场状态下禁止开仓（多空均不允许）。\n"
+            "关闭：与原来一致，不限制。"
+        )
+        self.strict_state_filter_chk.setStyleSheet("color: #e0a020; font-size: 12px;")
+        play_layout.addWidget(self.strict_state_filter_chk)
+
+        # 回测试验 TP/SL 开关
+        self.alt_tpsl_chk = QtWidgets.QCheckBox("试验新TP/SL：+0.4% / -0.5%（仅回测）")
+        self.alt_tpsl_chk.setToolTip(
+            "开启后：回测使用 TP=+0.4% / SL=-0.5%（价格）\n"
+            "仅用于回测对比，不影响策略池或实盘参数。"
+        )
+        self.alt_tpsl_chk.setStyleSheet("color: #7fb0ff; font-size: 12px;")
+        play_layout.addWidget(self.alt_tpsl_chk)
+
         # 进度显示
         self.play_progress_label = QtWidgets.QLabel("进度: 0 / 0")
         self.play_progress_label.setStyleSheet("color: #888;")
@@ -360,6 +379,14 @@ class ControlPanel(QtWidgets.QWidget):
     def get_speed(self) -> int:
         """获取当前速度"""
         return self.speed_slider.value()
+
+    def get_strict_state_filter(self) -> bool:
+        """获取严格市场状态过滤开关状态"""
+        return self.strict_state_filter_chk.isChecked()
+
+    def get_alt_tpsl(self) -> bool:
+        """获取回测试验TP/SL开关状态"""
+        return self.alt_tpsl_chk.isChecked()
     
     def set_status(self, text: str):
         """设置状态文本"""

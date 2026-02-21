@@ -14,7 +14,7 @@ import pandas as pd
 
 
 # 最少出现轮次阈值（低于此的组合视为噪声，不追踪）
-_MIN_APPEAR_ROUNDS = 2
+_MIN_APPEAR_ROUNDS = 3
 
 
 class SignalLiveMonitor:

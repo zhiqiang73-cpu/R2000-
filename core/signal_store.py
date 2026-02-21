@@ -79,9 +79,32 @@ def _win_long_path(path: str) -> str:
     if os.name != "nt":
         return path
     abs_path = os.path.abspath(path)
+    abs_path = os.path.normpath(abs_path)
     if abs_path.startswith("\\\\?\\"):
         return abs_path
+    if abs_path.startswith("\\\\"):
+        # UNC path
+        return "\\\\?\\UNC\\" + abs_path.lstrip("\\")
     return "\\\\?\\" + abs_path
+
+
+def _safe_exists(path: str) -> bool:
+    try:
+        return os.path.exists(path)
+    except OSError as e:
+        if os.name == "nt" and e.errno == 22:
+            return os.path.exists(_win_long_path(path))
+        raise
+
+
+def _safe_makedirs(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        if os.name == "nt" and e.errno == 22:
+            os.makedirs(_win_long_path(path), exist_ok=True)
+        else:
+            raise
 
 
 def _open_file(path: str, mode: str, encoding: Optional[str] = None):
@@ -119,7 +142,7 @@ def _combo_key(direction: str, conditions: List[str]) -> str:
 def _load_raw() -> dict:
     """加载 JSON 文件，不存在则返回空骨架。文件未变化时直接返回内存缓存。"""
     global _cache, _cache_mtime
-    if os.path.exists(STATE_FILE):
+    if _safe_exists(STATE_FILE):
         try:
             mtime = _safe_getmtime(STATE_FILE)
             if _cache is not None and mtime == _cache_mtime:
@@ -147,7 +170,7 @@ def _empty_state() -> dict:
 def _save_raw(data: dict) -> None:
     """直接写入目标文件（使用 orjson 高速序列化，移除 fsync 提速）。"""
     global _cache, _cache_mtime, _rounds_cache, _rounds_cache_mtime
-    os.makedirs(_DATA_DIR, exist_ok=True)
+    _safe_makedirs(_DATA_DIR)
     with _write_lock:
         if _USE_ORJSON:
             with _open_file(STATE_FILE, 'wb') as f:
@@ -165,7 +188,7 @@ def _save_raw(data: dict) -> None:
 def _save_cumulative_cache(data: dict) -> None:
     """将 cumulative 部分单独写入轻量级缓存文件（使用 orjson 高速序列化）。"""
     global _cumul_cache, _cumul_cache_mtime
-    os.makedirs(_DATA_DIR, exist_ok=True)
+    _safe_makedirs(_DATA_DIR)
     cache_data = {
         "version":      data.get("version", _SCHEMA_VERSION),
         "last_updated": data.get("last_updated", ""),
@@ -195,7 +218,7 @@ def _load_cumulative_fast() -> dict:
     global _cumul_cache, _cumul_cache_mtime
 
     # 1. 内存命中
-    if _cumul_cache is not None and os.path.exists(CUMULATIVE_CACHE_FILE):
+    if _cumul_cache is not None and _safe_exists(CUMULATIVE_CACHE_FILE):
         try:
             mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE)
             if mtime == _cumul_cache_mtime:
@@ -204,7 +227,7 @@ def _load_cumulative_fast() -> dict:
             pass
 
     # 2. 缓存文件存在，读取它
-    if os.path.exists(CUMULATIVE_CACHE_FILE):
+    if _safe_exists(CUMULATIVE_CACHE_FILE):
         try:
             mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE)
             with _open_file(CUMULATIVE_CACHE_FILE, 'r', encoding='utf-8') as f:
@@ -217,7 +240,7 @@ def _load_cumulative_fast() -> dict:
             pass
 
     # 3. 缓存文件不存在，回退到完整文件并生成缓存
-    if os.path.exists(STATE_FILE):
+    if _safe_exists(STATE_FILE):
         data = _load_raw()
         try:
             _save_cumulative_cache(data)
@@ -240,7 +263,7 @@ def _load_rounds_fast() -> list:
     """
     global _rounds_cache, _rounds_cache_mtime
 
-    if _rounds_cache is not None and os.path.exists(STATE_FILE):
+    if _rounds_cache is not None and _safe_exists(STATE_FILE):
         try:
             mtime = _safe_getmtime(STATE_FILE)
             if mtime == _rounds_cache_mtime:
@@ -302,6 +325,14 @@ def _estimated_pnl_pct(overall_rate: float, total_triggers: int,
     return round(per_trade * total_triggers * 100, 4)   # 单位：%
 
 
+def _ev_per_trigger_pct(overall_rate: float, direction: str = 'long') -> float:
+    """单次触发期望盈亏（百分比，未考虑杠杆）。"""
+    tp_pct = _LONG_TP_PCT  if direction == 'long' else _SHORT_TP_PCT
+    sl_pct = _LONG_SL_PCT  if direction == 'long' else _SHORT_SL_PCT
+    per_trade = overall_rate * tp_pct - (1.0 - overall_rate) * sl_pct
+    return round(per_trade * 100, 4)   # 单位：%
+
+
 def _merge_market_state_breakdown(history: List[dict]) -> dict:
     """
     聚合多轮历史记录中的 market_state_breakdown，得到累计汇总。
@@ -355,7 +386,7 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') ->
     根据历次命中率记录计算累计指标。
 
     history 元素字段：round_id, hit_rate, trigger_count, hit_count,
-                      market_state_breakdown (可选)
+                      market_state_breakdown (可选), hold_bars (可选)
     direction: 'long' 或 'short'，影响评分基准线和 P&L 常量
 
     返回字段：
@@ -369,6 +400,8 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') ->
       overall_rate          : float  总体命中率（total_hits / total_triggers）
       estimated_pnl_pct     : float  估算累计盈亏百分比
       market_state_breakdown: dict   按市场状态聚合的触发/命中统计
+      avg_hold_bars         : int    自然结束交易的平均持仓根数（排除超时）
+      hold_bars_sample_count: int    参与统计的样本数
     """
     rates = [h['hit_rate'] for h in history]
     n = len(rates)
@@ -376,6 +409,14 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') ->
     total_triggers = sum(h['trigger_count'] for h in history)
     total_hits     = sum(h.get('hit_count', 0) for h in history)
     overall_rate   = total_hits / total_triggers if total_triggers > 0 else 0.0
+
+    # 聚合 hold_bars：收集所有轮次中自然结束的持仓记录（排除 hold=-1 超时）
+    all_hold_bars: List[int] = []
+    for h in history:
+        all_hold_bars.extend(h.get('hold_bars', []))
+    valid_holds = [hb for hb in all_hold_bars if hb >= 0]
+    avg_hold_bars = int(round(sum(valid_holds) / len(valid_holds))) if valid_holds else 0
+    hold_bars_sample_count = len(valid_holds)
 
     if n == 0:
         return {
@@ -389,6 +430,8 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') ->
             'overall_rate':           0.0,
             'estimated_pnl_pct':      0.0,
             'market_state_breakdown': _merge_market_state_breakdown([]),
+            'avg_hold_bars':          avg_hold_bars,
+            'hold_bars_sample_count': hold_bars_sample_count,
         }
 
     avg_rate = sum(rates) / n
@@ -405,8 +448,11 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') ->
     else:
         rate_baseline, rate_max = 0.61, 0.75
     rate_score  = min(100.0, max(0.0, (avg_rate - rate_baseline) / (rate_max - rate_baseline) * 100.0))
-    stab_score  = min(100.0, max(0.0, (1.0 - rate_std / 0.15) * 100.0))
-    round_score = min(100.0, math.log(n + 1) / math.log(11) * 100.0)  # n=10 时满分
+    stab_score  = min(100.0, max(0.0, (1.0 - rate_std / 0.08) * 100.0))
+    # 轮次衰减折扣：n<5 时降低稳定性分，避免小样本虚高
+    round_factor = min(1.0, n / 5.0)
+    stab_score *= round_factor
+    round_score = min(100.0, math.log(n + 1) / math.log(21) * 100.0)  # n=20 时满分
     composite   = rate_score * 0.30 + stab_score * 0.40 + round_score * 0.30
 
     return {
@@ -419,7 +465,10 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') ->
         'total_hits':             total_hits,
         'overall_rate':           round(overall_rate, 6),
         'estimated_pnl_pct':      _estimated_pnl_pct(overall_rate, total_triggers, direction),
+        'ev_per_trigger_pct':     _ev_per_trigger_pct(overall_rate, direction),
         'market_state_breakdown': _merge_market_state_breakdown(history),
+        'avg_hold_bars':          avg_hold_bars,
+        'hold_bars_sample_count': hold_bars_sample_count,
     }
 
 
@@ -469,10 +518,16 @@ def _merge_round_into_data(
             'hit_count':              item['hit_count'],
             'tier':                   item['tier'],
             'market_state_breakdown': item.get('market_state_breakdown'),
+            'hold_bars':              item.get('hold_bars', []),
         })
 
         metrics = _compute_cumulative_metrics(entry['history'], direction=item['direction'])
         entry.update(metrics)
+        # 条件数量惩罚：超过 3 条每多 1 条扣 3 分（防过拟合）
+        n_conds = len(entry.get('conditions', []))
+        if n_conds > 3:
+            penalty = (n_conds - 3) * 3.0
+            entry['综合评分'] = round(max(0.0, entry.get('综合评分', 0.0) - penalty), 2)
         updated_keys[key] = entry
 
     return updated_keys
@@ -716,11 +771,11 @@ def _prune_redundant_subsets(entries: Dict[str, dict]) -> Dict[str, dict]:
 def _ensure_pruned_cache_fresh() -> None:
     """若去重缓存不存在或早于原始状态文件，则同步重建（同步/轻量操作）。"""
     try:
-        cache_mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE) if os.path.exists(CUMULATIVE_CACHE_FILE) else 0.0
+        cache_mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE) if _safe_exists(CUMULATIVE_CACHE_FILE) else 0.0
     except OSError:
         cache_mtime = 0.0
     try:
-        state_mtime = _safe_getmtime(STATE_FILE) if os.path.exists(STATE_FILE) else 0.0
+        state_mtime = _safe_getmtime(STATE_FILE) if _safe_exists(STATE_FILE) else 0.0
     except OSError:
         state_mtime = 0.0
     if cache_mtime < state_mtime:   # 包含 cache_mtime==0（文件不存在）的情况
@@ -737,12 +792,20 @@ def rebuild_pruned_cache() -> None:
     data = _load_raw()
     cumulative = data.get("cumulative", {})
 
-    # 层级过滤：只保留精品和优质
-    filtered = {
-        k: v for k, v in cumulative.items()
-        if _tier_from_rate(v.get('overall_rate', 0.0), v.get('direction', 'long'))
-           in ('精品', '优质')
-    }
+    # 层级过滤：精品/优质直接保留；候选组合需满足稳定性准入条件
+    CANDIDATE_MAX_STD    = 0.05   # 候选组合的稳定性准入门槛
+    CANDIDATE_MIN_ROUNDS = 5      # 候选组合的最少出现轮次
+
+    def _keep_entry(v: dict) -> bool:
+        tier = _tier_from_rate(v.get('overall_rate', 0.0), v.get('direction', 'long'))
+        if tier in ('精品', '优质'):
+            return True
+        if tier == '候选':
+            return (v.get('rate_std', 1.0) <= CANDIDATE_MAX_STD
+                    and v.get('appear_rounds', 0) >= CANDIDATE_MIN_ROUNDS)
+        return False
+
+    filtered = {k: v for k, v in cumulative.items() if _keep_entry(v)}
 
     # 对存量条目规范化（去除同族宽松+严格并存）
     normalized = _normalize_all_entries(filtered)
@@ -1099,7 +1162,7 @@ def clear_all() -> None:
     """清空所有历史记录（写入空骨架），同时删除轻量级缓存文件。"""
     global _cumul_cache, _cumul_cache_mtime
     invalidate_cache()
-    if os.path.exists(CUMULATIVE_CACHE_FILE):
+    if _safe_exists(CUMULATIVE_CACHE_FILE):
         try:
             os.remove(CUMULATIVE_CACHE_FILE)
         except OSError:
@@ -1110,18 +1173,18 @@ def clear_all() -> None:
 
 
 def get_stable_combos(
-    min_rounds: int = 3,
-    min_avg_rate: float = 0.64,
-    max_rate_std: float = 0.08,
+    min_rounds: int = 5,
+    min_avg_rate: float = 0.62,
+    max_rate_std: float = 0.05,
     direction: Optional[str] = None,
 ) -> List[dict]:
     """
     返回通过多轮稳定性筛选的组合列表，按综合评分降序。
 
     筛选条件（默认值）：
-      - appear_rounds >= 3
-      - avg_rate      >= 0.64
-      - rate_std      <= 0.08
+      - appear_rounds >= 5
+      - avg_rate      >= 0.62
+      - rate_std      <= 0.05
 
     Args:
         min_rounds:   最少出现轮次

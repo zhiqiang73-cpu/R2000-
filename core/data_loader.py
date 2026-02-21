@@ -53,14 +53,19 @@ class DataLoader:
         if self._full_data is not None:
             return self._full_data
             
+        script_dir = Path(__file__).parent.parent  # 项目根目录
         data_path = Path(self.data_file)
-        if not data_path.exists():
-            # 尝试相对于脚本目录查找
-            script_dir = Path(__file__).parent.parent
+        if not data_path.is_absolute() and not data_path.exists():
+            # 尝试相对于项目根目录
             data_path = script_dir / self.data_file
-            
         if not data_path.exists():
-            raise FileNotFoundError(f"数据文件不存在: {self.data_file}")
+            # 尝试在 data/ 目录下查找同名文件
+            data_path = script_dir / "data" / Path(self.data_file).name
+        if not data_path.exists():
+            raise FileNotFoundError(
+                f"数据文件不存在: {self.data_file}\n"
+                f"请确保 data/ 目录下有 parquet 文件，或在 config.py 中设置正确的 DATA_FILE 路径"
+            )
             
         print(f"[DataLoader] 正在加载数据: {data_path}")
         self._full_data = pd.read_parquet(data_path)
@@ -137,7 +142,11 @@ class DataLoader:
             
         # 随机选择起始位置（确保有足够的预热期）
         max_start = self.total_rows - sample_size
-        self.sample_start_idx = np.random.randint(self.warmup_bars, max_start)
+        if max_start <= self.warmup_bars:
+            # 数据量几乎等于采样大小，固定从 warmup_bars 开始，不随机偏移
+            self.sample_start_idx = self.warmup_bars
+        else:
+            self.sample_start_idx = np.random.randint(self.warmup_bars, max_start)
         self.sample_end_idx = self.sample_start_idx + sample_size
         
         # 采样

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,7 +34,7 @@ import pandas as pd
 from core.market_state_detector import detect_state
 
 # ── 回测参数 ────────────────────────────────────────────────────────────────
-MAX_HOLD  = 240     # 最大持仓根数（超时则算未命中）
+MAX_HOLD  = 60      # 最大持仓根数（超时则算未命中）- 短线优化
 
 # 做多参数（原有，TP+0.6% / SL−0.8%）
 LONG_TP1_PCT = 0.006   # 价格+0.6%
@@ -81,7 +81,7 @@ def _precompute_outcomes(
     tp_pct: float = TP1_PCT,
     sl_pct: float = SL_PCT,
     max_hold: int = MAX_HOLD,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     对每个 bar i 预计算：若在 bar i 收盘后发出信号、于 bar i+1 开盘入场，
     最终止盈先触发(True)还是止损先触发/超时(False)。
@@ -90,10 +90,13 @@ def _precompute_outcomes(
       - 悲观假设：同K线同时触及 TP 和 SL → 一律视为止损（False）
 
     Returns:
-        shape=(n,) 的 bool 数组；outcomes[n-1] 恒为 False（无法入场）
+        (outcomes, hold_bars):
+          outcomes: shape=(n,) 的 bool 数组；outcomes[n-1] 恒为 False（无法入场）
+          hold_bars: shape=(n,) 的 int 数组；持仓根数，超时标记为 -1（排除统计）
     """
     n = len(high)
     outcomes = np.zeros(n, dtype=bool)
+    hold_bars_arr = np.full(n, -1, dtype=np.int32)
 
     for i in range(n - 1):
         entry_idx = i + 1
@@ -123,18 +126,20 @@ def _precompute_outcomes(
 
         either = tp_hits | sl_hits
         if not either.any():
-            # 超时：算未命中
+            # 超时：算未命中，hold_bars=-1 排除统计
             outcomes[i] = False
+            hold_bars_arr[i] = -1
             continue
 
-        first = int(np.argmax(either))
+        first = int(np.argmax(either))  # 相对 entry_idx 的偏移，即持仓根数
 
         if tp_hits[first] and sl_hits[first]:
             outcomes[i] = False   # 双触发，悲观假设，按止损处理
         else:
             outcomes[i] = bool(tp_hits[first])
+        hold_bars_arr[i] = first
 
-    return outcomes
+    return outcomes, hold_bars_arr
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -359,6 +364,8 @@ def analyze(
     direction: str,
     fee_pct: float = 0.0006,
     progress_cb: Optional[Callable[[int, str], None]] = None,
+    excluded_families: Optional[List[str]] = None,
+    validation_split: float = 0.0,
 ) -> List[dict]:
     """
     对给定 K 线数据执行信号组合分析。
@@ -371,6 +378,12 @@ def analyze(
                      当前版本用于说明含费门槛来源，门槛已内置为 64/67/71%。
         progress_cb: 进度回调 progress_cb(percent: int, status_text: str)
                      percent 为 0-100 整数
+        excluded_families: 排除的条件族名列表（如 ['close_vs_ma5', 'ma5_slope']），
+                          条件名以此前缀开头的将被排除
+        validation_split: 验证集比例（0.0=关闭，0.3=后30%作为验证集）。
+                          启用时在训练集搜索组合，再用验证集二次过滤，
+                          每个通过验证的组合 hit_rate 更新为验证集命中率，
+                          train_hit_rate 字段保留训练集原始命中率。
 
     Returns:
         List[dict]，仅包含命中率 ≥ 候选门槛（做多 64%，做空 52%）的结果，按 hit_rate 降序。
@@ -379,7 +392,8 @@ def analyze(
           conditions             : List[str]  条件名称列表
           trigger_count          : int        总触发次数
           hit_count              : int        命中次数
-          hit_rate               : float      原始命中率（0-1）
+          hit_rate               : float      原始命中率（0-1）；启用分割时为验证集命中率
+          train_hit_rate         : float      训练集命中率（仅 validation_split > 0 时存在）
           tier                   : str        '候选' / '优质' / '精品'
           low_sample_warn        : bool       True 表示样本偏少（触发次数 8-14）
           market_state_breakdown : dict       按市场状态分组的触发/命中统计
@@ -390,6 +404,13 @@ def analyze(
     """
     if direction not in ('long', 'short'):
         raise ValueError(f"direction must be 'long' or 'short', got {direction!r}")
+
+    # ── 70/30 训练/验证集切分 ─────────────────────────────────────────────────
+    df_val: Optional[pd.DataFrame] = None
+    if validation_split > 0.0:
+        split_idx = int(len(df) * (1.0 - validation_split))
+        df_val = df.iloc[split_idx:].reset_index(drop=True)
+        df = df.iloc[:split_idx].reset_index(drop=True)
 
     # ── 1. 提取 NumPy 数组 ──────────────────────────────────────────────────
     high_arr  = df['high'].values.astype(float)
@@ -411,14 +432,21 @@ def analyze(
     # ── 2. 策略1：预计算 outcome 数组（O(N×240)，执行一次）───────────────────
     tp_pct = LONG_TP1_PCT if direction == 'long' else SHORT_TP1_PCT
     sl_pct = LONG_SL_PCT  if direction == 'long' else SHORT_SL_PCT
-    outcome = _precompute_outcomes(high_arr, low_arr, open_arr, close_arr, direction,
-                                   tp_pct=tp_pct, sl_pct=sl_pct)
+    outcome, hold_bars_arr = _precompute_outcomes(high_arr, low_arr, open_arr, close_arr, direction,
+                                                   tp_pct=tp_pct, sl_pct=sl_pct)
 
     if progress_cb:
         progress_cb(5, "正在构建条件数组...")
 
     # ── 3. 策略2：构建 30 个条件 bool 数组 ──────────────────────────────────
     all_conds = _build_condition_arrays(df, direction)
+
+    # 方案C：排除指定条件族（排他搜索）
+    if excluded_families:
+        all_conds = {
+            k: v for k, v in all_conds.items()
+            if not any(k.startswith(f) for f in excluded_families)
+        }
 
     if progress_cb:
         progress_cb(8, "正在进行单条件预剪枝...")
@@ -473,6 +501,7 @@ def analyze(
             indices   = np.nonzero(trigger_mask)[0]
             hit_count = int(outcome[indices].sum())
             hit_rate  = hit_count / trigger_count
+            hold_bars = hold_bars_arr[indices].tolist()  # 每触发点的持仓根数，-1=超时排除
 
             t_prem = TIER_PREMIUM   if direction == 'long' else SHORT_TIER_PREMIUM
             t_qual = TIER_QUALITY   if direction == 'long' else SHORT_TIER_QUALITY
@@ -499,6 +528,7 @@ def analyze(
                     'market_state_breakdown': _build_market_state_breakdown(
                         indices, outcome, market_state_arr
                     ),
+                    'hold_bars':              hold_bars,
                 })
 
             if processed % report_gap == 0 and progress_cb:
@@ -506,6 +536,69 @@ def analyze(
                 if pct > last_pct:
                     last_pct = pct
                     progress_cb(pct, f"正在计算第 {processed} / {total_combos} 个组合...")
+
+    # ── 7. 验证集二次过滤（validation_split > 0 时）──────────────────────────
+    if df_val is not None and len(df_val) > 0:
+        if progress_cb:
+            progress_cb(99, f"正在用验证集过滤 {len(results)} 个候选组合...")
+
+        val_high  = df_val['high'].values.astype(float)
+        val_low   = df_val['low'].values.astype(float)
+        val_open  = df_val['open'].values.astype(float)
+        val_close = df_val['close'].values.astype(float)
+
+        outcome_val, hold_bars_val = _precompute_outcomes(
+            val_high, val_low, val_open, val_close, direction,
+            tp_pct=tp_pct, sl_pct=sl_pct,
+        )
+        conds_val = _build_condition_arrays(df_val, direction)
+
+        t_prem_v = TIER_PREMIUM   if direction == 'long' else SHORT_TIER_PREMIUM
+        t_qual_v = TIER_QUALITY   if direction == 'long' else SHORT_TIER_QUALITY
+        t_cand_v = TIER_CANDIDATE if direction == 'long' else SHORT_TIER_CANDIDATE
+
+        val_results: List[dict] = []
+        for res in results:
+            cond_names_r = res['conditions']
+            trigger_mask_val: Optional[np.ndarray] = None
+            valid = True
+            for cname in cond_names_r:
+                if cname not in conds_val:
+                    valid = False
+                    break
+                arr = conds_val[cname]
+                if trigger_mask_val is None:
+                    trigger_mask_val = arr.copy()
+                else:
+                    trigger_mask_val &= arr
+            if not valid or trigger_mask_val is None:
+                continue
+
+            val_trigger_count = int(trigger_mask_val.sum())
+            if val_trigger_count < 1:
+                continue
+
+            val_indices = np.nonzero(trigger_mask_val)[0]
+            val_hit_count = int(outcome_val[val_indices].sum())
+            val_hit_rate  = val_hit_count / val_trigger_count
+            if val_hit_rate < t_cand_v:
+                continue
+
+            if val_hit_rate >= t_prem_v:
+                val_tier = '精品'
+            elif val_hit_rate >= t_qual_v:
+                val_tier = '优质'
+            else:
+                val_tier = '候选'
+
+            res['train_hit_rate']  = res['hit_rate']
+            res['hit_rate']        = val_hit_rate
+            res['tier']            = val_tier
+            res['low_sample_warn'] = val_trigger_count <= WARN_TRIGGERS_MAX
+            res['hold_bars']       = hold_bars_val[val_indices].tolist()
+            val_results.append(res)
+
+        results = val_results
 
     results.sort(key=lambda x: x['hit_rate'], reverse=True)
 

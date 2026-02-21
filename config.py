@@ -32,7 +32,7 @@ _load_dotenv(os.path.join(os.getcwd(), ".env"))  # 若从别处启动，再试�
 
 # ==================== 数据配置 ====================
 DATA_CONFIG = {
-    "DATA_FILE": "btcusdt_1m.parquet",
+    "DATA_FILE": "btcusdt_1m.parquet",  # 通过 文件→加载数据 可选择文件；采样按钮使用此默认路径
     "SAMPLE_SIZE": 50000,       # 每次采样的 K 线数量 (50000-100000)
     "RANDOM_SEED": None,        # 随机种子，None 表示每次随机
     "WARMUP_BARS": 200,         # 预热期（用于计算指标）
@@ -140,14 +140,14 @@ BACKTEST_CONFIG = {
     "FEE_RATE": 0.0004,         # 手续费率 0.04%
     "SLIPPAGE": 0.0002,         # 滑点 0.02%
     "POSITION_SIZE_PCT": 0.05,  # 单次仓位比例 5%
-    "STOP_LOSS_PCT": 0.008,     # SL 价格 -0.8%（10x杠杆 = -8%杠杆后）
-    "TAKE_PROFIT_PCT": 0.012,   # TP1 = +12%杠杆后 = 价格 +1.2%（新系统：原 TP2 升为 TP1）
+    "STOP_LOSS_PCT": 0.008,     # SL 价格 -0.8% = 杠杆后 -16%（20x）
+    "TAKE_PROFIT_PCT": 0.006,   # TP1 价格 +0.6% = 杠杆后 +12%（20x）— 与信号分析/模拟交易对齐
     "TP1_RATIO": 0.70,          # TP1 平仓比例 70%
     "TP_SP_LOOKBACK": 20,       # TP/SP 近端高低点窗口
 
     # ── 追踪止盈止损系统 ──
     "TRAILING_STOP_ENABLED": True,          # 启用追踪止损（TP1后阶段2）
-    "TRAILING_STOP_PCT": 0.08,              # 追踪止损间距 8%（价格）
+    "TRAILING_STOP_PCT": 0.02,              # 追踪止损间距 2%（价格）- 短线优化
 
     # 阶梯止损上移（杠杆后%）
     "BREAKEVEN_THRESHOLD_PCT": 6.0,         # 浮盈达到+6%（杠杆后）触发止损上移
@@ -155,10 +155,10 @@ BACKTEST_CONFIG = {
 
     # 时间衰减止损（杠杆后%）
     "TIME_DECAY_ENABLED": True,             # 启用时间衰减止损收窄
-    "TIME_DECAY_BAR_1": 120,                # 超过120根K线触发第一档收窄
-    "TIME_DECAY_SL_1": -10.0,               # 第一档：止损收窄至 -10%（杠杆后）
-    "TIME_DECAY_BAR_2": 180,                # 超过180根K线触发第二档收窄
-    "TIME_DECAY_SL_2": -5.0,                # 第二档：止损收窄至 -5%（杠杆后）
+    "TIME_DECAY_BAR_1": 30,                 # 超过30根K线触发第一档收窄 - 短线优化
+    "TIME_DECAY_SL_1": -6.0,                # 第一档：止损收窄至 -6%（杠杆后）- 短线优化
+    "TIME_DECAY_BAR_2": 60,                 # 超过60根K线触发第二档收窄 - 短线优化
+    "TIME_DECAY_SL_2": -3.0,                # 第二档：止损收窄至 -3%（杠杆后）- 短线优化
 }
 
 # ==================== 实盘风控配置 ====================
@@ -568,7 +568,7 @@ PAPER_TRADING_CONFIG = {
     # 止盈止损
     "STOP_LOSS_ATR": 2.0,
     "TAKE_PROFIT_ATR": 3.5,             # TP = 3.5 x ATR（适中的止盈倍数，平衡捕获利润与避免过度持仓）
-    "MAX_HOLD_BARS": 240,
+    "MAX_HOLD_BARS": 60,              # 最大持仓根数 - 短线优化
     
     # ── 止损保护参数 ──
     "MIN_SL_PCT": 0.004,        # 最小止损距离 0.4%（原配置，TP/SL 较近）
@@ -627,7 +627,7 @@ PAPER_TRADING_CONFIG = {
     # 阶段1：入场→TP1（+12%），动态调整止损
     # 阶段2：TP1后，剩余30%用追踪止损跑利润
     "TRAILING_STOP_ENABLED": True,       # 启用追踪止损（阶段2使用）
-    "TRAILING_STOP_PCT": 0.08,           # 追踪止损间距 8%（价格变动）
+    "TRAILING_STOP_PCT": 0.02,           # 追踪止损间距 2%（价格变动）- 短线优化
 
     # 阶梯止损上移（阶段1）
     "BREAKEVEN_THRESHOLD_PCT": 6.0,      # 浮盈达到+6%（杠杆后）→止损上移
@@ -635,10 +635,10 @@ PAPER_TRADING_CONFIG = {
 
     # 时间衰减止损（阶段1，未到过+6%时才触发）
     "TIME_DECAY_ENABLED": True,          # 启用时间衰减
-    "TIME_DECAY_BAR_1": 120,             # 第一档：持仓超过120根K线
-    "TIME_DECAY_SL_1": -10.0,            # 第一档止损收窄到：-10%（杠杆后）
-    "TIME_DECAY_BAR_2": 180,             # 第二档：持仓超过180根K线
-    "TIME_DECAY_SL_2": -5.0,             # 第二档止损收窄到：-5%（杠杆后）
+    "TIME_DECAY_BAR_1": 30,              # 第一档：持仓超过30根K线 - 短线优化
+    "TIME_DECAY_SL_1": -6.0,             # 第一档止损收窄到：-6%（杠杆后）- 短线优化
+    "TIME_DECAY_BAR_2": 60,              # 第二档：持仓超过60根K线 - 短线优化
+    "TIME_DECAY_SL_2": -3.0,             # 第二档止损收窄到：-3%（杠杆后）- 短线优化
 
     # 兼容旧配置（已废弃，保留以防其他模块引用）
     "STAGED_TP_1_PCT": 12.0,          # [废弃] TP1 收益率 +12%
@@ -648,13 +648,6 @@ PAPER_TRADING_CONFIG = {
     "STAGED_SL_RATIO_1": 1.00,        # [废弃] 止损始终全平
     "STAGED_SL_RATIO_2": 1.00,        # [废弃] 止损始终全平
 
-    # ── 价格动量衰减离场（新增）──
-    # 当价格接近峰值但动能衰减时主动离场
-    "MOMENTUM_EXIT_ENABLED": True,     # 是否启用动量衰减离场
-    "MOMENTUM_MIN_PROFIT_PCT": 5.0,    # 最低利润阈值（至少盈利5%才检测，与TP1对齐，避免过早截断赢家）
-    "MOMENTUM_LOOKBACK_BARS": 3,       # 动量检测回看K线数
-    "MOMENTUM_DECAY_THRESHOLD": 0.5,   # K线实体缩小阈值（当前<峰值的50%视为衰减）
-    "MOMENTUM_PEAK_RETRACEMENT": 0.8,  # 从峰值回撤阈值（回撤80%的利润触发）
     "HOLD_CHECK_INTERVAL": 3,
     
     # ── 离场信号学习系统（自适应优化）──
@@ -794,7 +787,7 @@ PAPER_TRADING_CONFIG = {
 
     # ── 追踪止盈止损系统 ──
     "TRAILING_STOP_ENABLED": True,          # 启用追踪止损（TP1后进入阶段2时生效）
-    "TRAILING_STOP_PCT": 0.08,              # 追踪止损间距 8%（价格，非杠杆后）
+    "TRAILING_STOP_PCT": 0.02,              # 追踪止损间距 2%（价格，非杠杆后）- 短线优化
 
     # 阶梯止损上移（杠杆后%）
     "BREAKEVEN_THRESHOLD_PCT": 6.0,         # 第一档阈值：浮盈+6%（杠杆后）触发止损上移
@@ -802,10 +795,10 @@ PAPER_TRADING_CONFIG = {
 
     # 时间衰减止损（杠杆后%）
     "TIME_DECAY_ENABLED": True,             # 启用时间衰减止损收窄
-    "TIME_DECAY_BAR_1": 120,                # 第一档：持仓超过120根K线
-    "TIME_DECAY_SL_1": -10.0,               # 第一档止损收窄目标：-10%（杠杆后）
-    "TIME_DECAY_BAR_2": 180,                # 第二档：持仓超过180根K线
-    "TIME_DECAY_SL_2": -5.0,                # 第二档止损收窄目标：-5%（杠杆后）
+    "TIME_DECAY_BAR_1": 30,                 # 第一档：持仓超过30根K线 - 短线优化
+    "TIME_DECAY_SL_1": -6.0,                # 第一档止损收窄目标：-6%（杠杆后）- 短线优化
+    "TIME_DECAY_BAR_2": 60,                 # 第二档：持仓超过60根K线 - 短线优化
+    "TIME_DECAY_SL_2": -3.0,                # 第二档止损收窄目标：-3%（杠杆后）- 短线优化
 }
 
 # ==================== DeepSeek API 配置 ====================

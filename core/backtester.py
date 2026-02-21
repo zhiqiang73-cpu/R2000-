@@ -39,6 +39,8 @@ class Position:
     ever_reached_6pct: bool = False  # 是否曾达到+BREAKEVEN_THRESHOLD_PCT
     original_stop_loss: float = 0.0  # 原始止损价（用于止损参考）
     peak_price: float = 0.0         # 阶段2追踪最高/最低价
+    signal_key: str = ""            # combo_key，用于日志和追溯
+    avg_hold_bars: int = 0          # 策略平均持仓，0=使用全局配置
 
 
 @dataclass
@@ -71,7 +73,8 @@ class TradeRecord:
     # 信号回测附加信息
     signal_key: str = ""                # 累计结果编号（combo key）
     signal_rate: float = 0.0            # 综合命中率 overall_rate
-    signal_score: float = 0.0           # 综合评分
+    signal_score: float = 0.0          # 综合评分
+    avg_hold_bars: int = 0              # 策略平均持仓（用于时间衰减）
 
 
 @dataclass
@@ -103,6 +106,7 @@ class BacktestResult:
     equity_curve: List[float] = field(default_factory=list)
     trades: List[TradeRecord] = field(default_factory=list)
     current_pos: Optional[Position] = None  # 当前持仓信息
+    trade_logs: List[dict] = field(default_factory=list)
 
 
 class Backtester:
@@ -140,6 +144,7 @@ class Backtester:
         self.position = Position()
         self.equity_curve = []
         self.trades: List[TradeRecord] = []
+        self.trade_logs: List[dict] = []
         self._reset_stats()
         
     def reset(self):
@@ -148,7 +153,21 @@ class Backtester:
         self.position = Position()
         self.equity_curve = []
         self.trades = []
+        self.trade_logs = []
         self._reset_stats()
+
+    def _log_event(self, event: str, idx: int, side: Optional[PositionSide],
+                   price: float, info: Optional[dict] = None) -> None:
+        """记录回测关键事件（entry / tp1 / sl / trailing_sl / signal / end）"""
+        side_map = {PositionSide.LONG: "LONG", PositionSide.SHORT: "SHORT"}
+        side_text = side_map.get(side, "") if side is not None else ""
+        self.trade_logs.append({
+            "idx": idx,
+            "event": event,
+            "side": side_text,
+            "price": price,
+            "info": info or {},
+        })
 
     def _reset_stats(self):
         """重置统计缓存"""
@@ -209,14 +228,14 @@ class Backtester:
                 if self.position.side == PositionSide.NONE:
                     # 开仓
                     side = PositionSide.LONG if signal > 0 else PositionSide.SHORT
-                    self._open_position(i, current_price, side)
+                    self._open_position(i, current_price, side, reason="signal", meta={"signal": float(signal)})
                     
                 elif (signal > 0 and self.position.side == PositionSide.SHORT) or \
                      (signal < 0 and self.position.side == PositionSide.LONG):
                     # 反向信号，平仓后反向开仓
                     self._close_position(i, current_price, "signal")
                     side = PositionSide.LONG if signal > 0 else PositionSide.SHORT
-                    self._open_position(i, current_price, side)
+                    self._open_position(i, current_price, side, reason="signal_reverse", meta={"signal": float(signal)})
             
             # 记录权益
             equity = self._calculate_equity(current_price)
@@ -251,12 +270,12 @@ class Backtester:
                 if self.position.side == PositionSide.SHORT:
                     self._close_position(i, low[i], "signal")
                 if self.position.side == PositionSide.NONE:
-                    self._open_position(i, low[i], PositionSide.LONG)
+                    self._open_position(i, low[i], PositionSide.LONG, reason="label_long_entry")
             elif label == -1:  # SHORT_ENTRY
                 if self.position.side == PositionSide.LONG:
                     self._close_position(i, high[i], "signal")
                 if self.position.side == PositionSide.NONE:
-                    self._open_position(i, high[i], PositionSide.SHORT)
+                    self._open_position(i, high[i], PositionSide.SHORT, reason="label_short_entry")
             elif label == 2:  # LONG_EXIT
                 if self.position.side == PositionSide.LONG:
                     self._close_position(i, high[i], "signal")
@@ -280,12 +299,12 @@ class Backtester:
             if self.position.side == PositionSide.SHORT:
                 self._close_position(idx, low, "signal")
             if self.position.side == PositionSide.NONE:
-                self._open_position(idx, low, PositionSide.LONG)
+                self._open_position(idx, low, PositionSide.LONG, reason="label_long_entry")
         elif label == -1:  # SHORT_ENTRY
             if self.position.side == PositionSide.LONG:
                 self._close_position(idx, high, "signal")
             if self.position.side == PositionSide.NONE:
-                self._open_position(idx, high, PositionSide.SHORT)
+                self._open_position(idx, high, PositionSide.SHORT, reason="label_short_entry")
         elif label == 2:  # LONG_EXIT
             if self.position.side == PositionSide.LONG:
                 self._close_position(idx, high, "signal")
@@ -307,6 +326,7 @@ class Backtester:
         result = BacktestResult()
         result.equity_curve = self.equity_curve.copy()
         result.trades = self.trades.copy()
+        result.trade_logs = self.trade_logs.copy()
         result.initial_capital = self.initial_capital
         result.current_capital = self.capital
         result.current_pos = self.position if self.position.side != PositionSide.NONE else None
@@ -435,19 +455,31 @@ class Backtester:
             # 判断信号
             if self.position.side == PositionSide.NONE:
                 if long_score > long_threshold and long_score > short_score:
-                    self._open_position(i, current_price, PositionSide.LONG)
+                    self._open_position(i, current_price, PositionSide.LONG,
+                                        reason="score_long",
+                                        meta={"long_score": float(long_score), "short_score": float(short_score),
+                                              "long_threshold": float(long_threshold), "short_threshold": float(short_threshold)})
                 elif short_score > short_threshold and short_score > long_score:
-                    self._open_position(i, current_price, PositionSide.SHORT)
+                    self._open_position(i, current_price, PositionSide.SHORT,
+                                        reason="score_short",
+                                        meta={"long_score": float(long_score), "short_score": float(short_score),
+                                              "long_threshold": float(long_threshold), "short_threshold": float(short_threshold)})
             
             elif self.position.side == PositionSide.LONG:
                 if short_score > short_threshold:
                     self._close_position(i, current_price, "signal")
-                    self._open_position(i, current_price, PositionSide.SHORT)
+                    self._open_position(i, current_price, PositionSide.SHORT,
+                                        reason="score_short_reverse",
+                                        meta={"long_score": float(long_score), "short_score": float(short_score),
+                                              "short_threshold": float(short_threshold)})
             
             elif self.position.side == PositionSide.SHORT:
                 if long_score > long_threshold:
                     self._close_position(i, current_price, "signal")
-                    self._open_position(i, current_price, PositionSide.LONG)
+                    self._open_position(i, current_price, PositionSide.LONG,
+                                        reason="score_long_reverse",
+                                        meta={"long_score": float(long_score), "short_score": float(short_score),
+                                              "long_threshold": float(long_threshold)})
             
             # 记录权益
             equity = self._calculate_equity(current_price)
@@ -459,8 +491,13 @@ class Backtester:
         
         return self._calculate_statistics()
     
-    def _open_position(self, idx: int, price: float, side: PositionSide):
+    def _open_position(self, idx: int, price: float, side: PositionSide,
+                       reason: str = "", meta: Optional[dict] = None,
+                       signal_key: str = "", avg_hold_bars: int = 0):
         """开仓（追踪止盈止损框架：TP1=70%平仓进入阶段2，阶段2用追踪止损，SL全平）"""
+        if meta:
+            signal_key = meta.get("signal_key", signal_key)
+            avg_hold_bars = meta.get("avg_hold_bars", avg_hold_bars)
         tp1_pct = BACKTEST_CONFIG.get("TAKE_PROFIT_PCT", 0.012)    # TP1 价格变动 1.2%（+12%杠杆后）
         sl_pct  = BACKTEST_CONFIG.get("STOP_LOSS_PCT", 0.008)      # SL  价格变动 0.8%
         tp1_ratio = BACKTEST_CONFIG.get("TP1_RATIO", 0.70)         # TP1 平仓 70%
@@ -503,7 +540,18 @@ class Backtester:
             ever_reached_6pct=False,
             original_stop_loss=stop_loss,
             peak_price=entry_price,
+            signal_key=signal_key,
+            avg_hold_bars=avg_hold_bars,
         )
+        self._log_event("entry", idx, side, entry_price, {
+            "reason": reason,
+            "meta": meta or {},
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "leverage": self.leverage,
+            "size": size,
+            "margin": margin,
+        })
     
     def _close_position(self, idx: int, price: float, reason: str):
         """平仓"""
@@ -545,7 +593,9 @@ class Backtester:
             stop_loss=self.position.stop_loss,
             take_profit=self.position.take_profit,
             liquidation_price=self.position.liquidation_price,
-            margin=self.position.margin
+            margin=self.position.margin,
+            signal_key=self.position.signal_key,
+            avg_hold_bars=self.position.avg_hold_bars,
         ))
 
         # 更新统计缓存
@@ -570,7 +620,16 @@ class Backtester:
             self._short_profit += net_profit
             if net_profit > 0:
                 self._short_win_trades += 1
-        
+
+        # 记录平仓日志（sl / trailing_sl / signal / end）
+        self._log_event(reason, idx, self.position.side, exit_price, {
+            "profit_pct": round(profit_pct, 2),
+            "hold_bars": idx - self.position.entry_idx,
+            "entry_price": round(self.position.entry_price, 2),
+            "stop_loss": self.position.stop_loss,
+            "take_profit": self.position.take_profit,
+        })
+
         # 清空持仓
         self.position = Position()
     
@@ -598,6 +657,7 @@ class Backtester:
         cfg = BACKTEST_CONFIG
         lev = cfg.get("LEVERAGE", 10)
         is_long = (pos.side == PositionSide.LONG)
+        old_sl = pos.stop_loss
 
         if pos.stage == 1:
             hold_bars = current_idx - pos.entry_idx if current_idx >= 0 else 0
@@ -621,13 +681,19 @@ class Backtester:
                     pos.stop_loss = max(pos.stop_loss, pos.entry_price * (1 + sl_pct))
                 else:
                     pos.stop_loss = min(pos.stop_loss, pos.entry_price * (1 - sl_pct))
+                if pos.stop_loss != old_sl:
+                    old_sl = pos.stop_loss
 
             elif not pos.ever_reached_6pct:
                 # 未触发阶梯上移时：时间衰减止损收窄（止损只能收紧，不能放宽）
                 decay_enabled = cfg.get("TIME_DECAY_ENABLED", True)
                 if decay_enabled:
-                    bar2 = cfg.get("TIME_DECAY_BAR_2", 180)
-                    bar1 = cfg.get("TIME_DECAY_BAR_1", 120)
+                    if pos.avg_hold_bars >= 10:
+                        bar1 = int(pos.avg_hold_bars * 0.50)
+                        bar2 = int(pos.avg_hold_bars * 0.70)
+                    else:
+                        bar1 = cfg.get("TIME_DECAY_BAR_1", 30)
+                        bar2 = cfg.get("TIME_DECAY_BAR_2", 60)
                     sl2_pct = cfg.get("TIME_DECAY_SL_2", -5.0) / 100 / lev
                     sl1_pct = cfg.get("TIME_DECAY_SL_1", -10.0) / 100 / lev
                     if hold_bars > bar2:
@@ -636,12 +702,16 @@ class Backtester:
                             pos.stop_loss = max(pos.stop_loss, decay_sl)
                         else:
                             pos.stop_loss = min(pos.stop_loss, decay_sl)
+                        if pos.stop_loss != old_sl:
+                            old_sl = pos.stop_loss
                     elif hold_bars > bar1:
                         decay_sl = pos.entry_price * (1 + sl1_pct) if is_long else pos.entry_price * (1 - sl1_pct)
                         if is_long:
                             pos.stop_loss = max(pos.stop_loss, decay_sl)
                         else:
                             pos.stop_loss = min(pos.stop_loss, decay_sl)
+                        if pos.stop_loss != old_sl:
+                            old_sl = pos.stop_loss
 
             # 检查 SL 触发（全平）
             if is_long and low <= pos.stop_loss:
@@ -672,6 +742,8 @@ class Backtester:
                     pos.peak_price = high
                 trailing_sl = pos.peak_price * (1 - trail_pct)
                 pos.stop_loss = max(pos.stop_loss, trailing_sl)
+                if pos.stop_loss != old_sl:
+                    old_sl = pos.stop_loss
                 if low <= pos.stop_loss:
                     return True, pos.stop_loss, "trailing_sl"
             else:
@@ -679,6 +751,8 @@ class Backtester:
                     pos.peak_price = low
                 trailing_sl = pos.peak_price * (1 + trail_pct)
                 pos.stop_loss = min(pos.stop_loss, trailing_sl)
+                if pos.stop_loss != old_sl:
+                    old_sl = pos.stop_loss
                 if high >= pos.stop_loss:
                     return True, pos.stop_loss, "trailing_sl"
 
@@ -721,6 +795,15 @@ class Backtester:
         if pos.side == PositionSide.SHORT:
             profit_pct = -profit_pct
 
+        # 记录 TP1 日志（部分平仓触发追踪止损阶段2）
+        if reason == "tp1":
+            self._log_event("tp1", exit_idx, pos.side, exit_price, {
+                "profit_pct": round(profit_pct, 2),
+                "ratio": round(ratio * 100),
+                "entry_price": round(pos.entry_price, 2),
+                "take_profit": pos.take_profit,
+            })
+
         self.trades.append(TradeRecord(
             entry_idx=pos.entry_idx,
             exit_idx=exit_idx,
@@ -736,6 +819,8 @@ class Backtester:
             take_profit=pos.take_profit,
             liquidation_price=pos.liquidation_price,
             margin=pos.margin,
+            signal_key=pos.signal_key,
+            avg_hold_bars=pos.avg_hold_bars,
         ))
 
         # 更新统计缓存（部分平仓计为一笔独立交易）

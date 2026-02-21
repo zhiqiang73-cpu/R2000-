@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 import json
 import re
-from typing import Optional
+from pathlib import Path
+from typing import Optional, List
 import sys
 import os
 import time
@@ -258,6 +259,8 @@ class SignalBacktestWorker(QtCore.QObject):
         self._pause_requested = False
         self.is_running = False
         self._labels_ready = False
+        self.strict_state_filter = False  # 严格市场状态过滤：⚠状态禁止开仓
+        self.use_alt_tpsl = False  # 回测试验 TP/SL 开关
 
     @QtCore.pyqtSlot()
     def run_backtest(self):
@@ -276,6 +279,17 @@ class SignalBacktestWorker(QtCore.QObject):
             from core.market_state_detector import detect_state
             from core.backtester import TradeRecord, BacktestResult, Position, PositionSide
             from config import PAPER_TRADING_CONFIG, BACKTEST_CONFIG
+
+            # 回测试验 TP/SL（仅影响回测，不改配置/策略池）
+            long_tp_pct = LONG_TP1_PCT
+            long_sl_pct = LONG_SL_PCT
+            short_tp_pct = SHORT_TP1_PCT
+            short_sl_pct = SHORT_SL_PCT
+            if self.use_alt_tpsl:
+                long_tp_pct = 0.004
+                long_sl_pct = 0.005
+                short_tp_pct = 0.004
+                short_sl_pct = 0.005
 
             n = len(self.df)
             INITIAL_CAP = float(PAPER_TRADING_CONFIG.get("DEFAULT_BALANCE", 5000.0))
@@ -345,7 +359,7 @@ class SignalBacktestWorker(QtCore.QObject):
                     df_work = calculate_all_indicators(self.df.copy())
                     cumulative = get_cumulative()
                     valid = {k: v for k, v in cumulative.items()
-                             if v.get('appear_rounds', 0) >= 2}
+                             if v.get('appear_rounds', 0) >= 3}
                     if not valid:
                         self._precompute_failed = True
                         self.error.emit("策略池为空，请先完成信号分析")
@@ -375,14 +389,33 @@ class SignalBacktestWorker(QtCore.QObject):
             prep_initialized = False
 
             trade_records = []
+            trade_logs = []
             capital = INITIAL_CAP
             LEVERAGE = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
             PCT = float(PAPER_TRADING_CONFIG.get("POSITION_SIZE_PCT", 0.05))
             FEE = float(BACKTEST_CONFIG.get("FEE_RATE", 0.0004))
             in_pos = False
             e_price = e_idx = e_dir = tp = sl = None
+            e_margin = None
             e_key = None
             e_info = None
+            # 动态止损追踪状态
+            peak_pnl_pct = 0.0           # 持仓期间杠杆后峰值盈亏%
+            ever_reached_threshold = False  # 是否曾触达保本阈值
+            pos_stage = 1                # 1=阶段1(固定SL+时间衰减), 2=阶段2(追踪止损)
+            peak_price = 0.0             # 阶段2追踪用峰值价格
+            stage2_margin = 0.0          # 阶段2剩余保证金
+            
+            def _append_trade_log(event, idx, side, price, info=None):
+                trade_logs.append({
+                    "idx": idx,
+                    "event": event,
+                    "side": "LONG" if side == 'long' else ("SHORT" if side == 'short' else ""),
+                    "price": price,
+                    "info": info or {},
+                })
+                if len(trade_logs) > 800:
+                    trade_logs[:] = trade_logs[-800:]
 
             cur = 0
             while self.is_running and not self._stop_requested and cur < n:
@@ -411,48 +444,196 @@ class SignalBacktestWorker(QtCore.QObject):
                     slope = row.get('ma5_slope')
 
                     if in_pos:
-                        hit_tp = (e_dir == 'long' and hi >= tp) or (e_dir == 'short' and lo <= tp)
-                        hit_sl = (e_dir == 'long' and lo <= sl) or (e_dir == 'short' and hi >= sl)
-                        timed  = (cur - e_idx) >= MAX_HOLD
-                        if hit_tp or hit_sl or timed:
-                            x_price = (tp if hit_tp else sl) if (hit_tp or hit_sl) else cl
+                        _cfg   = PAPER_TRADING_CONFIG
+                        is_long = (e_dir == 'long')
+                        hold_bars = cur - e_idx
+                        _lev  = LEVERAGE
+
+                        # ── 更新峰值浮盈（用于保本/时间衰减判断）──────────────
+                        best_bar = hi if is_long else lo
+                        bar_pnl = (best_bar - e_price) / e_price * (_lev if is_long else -_lev) * 100
+                        if bar_pnl > peak_pnl_pct:
+                            peak_pnl_pct = bar_pnl
+
+                        # ── 动态止损更新 ──────────────────────────────────────
+                        if pos_stage == 1:
+                            bp_thr  = float(_cfg.get("BREAKEVEN_THRESHOLD_PCT", 6.0))
+                            bp_sl   = float(_cfg.get("BREAKEVEN_SL_PCT", -3.0))
+                            td_en   = bool(_cfg.get("TIME_DECAY_ENABLED", True))
+                            bar1    = int(_cfg.get("TIME_DECAY_BAR_1", 120))
+                            bar2    = int(_cfg.get("TIME_DECAY_BAR_2", 180))
+                            sl1_pnl = float(_cfg.get("TIME_DECAY_SL_1", -10.0))
+                            sl2_pnl = float(_cfg.get("TIME_DECAY_SL_2", -5.0))
+
+                            if not ever_reached_threshold and peak_pnl_pct >= bp_thr:
+                                # 保本触发：浮盈达到阈值，止损上移
+                                ever_reached_threshold = True
+                                bp_sl_price = (e_price * (1.0 + bp_sl / 100.0 / _lev) if is_long
+                                               else e_price * (1.0 - bp_sl / 100.0 / _lev))
+                                if (is_long and bp_sl_price > sl) or (not is_long and bp_sl_price < sl):
+                                    sl = bp_sl_price
+                                    _append_trade_log("breakeven_sl", cur, e_dir, sl, {
+                                        "reason": f"浮盈峰值{peak_pnl_pct:.1f}%≥{bp_thr:.0f}%→止损上移至{bp_sl:.0f}%"
+                                    })
+                            elif not ever_reached_threshold and td_en:
+                                # 时间衰减：持仓过久自动收窄止损
+                                target_pnl, td_label = None, ""
+                                if hold_bars >= bar2:
+                                    target_pnl = sl2_pnl
+                                    td_label = f"持仓{hold_bars}根≥{bar2}根→收窄至{sl2_pnl:.0f}%"
+                                elif hold_bars >= bar1:
+                                    target_pnl = sl1_pnl
+                                    td_label = f"持仓{hold_bars}根≥{bar1}根→收窄至{sl1_pnl:.0f}%"
+                                if target_pnl is not None:
+                                    new_sl = (e_price * (1.0 + target_pnl / 100.0 / _lev) if is_long
+                                              else e_price * (1.0 - target_pnl / 100.0 / _lev))
+                                    if (is_long and new_sl > sl) or (not is_long and new_sl < sl):
+                                        if hold_bars in (bar1, bar2):  # 首次跨过阈值时记录日志
+                                            _append_trade_log("time_decay_sl", cur, e_dir, new_sl, {
+                                                "reason": f"⏱ {td_label}"
+                                            })
+                                        sl = new_sl
+
+                        elif pos_stage == 2:
+                            # 阶段2：追踪止损（跟随最高/最低价）
+                            trail_pct = float(_cfg.get("TRAILING_STOP_PCT", 0.08))
+                            if is_long:
+                                if hi > peak_price:
+                                    peak_price = hi
+                                sl = max(sl, peak_price * (1.0 - trail_pct))
+                            else:
+                                if lo < peak_price:
+                                    peak_price = lo
+                                sl = min(sl, peak_price * (1.0 + trail_pct))
+
+                        # ── 判断出场条件（用更新后的 sl 计算）───────────────────
+                        hit_tp = (pos_stage == 1) and (
+                            (is_long and hi >= tp) or (not is_long and lo <= tp)
+                        )
+                        hit_sl = (is_long and lo <= sl) or (not is_long and hi >= sl)
+                        timed  = hold_bars >= MAX_HOLD
+
+                        if hit_tp and not hit_sl:
+                            # ── 阶段1 TP1 命中：分批止盈 70%，剩余 30% 追踪 ──
+                            tp1_ratio    = float(_cfg.get("STAGED_TP_RATIO_1", 0.70))
+                            remain_ratio = 1.0 - tp1_ratio
+                            active_margin  = e_margin or (capital * PCT)
+                            partial_margin = active_margin * tp1_ratio
                             pnl_pct = (
-                                ((x_price - e_price) / e_price if e_dir == 'long'
-                                 else (e_price - x_price) / e_price) - FEE * 2
+                                ((tp - e_price) / e_price if is_long else (e_price - tp) / e_price) - FEE * 2
                             )
-                            pnl = pnl_pct * capital * PCT * LEVERAGE
+                            pnl = pnl_pct * partial_margin * LEVERAGE
                             capital += pnl
-                            reason = 'tp' if hit_tp else ('sl' if hit_sl else 'timeout')
-                            labels_arr[cur] = 2 if e_dir == 'long' else -2
-                            self.label_found.emit(cur, int(labels_arr[cur]))
+                            _append_trade_log("tp1_partial", cur, e_dir, tp, {
+                                "profit_pct": round(pnl_pct * 100.0, 2),
+                                "hold_bars": hold_bars,
+                                "entry_price": round(e_price, 2),
+                                "stop_loss": sl,
+                                "take_profit": tp,
+                                "note": f"TP1分批平仓{tp1_ratio:.0%}→剩余{remain_ratio:.0%}进追踪阶段",
+                            })
                             trade_records.append(TradeRecord(
                                 entry_idx=e_idx, exit_idx=cur,
-                                side=1 if e_dir == 'long' else -1,
-                                entry_price=e_price, exit_price=x_price,
-                                size=capital * PCT * LEVERAGE / e_price,
+                                side=1 if is_long else -1,
+                                entry_price=e_price, exit_price=tp,
+                                size=partial_margin * LEVERAGE / e_price,
                                 profit=pnl, profit_pct=pnl_pct * 100,
-                                hold_periods=cur - e_idx, exit_reason=reason,
+                                hold_periods=hold_bars, exit_reason="tp1_partial",
+                                stop_loss=sl or 0.0,
+                                take_profit=tp or 0.0,
+                                liquidation_price=0.0,
+                                margin=partial_margin,
+                                signal_key=e_key or "",
+                                signal_rate=(e_info or {}).get('overall_rate', 0.0),
+                                signal_score=(e_info or {}).get('综合评分', 0.0),
+                            ))
+                            # 进入阶段2：SL 上移至开仓价保本，追踪止损从 TP1 开始
+                            pos_stage  = 2
+                            e_margin   = active_margin * remain_ratio
+                            peak_price = tp
+                            trail_pct  = float(_cfg.get("TRAILING_STOP_PCT", 0.08))
+                            sl = max(e_price, peak_price * (1.0 - trail_pct)) if is_long \
+                                 else min(e_price, peak_price * (1.0 + trail_pct))
+                            # 发射剩余仓位持仓更新
+                            cur_pos = Position(
+                                side=PositionSide.LONG if is_long else PositionSide.SHORT,
+                                entry_price=e_price, entry_idx=e_idx,
+                                size=e_margin * LEVERAGE / e_price,
+                                stop_loss=sl, take_profit=tp, liquidation_price=0.0,
+                                margin=e_margin,
+                            )
+                            try:
+                                cur_pos.signal_key   = e_key or ""
+                                cur_pos.signal_rate  = (e_info or {}).get('overall_rate', 0.0)
+                                cur_pos.signal_score = (e_info or {}).get('综合评分', 0.0)
+                            except Exception:
+                                pass
+                            m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
+                            m["current_bar"] = cur
+                            m["trade_logs"]  = list(trade_logs)
+                            self.rt_update.emit(m, list(trade_records))
+
+                        elif hit_sl or timed:
+                            # ── SL 触发 / 超时平仓（含阶段2追踪止损触发）────────
+                            active_margin = e_margin or (capital * PCT)
+                            x_price = sl if hit_sl else cl
+                            reason  = ('trailing_sl' if pos_stage == 2 else 'sl') if hit_sl else 'timeout'
+                            pnl_pct = (
+                                ((x_price - e_price) / e_price if is_long else (e_price - x_price) / e_price) - FEE * 2
+                            )
+                            pnl = pnl_pct * active_margin * LEVERAGE
+                            capital += pnl
+                            labels_arr[cur] = 2 if is_long else -2
+                            self.label_found.emit(cur, int(labels_arr[cur]))
+                            _append_trade_log(reason, cur, e_dir, x_price, {
+                                "profit_pct": round(pnl_pct * 100.0, 2),
+                                "hold_bars": hold_bars,
+                                "entry_price": round(e_price, 2),
+                                "stop_loss": sl,
+                                "take_profit": tp,
+                            })
+                            trade_records.append(TradeRecord(
+                                entry_idx=e_idx, exit_idx=cur,
+                                side=1 if is_long else -1,
+                                entry_price=e_price, exit_price=x_price,
+                                size=active_margin * LEVERAGE / e_price,
+                                profit=pnl, profit_pct=pnl_pct * 100,
+                                hold_periods=hold_bars, exit_reason=reason,
+                                stop_loss=sl or 0.0,
+                                take_profit=tp or 0.0,
+                                liquidation_price=0.0,
+                                margin=active_margin,
                                 signal_key=e_key or "",
                                 signal_rate=(e_info or {}).get('overall_rate', 0.0),
                                 signal_score=(e_info or {}).get('综合评分', 0.0),
                             ))
                             in_pos = False
+                            e_margin = None
                             self.rt_update.emit(
-                                _make_running_metrics(trade_records, INITIAL_CAP),
+                                {**_make_running_metrics(trade_records, INITIAL_CAP), "trade_logs": list(trade_logs)},
                                 list(trade_records),
                             )
+
                         else:
-                            # 持仓中，每步刷新交易明细和持仓
+                            # ── 持仓中：每步刷新持仓和交易明细 ─────────────────
                             cur_pos = Position(
-                                side=PositionSide.LONG if e_dir == 'long' else PositionSide.SHORT,
+                                side=PositionSide.LONG if is_long else PositionSide.SHORT,
                                 entry_price=e_price, entry_idx=e_idx,
-                                size=capital * PCT * LEVERAGE / e_price,
+                                size=(e_margin or (capital * PCT)) * LEVERAGE / e_price,
                                 stop_loss=sl, take_profit=tp, liquidation_price=0.0,
-                                margin=capital * PCT,
+                                margin=e_margin or (capital * PCT),
                             )
+                            try:
+                                cur_pos.signal_key   = e_key or ""
+                                cur_pos.signal_rate  = (e_info or {}).get('overall_rate', 0.0)
+                                cur_pos.signal_score = (e_info or {}).get('综合评分', 0.0)
+                            except Exception:
+                                pass
                             m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
                             m["current_bar"] = cur
+                            m["trade_logs"]  = list(trade_logs)
                             self.rt_update.emit(m, list(trade_records))
+
                         self.step_completed.emit(cur)
                         cur += 1
                         sleep_time = max(0.001, 10.0 / max(1, self.speed))
@@ -486,6 +667,12 @@ class SignalBacktestWorker(QtCore.QObject):
                         arr = cond.get(d, {})
                         if all(bool(arr.get(c, [False])[cur]) for c in conds if c in arr):
                             state_wr = bkd.get('avg_rate', 0.0)
+                            # 严格市场状态过滤：若该状态下触发次数≥5且命中率低于候选门槛（⚠），则跳过
+                            if self.strict_state_filter:
+                                _thresh = 0.64 if d == 'long' else 0.52
+                                _trig   = bkd.get('total_triggers', 0)
+                                if _trig >= 5 and state_wr < _thresh:
+                                    continue
                             _triggered.append((key, entry, d, state_wr, len(conds)))
                     # 按状态专项命中率降序，同分时少条件优先
                     best_entry = None
@@ -499,18 +686,34 @@ class SignalBacktestWorker(QtCore.QObject):
                         e_key, e_info = key, info
                         labels_arr[cur] = 1 if d == 'long' else -1
                         self.label_found.emit(cur, int(labels_arr[cur]))
-                        tp = cl * (1 + LONG_TP1_PCT)  if d == 'long' else cl * (1 - SHORT_TP1_PCT)
-                        sl = cl * (1 - LONG_SL_PCT)   if d == 'long' else cl * (1 + SHORT_SL_PCT)
+                        tp = cl * (1 + long_tp_pct)  if d == 'long' else cl * (1 - short_tp_pct)
+                        sl = cl * (1 - long_sl_pct)  if d == 'long' else cl * (1 + short_sl_pct)
+                        e_margin = capital * PCT
+                        # 重置动态止损状态
+                        peak_pnl_pct = 0.0
+                        ever_reached_threshold = False
+                        pos_stage  = 1
+                        peak_price = cl
+                        stage2_margin = 0.0
+                        _append_trade_log("entry", cur, d, cl, {
+                            "reason": "signal",
+                            "meta": {"signal_key": key},
+                            "stop_loss": sl,
+                            "take_profit": tp,
+                            "leverage": LEVERAGE,
+                            "margin": e_margin,
+                        })
                         # 开仓时立即刷新持仓和交易明细
                         cur_pos = Position(
                             side=PositionSide.LONG if d == 'long' else PositionSide.SHORT,
                             entry_price=e_price, entry_idx=e_idx,
-                            size=capital * PCT * LEVERAGE / e_price,
+                            size=e_margin * LEVERAGE / e_price,
                             stop_loss=sl, take_profit=tp, liquidation_price=0.0,
-                            margin=capital * PCT,
+                            margin=e_margin,
                         )
                         m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
                         m["current_bar"] = cur
+                        m["trade_logs"] = list(trade_logs)
                         self.rt_update.emit(m, list(trade_records))
 
                 self.step_completed.emit(cur)
@@ -572,6 +775,7 @@ class SignalBacktestWorker(QtCore.QObject):
                 return res
 
             bt_result = _make_bt_result(trade_records, INITIAL_CAP, capital)
+            bt_result.trade_logs = list(trade_logs)
             metrics = {
                 "initial_capital": bt_result.initial_capital,
                 "total_trades":    bt_result.total_trades,
@@ -587,6 +791,7 @@ class SignalBacktestWorker(QtCore.QObject):
                 "short_profit":    bt_result.short_profit,
                 "current_pos":     None,
                 "last_trade":      bt_result.trades[-1] if bt_result.trades else None,
+                "trade_logs":      list(trade_logs),
             }
             self.finished.emit({
                 'bt_result': bt_result,
@@ -619,10 +824,11 @@ class DataLoaderWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     
-    def __init__(self, sample_size, seed):
+    def __init__(self, sample_size, seed, data_file=None):
         super().__init__()
         self.sample_size = sample_size
         self.seed = seed
+        self.data_file = data_file
     
     @QtCore.pyqtSlot()
     def process(self):
@@ -630,7 +836,7 @@ class DataLoaderWorker(QtCore.QObject):
             from core.data_loader import DataLoader
             from utils.indicators import calculate_all_indicators
             
-            loader = DataLoader()
+            loader = DataLoader(data_file=self.data_file)
             df = loader.sample_continuous(self.sample_size, self.seed)
             df = calculate_all_indicators(df)
             mtf_data = loader.get_mtf_data()
@@ -1154,6 +1360,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # ============ Tab 4: 信号分析 ============
         self.signal_analysis_tab = SignalAnalysisTab()
+        self.signal_analysis_tab.set_main_window(self)
         self.main_tabs.addTab(self.signal_analysis_tab, "🔍 信号分析")
         # "换新数据再验证"按钮 → 触发重新加载不同时间段的数据
         self.signal_analysis_tab.request_new_data.connect(self._on_signal_request_new_data)
@@ -1342,11 +1549,31 @@ class MainWindow(QtWidgets.QMainWindow):
         return symbol, interval
     
     def _on_load_data(self):
-        """加载数据"""
-        self._on_sample_requested(DATA_CONFIG["SAMPLE_SIZE"], None)
+        """加载数据：弹出文件选择对话框，用户选择 parquet 文件后加载"""
+        self._show_file_dialog_and_load(DATA_CONFIG["SAMPLE_SIZE"], None)
     
-    def _on_sample_requested(self, sample_size: int, seed):
-        """处理采样请求"""
+    def _show_file_dialog_and_load(self, sample_size: int, seed, start_dir: str = None):
+        """弹出文件选择对话框，选择后加载。start_dir 为 None 时使用 data/ 或项目根目录"""
+        project_root = Path(__file__).parent.parent
+        data_dir = project_root / "data"
+        init_dir = start_dir or (str(data_dir) if data_dir.exists() else str(project_root))
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择数据文件",
+            init_dir,
+            "Parquet 文件 (*.parquet);;所有文件 (*.*)"
+        )
+        if not path:
+            return
+        self._on_sample_requested(sample_size, seed, data_file=path)
+    
+    def _on_sample_requested(self, sample_size: int, seed, data_file: str = None):
+        """处理采样请求。data_file 为空则使用最近加载的文件"""
+        if not data_file:
+            data_file = getattr(self, "_last_data_file", None)
+        if not data_file:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先通过“文件 → 加载数据”选择数据文件")
+            return
         self._sampling_in_progress = True
         self.control_panel.set_status("正在加载数据...")
         self.control_panel.set_buttons_enabled(False)
@@ -1354,7 +1581,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # 创建工作线程
         self.worker_thread = QtCore.QThread()
-        self.data_worker = DataLoaderWorker(sample_size, seed)
+        self.data_worker = DataLoaderWorker(sample_size, seed, data_file=data_file)
         self.data_worker.moveToThread(self.worker_thread)
         
         self.worker_thread.started.connect(self.data_worker.process)
@@ -1372,6 +1599,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.df = result['df']
             self.mtf_data = result['mtf_data']
             self.data_loader = result['loader']
+            self._last_data_file = getattr(self.data_loader, 'data_file', None) or DATA_CONFIG.get("DATA_FILE")
             self.labels = None
             self.features = None
             
@@ -1405,14 +1633,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_signal_request_new_data(self):
         """
         信号分析页签请求加载新一批历史数据（不同时间段的 50000 根 K 线）。
-        以随机种子触发重新采样，完成后 _on_sample_finished 会自动调用
-        signal_analysis_tab.set_data()，再由 set_data() 自动启动分析。
+        若已有加载过的文件则用该文件重新采样；否则弹出文件选择。
         """
         import random as _random
         sample_size = DATA_CONFIG.get("SAMPLE_SIZE", 50000)
         random_seed = _random.randint(0, 999999)
-        self.statusBar().showMessage(f"正在加载新一批历史数据（种子={random_seed}）...")
-        self._on_sample_requested(sample_size, random_seed)
+        last_file = getattr(self, "_last_data_file", None)
+        if last_file and Path(str(last_file)).exists():
+            self.statusBar().showMessage(f"正在加载新一批历史数据（种子={random_seed}）...")
+            self._on_sample_requested(sample_size, random_seed, data_file=last_file)
+        else:
+            self.statusBar().showMessage(f"正在加载新一批历史数据（种子={random_seed}）...")
+            self._show_file_dialog_and_load(sample_size, random_seed)
 
     def _on_worker_error(self, error_msg: str):
         """通用后台任务错误处理"""
@@ -1427,6 +1659,16 @@ class MainWindow(QtWidgets.QMainWindow):
         """处理标注请求 - 开始动画播放"""
         if self.df is None:
             QtWidgets.QMessageBox.warning(self, "警告", "请先加载数据")
+            return
+
+        if (
+            self.signal_analysis_tab
+            and hasattr(self.signal_analysis_tab, "is_busy")
+            and self.signal_analysis_tab.is_busy()
+        ):
+            QtWidgets.QMessageBox.warning(
+                self, "提示", "自动验证运行中，请先停止再开始回测。"
+            )
             return
         
         if self.is_playing:
@@ -1452,6 +1694,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vector_memory = None
         self._fv_ready = False
         self.analysis_panel.update_trade_log([])
+        self.analysis_panel.update_backtest_log([])
         self.analysis_panel.fingerprint_widget.clear_plot()
         self.control_panel.set_playing_state(True)
         self.control_panel.set_status("正在启动实时回测...")
@@ -1468,6 +1711,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker_thread = QtCore.QThread()
         self.labeling_worker = SignalBacktestWorker(self.df)
         self.labeling_worker.speed = speed
+        self.labeling_worker.strict_state_filter = self.control_panel.get_strict_state_filter()
+        self.labeling_worker.use_alt_tpsl = self.control_panel.get_alt_tpsl()
         self.labeling_worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.labeling_worker.run_backtest)
@@ -1571,6 +1816,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_regime_stats()
             self._update_vector_space_plot()
             self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
+            self.analysis_panel.update_backtest_log(self._format_backtest_logs(getattr(bt_result, "trade_logs", [])))
 
             # 轨迹模板提取
             self._extract_trajectory_templates(bt_result.trades)
@@ -1654,6 +1900,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             templates_added += 1
                     self.rt_last_trade_count = new_count
                     self.analysis_panel.update_trade_log(self._format_trades(self.rt_backtester.trades))
+                    self.analysis_panel.update_backtest_log(self._format_backtest_logs(self.rt_backtester.trade_logs))
                     self._update_regime_stats()
                     # 每10笔交易刷新一次3D图（节省性能）
                     if new_count % 10 == 0 or new_count < 20:
@@ -1794,6 +2041,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.rt_backtester:
             self.analysis_panel.update_trade_log(self._format_trades(self.rt_backtester.trades))
+            self.analysis_panel.update_backtest_log(self._format_backtest_logs(self.rt_backtester.trade_logs))
         self._update_regime_stats()
         self._update_vector_space_plot()
         
@@ -1833,6 +2081,20 @@ class MainWindow(QtWidgets.QMainWindow):
             entry_idx = getattr(current_pos, 'entry_idx', 0)
             entry_price = getattr(current_pos, 'entry_price', 0.0)
             hold_bars = max(0, current_bar - entry_idx)
+            # 策略编号（优先 signal_key，其次模板ID）
+            signal_key = getattr(current_pos, 'signal_key', '') or ''
+            signal_rate = getattr(current_pos, 'signal_rate', 0.0)
+            signal_score = getattr(current_pos, 'signal_score', 0.0)
+            if signal_key:
+                fingerprint = f"#{signal_key[:8]} 率{signal_rate:.0%} 分{signal_score:.0f}"
+            else:
+                template_idx = getattr(current_pos, 'matched_template_idx', None)
+                entry_sim = getattr(current_pos, 'entry_similarity', None)
+                if template_idx is not None and entry_sim is not None:
+                    fingerprint = f"T#{template_idx} | Sim={entry_sim:.2f}"
+                else:
+                    fingerprint = "--"
+            avg_hold = getattr(current_pos, 'avg_hold_bars', 0) or 0
             rows.append({
                 "side": side,
                 "entry_time": fmt_time(entry_idx),
@@ -1842,8 +2104,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "profit": "--",
                 "profit_pct": "--",
                 "hold": f"已持{hold_bars}根",
+                "avg_hold": str(avg_hold) if avg_hold else "-",
                 "regime": "",
-                "fingerprint": "--",
+                "fingerprint": fingerprint,
             })
         for t in trades[-200:]:
             side = "LONG" if t.side == 1 else "SHORT"
@@ -1860,6 +2123,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     fingerprint = f"T#{template_idx} | Sim={entry_sim:.2f}"
                 else:
                     fingerprint = "--"
+            avg_hold = getattr(t, 'avg_hold_bars', 0) or 0
             rows.append({
                 "side": side,
                 "entry_time": fmt_time(t.entry_idx),
@@ -1869,8 +2133,105 @@ class MainWindow(QtWidgets.QMainWindow):
                 "profit": f"{t.profit:.2f}",
                 "profit_pct": f"{t.profit_pct:.2f}",
                 "hold": str(t.hold_periods),
+                "avg_hold": str(avg_hold) if avg_hold else "-",
                 "regime": getattr(t, 'market_regime', ''),
                 "fingerprint": fingerprint,
+            })
+        return rows
+
+    def _format_backtest_logs(self, logs: List[dict]):
+        """格式化回测日志（仅展示最近500条）"""
+        if self.df is None:
+            return []
+
+        time_col = None
+        for col in ['timestamp', 'open_time', 'time']:
+            if col in self.df.columns:
+                time_col = col
+                break
+
+        def fmt_time(idx):
+            if time_col is None:
+                return str(idx)
+            ts = self.df[time_col].iloc[idx]
+            try:
+                if isinstance(ts, (int, float)):
+                    return QtCore.QDateTime.fromSecsSinceEpoch(int(ts / 1000)).toString("MM-dd HH:mm")
+                return pd.to_datetime(ts).strftime('%m-%d %H:%M')
+            except Exception:
+                return str(idx)
+
+        event_map = {
+            "entry":        "开仓",
+            "tp1":          "TP1 部分止盈",
+            "tp":           "止盈",
+            "sl":           "止损",
+            "trailing_sl":  "追踪止损",
+            "signal":       "信号平仓",
+            "end":          "强制平仓",
+            "timeout":      "超时平仓",
+            # legacy keys
+            "exit":              "平仓",
+            "partial_exit":      "部分平仓",
+            "sl_move_breakeven": "止损上移",
+            "sl_time_decay":     "止损收窄",
+            "sl_trailing_update":"追踪更新",
+            "stage2_enter":      "进入阶段2",
+        }
+
+        rows = []
+        for e in (logs or [])[-500:]:
+            idx   = e.get("idx", 0)
+            info  = e.get("info", {}) or {}
+            ev    = e.get("event", "")
+            event = event_map.get(ev, ev)
+            side  = e.get("side", "")
+            price = e.get("price", "")
+            stop_loss   = info.get("stop_loss", "")
+            take_profit = info.get("take_profit", "")
+
+            # 精炼 detail 列
+            detail_parts = []
+            profit_pct = info.get("profit_pct")
+            hold_bars  = info.get("hold_bars")
+            entry_price = info.get("entry_price")
+
+            if ev == "entry":
+                reason = info.get("reason", "")
+                if reason:
+                    detail_parts.append(f"原因={reason}")
+                lev = info.get("leverage")
+                if lev:
+                    detail_parts.append(f"{lev}x杠杆")
+                meta = info.get("meta", {})
+                if isinstance(meta, dict):
+                    ls = meta.get("long_score")
+                    ss = meta.get("short_score")
+                    if ls is not None:
+                        detail_parts.append(f"多分={ls:.2f} 空分={ss:.2f}")
+            elif ev == "tp1":
+                ratio = info.get("ratio", 70)
+                if profit_pct is not None:
+                    sign = "+" if profit_pct >= 0 else ""
+                    detail_parts.append(f"平仓{ratio:.0f}% {sign}{profit_pct:.2f}%  → 进入追踪止损")
+            else:
+                # sl / trailing_sl / signal / end
+                if profit_pct is not None:
+                    sign = "+" if profit_pct >= 0 else ""
+                    detail_parts.append(f"盈亏 {sign}{profit_pct:.2f}%")
+                if hold_bars is not None:
+                    detail_parts.append(f"持仓 {hold_bars} 根")
+                if entry_price:
+                    detail_parts.append(f"入场 {entry_price}")
+
+            rows.append({
+                "event":      event,
+                "time":       fmt_time(idx),
+                "side":       side,
+                "price":      f"{price:.2f}" if isinstance(price, (int, float)) else str(price),
+                "stop_loss":  f"{stop_loss:.2f}" if isinstance(stop_loss, (int, float)) else str(stop_loss),
+                "take_profit":f"{take_profit:.2f}" if isinstance(take_profit, (int, float)) else str(take_profit),
+                "detail":     " | ".join(detail_parts),
             })
         return rows
     
@@ -3463,6 +3824,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._update_regime_stats()
                     self._update_vector_space_plot()
                     self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
+                    self.analysis_panel.update_backtest_log(self._format_backtest_logs(getattr(bt_result, "trade_logs", [])))
 
                     # 打印记忆体统计
                     if self.vector_memory:
@@ -3502,6 +3864,23 @@ class MainWindow(QtWidgets.QMainWindow):
         current_pos = metrics.get("current_pos")
         current_bar = metrics.get("current_bar", 0)
         self.analysis_panel.update_trade_log(self._format_trades(trades, current_pos=current_pos, current_bar=current_bar))
+        logs = metrics.get("trade_logs")
+        if logs is not None:
+            self.analysis_panel.update_backtest_log(self._format_backtest_logs(logs))
+        elif self.rt_backtester:
+            self.analysis_panel.update_backtest_log(self._format_backtest_logs(self.rt_backtester.trade_logs))
+        # 同步更新图表 SL/TP 线（反映时间衰减和追踪止损的实时变化）
+        if hasattr(self, 'chart_widget') and self.chart_widget is not None:
+            if current_pos is not None:
+                _bt_sl = getattr(current_pos, 'stop_loss', None)
+                _bt_tp = getattr(current_pos, 'take_profit', None)
+                self.chart_widget._tp_sl_locked = True
+                if hasattr(self.chart_widget, 'set_tp_sl_lines'):
+                    self.chart_widget.set_tp_sl_lines(_bt_tp, _bt_sl)
+            else:
+                self.chart_widget._tp_sl_locked = False
+                if hasattr(self.chart_widget, 'set_tp_sl_lines'):
+                    self.chart_widget.set_tp_sl_lines(None, None)
 
     def _on_signal_bt_finished(self, result: dict):
         """信号回测完成"""
@@ -3518,6 +3897,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 更新交易明细
         self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
+        self.analysis_panel.update_backtest_log(self._format_backtest_logs(getattr(bt_result, "trade_logs", [])))
 
         self.is_playing = False
         self.control_panel.set_playing_state(False)
@@ -4062,6 +4442,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 use_qualified_only=(config.get("use_qualified_only", True) and (not has_prototypes)),
                 qualified_fingerprints=qualified_fingerprints,
                 qualified_prototype_fingerprints=(verified_proto_fps if use_verified_protos else set()),
+                oscillation_filter_enabled=config.get("oscillation_filter_enabled", True),
                 api_key=config.get("api_key"),
                 api_secret=config.get("api_secret"),
                 use_testnet=PAPER_TRADING_CONFIG.get("USE_TESTNET", True),
@@ -4418,6 +4799,29 @@ class MainWindow(QtWidgets.QMainWindow):
             # 更新统计
             stats = self._live_engine.get_stats()
             self.paper_trading_tab.status_panel.update_stats(stats)
+            # 同步回测指标面板（用于展示当前仓位TP/SL与实时盈亏）
+            try:
+                last_trade = None
+                if self._live_engine and getattr(self._live_engine, "paper_trader", None):
+                    hist = getattr(self._live_engine.paper_trader, "order_history", None)
+                    if hist:
+                        last_trade = hist[-1]
+                metrics = {
+                    "initial_capital": stats.get("initial_balance", 0.0),
+                    "total_profit": stats.get("total_pnl", 0.0),
+                    "total_return": (stats.get("total_pnl_pct", 0.0) / 100.0),
+                    "win_rate": stats.get("win_rate", 0.0),
+                    "max_drawdown": (stats.get("max_drawdown_pct", 0.0) / 100.0),
+                    "long_win_rate": stats.get("long_win_rate", 0.0),
+                    "short_win_rate": stats.get("short_win_rate", 0.0),
+                    "long_profit": 0.0,
+                    "short_profit": 0.0,
+                    "current_pos": order,
+                    "last_trade": last_trade,
+                }
+                self.optimizer_panel.update_backtest_metrics(metrics)
+            except Exception:
+                pass
             
             # 更新推理引擎显示（综合决策在 status_panel 的「推理」子 tab）
             status_panel = getattr(self.paper_trading_tab, 'status_panel', None)
@@ -4950,12 +5354,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if order is not None:
                 tp = getattr(order, "take_profit", None)
                 sl = getattr(order, "stop_loss", None)
+                # 锁定为真实委托价，避免图表被历史高低点覆盖
+                self.paper_trading_tab.chart_widget._tp_sl_locked = True
                 self.paper_trading_tab.chart_widget.set_tp_sl_lines(tp, sl)
                 
                 # 【实时偏离检测】持仓中检查价格是否偏离概率扇形置信带
                 self._check_deviation_warning(df)
             else:
                 # 无持仓时清除虚线
+                self.paper_trading_tab.chart_widget._tp_sl_locked = False
                 self.paper_trading_tab.chart_widget.set_tp_sl_lines(None, None)
             self._last_live_chart_refresh_ts = now
             self._live_chart_dirty = False
