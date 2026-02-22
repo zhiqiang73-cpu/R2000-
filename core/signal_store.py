@@ -129,6 +129,42 @@ def _open_file(path: str, mode: str, encoding: Optional[str] = None):
         raise
 
 
+def _read_json_file(path: str) -> dict:
+    """
+    读取 JSON 文件，自动兼容 UTF-8/UTF-8 BOM/UTF-16 编码。
+    返回解析后的 dict（若不是 dict 也照常返回，外层自行判断）。
+    """
+    with _open_file(path, 'rb') as f:
+        raw = f.read()
+
+    # 快速 BOM 判断
+    if raw.startswith(b'\xff\xfe') or raw.startswith(b'\xfe\xff'):
+        enc_order = ('utf-16', 'utf-8', 'utf-8-sig')
+    elif raw.startswith(b'\xef\xbb\xbf'):
+        enc_order = ('utf-8-sig', 'utf-8', 'utf-16')
+    else:
+        enc_order = ('utf-8', 'utf-8-sig', 'utf-16')
+
+    for enc in enc_order + ('utf-16-le', 'utf-16-be'):
+        try:
+            text = raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+    # orjson 作为最后兜底（仅 UTF-8）
+    if _USE_ORJSON:
+        try:
+            return orjson.loads(raw)
+        except Exception:
+            pass
+
+    raise ValueError(f"无法解析 JSON 文件: {path}")
+
+
 def _safe_getmtime(path: str) -> float:
     try:
         return os.path.getmtime(path)
@@ -148,23 +184,39 @@ def _combo_key(direction: str, conditions: List[str]) -> str:
 
 
 def _load_raw(pool_id: str = "pool1") -> dict:
-    """加载 JSON 文件，不存在则返回空骨架。文件未变化时直接返回内存缓存。"""
+    """
+    加载 JSON 文件，不存在则返回空骨架。文件未变化时直接返回内存缓存。
+    
+    重要：获取 _write_lock 以防止读写竞争导致的数据损坏。
+    """
     global _cache, _cache_mtime
     state_file, _ = _get_files(pool_id)
-    if _safe_exists(state_file):
-        try:
-            mtime = _safe_getmtime(state_file)
-            if pool_id in _cache and mtime == _cache_mtime.get(pool_id):
-                return _cache[pool_id]
-            with _open_file(state_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                _cache[pool_id] = data
-                _cache_mtime[pool_id] = mtime
-                return _cache[pool_id]
-        except (json.JSONDecodeError, OSError):
-            pass
-    return _empty_state()
+    
+    with _write_lock:  # 防止读写竞争
+        if _safe_exists(state_file):
+            try:
+                mtime = _safe_getmtime(state_file)
+                if pool_id in _cache and mtime == _cache_mtime.get(pool_id):
+                    return _cache[pool_id]
+                data = _read_json_file(state_file)
+                if isinstance(data, dict):
+                    _cache[pool_id] = data
+                    _cache_mtime[pool_id] = mtime
+                    return _cache[pool_id]
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
+                # JSON 解析失败：文件可能损坏或编码异常
+                import sys
+                print(f"[signal_store] WARNING: JSON decode error in {state_file}: {e}", file=sys.stderr)
+                # 如果缓存中有数据，优先使用缓存（防止数据丢失）
+                if pool_id in _cache:
+                    print(f"[signal_store] Using cached data for {pool_id}", file=sys.stderr)
+                    return _cache[pool_id]
+            except OSError as e:
+                import sys
+                print(f"[signal_store] WARNING: OS error reading {state_file}: {e}", file=sys.stderr)
+                if pool_id in _cache:
+                    return _cache[pool_id]
+        return _empty_state()
 
 
 def _empty_state() -> dict:
@@ -217,31 +269,44 @@ def _save_cumulative_cache(data: dict, pool_id: str = "pool1") -> None:
 
 
 def _load_cumulative_fast(pool_id: str = "pool1") -> dict:
+    """
+    快速加载 cumulative 缓存文件。
+    
+    重要：获取 _write_lock 以防止读写竞争导致的数据损坏。
+    """
     global _cumul_cache, _cumul_cache_mtime
 
     _, cumul_file = _get_files(pool_id)
 
-    # 1. 内存命中
-    if pool_id in _cumul_cache and _safe_exists(cumul_file):
-        try:
-            mtime = _safe_getmtime(cumul_file)
-            if mtime == _cumul_cache_mtime.get(pool_id):
-                return _cumul_cache[pool_id]
-        except OSError:
-            pass
+    with _write_lock:  # 防止读写竞争
+        # 1. 内存命中
+        if pool_id in _cumul_cache and _safe_exists(cumul_file):
+            try:
+                mtime = _safe_getmtime(cumul_file)
+                if mtime == _cumul_cache_mtime.get(pool_id):
+                    return _cumul_cache[pool_id]
+            except OSError:
+                pass
 
-    # 2. 缓存文件存在，读取它
-    if _safe_exists(cumul_file):
-        try:
-            mtime = _safe_getmtime(cumul_file)
-            with _open_file(cumul_file, 'r', encoding='utf-8') as f:
-                cache_data = json.load(f)
-            if isinstance(cache_data, dict):
-                _cumul_cache[pool_id] = cache_data.get('cumulative', {})
-                _cumul_cache_mtime[pool_id] = mtime
-                return _cumul_cache[pool_id]
-        except (json.JSONDecodeError, OSError):
-            pass
+        # 2. 缓存文件存在，读取它
+        if _safe_exists(cumul_file):
+            try:
+                mtime = _safe_getmtime(cumul_file)
+                cache_data = _read_json_file(cumul_file)
+                if isinstance(cache_data, dict):
+                    _cumul_cache[pool_id] = cache_data.get('cumulative', {})
+                    _cumul_cache_mtime[pool_id] = mtime
+                    return _cumul_cache[pool_id]
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
+                import sys
+                print(f"[signal_store] WARNING: JSON decode error in {cumul_file}: {e}", file=sys.stderr)
+                if pool_id in _cumul_cache:
+                    return _cumul_cache[pool_id]
+            except OSError as e:
+                import sys
+                print(f"[signal_store] WARNING: OS error reading {cumul_file}: {e}", file=sys.stderr)
+                if pool_id in _cumul_cache:
+                    return _cumul_cache[pool_id]
 
     # 3. 缓存文件不存在，回退到完整文件并生成缓存
     state_file, _ = _get_files(pool_id)
@@ -727,7 +792,7 @@ def _normalize_all_entries(entries: Dict[str, dict]) -> Dict[str, dict]:
     for key, entry in entries.items():
         conds = entry.get('conditions', [])
         new_conds = _simplify_conditions(conds)
-        new_key = entry.get('direction', 'long') + ':' + ','.join(sorted(new_conds))
+        new_key = _combo_key(entry.get('direction', 'long'), new_conds)
         if new_key in normalized:
             # key 碰撞：保留触发数更多的
             if entry.get('total_triggers', 0) >= normalized[new_key].get('total_triggers', 0):
@@ -817,7 +882,7 @@ def _ensure_pruned_cache_fresh(pool_id: str = "pool1") -> None:
         state_mtime = _safe_getmtime(state_file) if _safe_exists(state_file) else 0.0
     except OSError:
         state_mtime = 0.0
-    if cache_mtime < state_mtime:
+    if cache_mtime <= state_mtime:
         rebuild_pruned_cache(pool_id)
 
 
@@ -1160,7 +1225,9 @@ def get_premium_pool(
           combo_key, direction, conditions, market_state,
           score, state_rate, state_triggers, tier
     """
-    cumulative = get_cumulative(direction, "pool1")
+    cumul1 = get_cumulative(direction, "pool1")
+    cumul2 = get_cumulative(direction, "pool2")
+    cumulative = {**cumul1, **cumul2}
     if not cumulative:
         return []
 
@@ -1416,6 +1483,320 @@ def get_ev_per_bar(combo: dict) -> float:
 
     ev_per_trade = overall_rate * tp - (1.0 - overall_rate) * sl
     return ev_per_trade / avg_hold_bars
+
+
+def import_from_file(src_path: str, pool_id: str = "pool1") -> Dict[str, object]:
+    """
+    从外部 JSON 文件导入数据，追加合并到指定策略池。
+
+    策略：
+    - rounds：按 round_id 去重，只追加目标文件中不存在的轮次，round_id 自动重新编号
+    - cumulative：按 combo_key 合并，若 key 已存在则合并 history，重新计算统计量
+
+    Returns:
+        {"merged_rounds": int, "merged_combos": int, "skipped_rounds": int}
+    """
+    # ── 读取源文件 ────────────────────────────────────────────────────────────
+    with _write_lock:
+        try:
+            src = _read_json_file(src_path)
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            raise ValueError(f"无法读取源文件 {src_path}: {e}")
+
+    if not isinstance(src, dict):
+        raise ValueError("源文件格式不合法（顶层必须是 JSON 对象）")
+
+    src_rounds:     list = src.get('rounds', [])
+    src_cumulative: dict = src.get('cumulative', {})
+
+    # ── 读取目标数据 ──────────────────────────────────────────────────────────
+    data = _load_raw(pool_id)
+    dst_rounds:     list = data.setdefault('rounds', [])
+    dst_cumulative: dict = data.setdefault('cumulative', {})
+
+    # ── 合并 rounds（按原始 timestamp+direction 去重，避免重复导入）────────────
+    existing_signatures = {
+        (r.get('timestamp', ''), r.get('direction', ''))
+        for r in dst_rounds
+    }
+    next_id     = max((r.get('round_id', 0) for r in dst_rounds), default=0) + 1
+    merged_rounds  = 0
+    skipped_rounds = 0
+
+    for r in src_rounds:
+        sig = (r.get('timestamp', ''), r.get('direction', ''))
+        if sig in existing_signatures:
+            skipped_rounds += 1
+            continue
+        new_r = dict(r)
+        new_r['round_id'] = next_id
+        dst_rounds.append(new_r)
+        existing_signatures.add(sig)
+        next_id += 1
+        merged_rounds += 1
+
+    # ── 合并 cumulative ────────────────────────────────────────────────────────
+    merged_combos = 0
+    for key, src_entry in src_cumulative.items():
+        if key not in dst_cumulative:
+            dst_cumulative[key] = dict(src_entry)
+            merged_combos += 1
+        else:
+            dst_entry = dst_cumulative[key]
+            # 合并 history（按 round_id 去重）
+            existing_rids = {h.get('round_id') for h in dst_entry.get('history', [])}
+            added = False
+            for h in src_entry.get('history', []):
+                if h.get('round_id') not in existing_rids:
+                    dst_entry.setdefault('history', []).append(h)
+                    existing_rids.add(h.get('round_id'))
+                    added = True
+            if added:
+                # 重新计算统计量
+                history = dst_entry.get('history', [])
+                rates = [h.get('hit_rate', 0.0) for h in history if 'hit_rate' in h]
+                if rates:
+                    dst_entry['appear_rounds'] = len(rates)
+                    dst_entry['avg_rate']      = round(sum(rates) / len(rates), 6)
+                    dst_entry['rate_std']      = round(statistics.pstdev(rates), 6) if len(rates) > 1 else 0.0
+                    total_t = sum(h.get('trigger_count', 0) for h in history)
+                    total_h = sum(h.get('hit_count',    0) for h in history)
+                    dst_entry['total_triggers'] = total_t
+                    dst_entry['overall_rate']   = round(total_h / total_t, 6) if total_t > 0 else dst_entry['avg_rate']
+                merged_combos += 1
+
+    # ── 写回 ─────────────────────────────────────────────────────────────────
+    data['last_updated'] = datetime.now().isoformat(timespec='seconds')
+    data['version']      = _SCHEMA_VERSION
+    _save_raw(data, pool_id)
+
+    return {
+        "merged_rounds":  merged_rounds,
+        "merged_combos":  merged_combos,
+        "skipped_rounds": skipped_rounds,
+    }
+
+
+def import_from_txt(src_path: str) -> Dict[str, object]:
+    """
+    从 TXT 文件导入累计结果，自动识别 Pool1/Pool2 并追加合并。
+
+    TXT 格式示例（由 _export_cumulative_txt 导出）：
+        === 策略池 1（TP 0.6% / SL 0.8%，做多≥64% / 做空≥52%） ===
+        序号	方向	层级	出现轮次	累计触发	累计命中	综合命中率	...	条件组合
+        1	做多	精品	2	32	23	71.9%	...	布林中区<0.40（宽松） & ...
+
+    Returns:
+        {"pool1_imported": int, "pool2_imported": int, "errors": list}
+    """
+    from core.signal_utils import _COND_LABELS
+
+    # ── 构建反向映射：中文条件描述 → 内部条件键 ────────────────────────────────
+    def _build_reverse_map() -> Dict[str, Dict[str, str]]:
+        """返回 {direction: {中文描述: 内部键}} 的嵌套映射"""
+        reverse = {"long": {}, "short": {}}
+        for base_key, info in _COND_LABELS.items():
+            label = info.get("label", base_key)
+            for direction in ("long", "short"):
+                dir_info = info.get(direction, {})
+                for level, rule in dir_info.items():
+                    if not rule:
+                        continue
+                    suffix = "（严格）" if level == "strict" else "（宽松）"
+                    full_label = f"{label}{rule}{suffix}"
+                    internal_key = f"{base_key}_{level}"
+                    reverse[direction][full_label] = internal_key
+        return reverse
+
+    reverse_map = _build_reverse_map()
+
+    def _parse_conditions(cond_str: str, direction: str) -> List[str]:
+        """将中文条件描述转换回内部条件键列表"""
+        if not cond_str.strip():
+            return []
+        parts = [p.strip() for p in cond_str.split(" & ")]
+        result = []
+        dir_map = reverse_map.get(direction, {})
+        for part in parts:
+            if part in dir_map:
+                result.append(dir_map[part])
+            else:
+                # 尝试另一个方向（有些条件可能是双向的）
+                other_dir = "short" if direction == "long" else "long"
+                other_map = reverse_map.get(other_dir, {})
+                if part in other_map:
+                    result.append(other_map[part])
+                else:
+                    # 无法识别的条件，跳过或记录
+                    pass
+        return sorted(result)
+
+    def _parse_rate(rate_str: str) -> float:
+        """将百分比字符串转换为浮点数，如 '71.9%' → 0.719"""
+        if not rate_str:
+            return 0.0
+        rate_str = rate_str.strip().replace("%", "").replace("+", "")
+        try:
+            return float(rate_str) / 100.0
+        except ValueError:
+            return 0.0
+
+    # ── 读取并解析 TXT 文件 ───────────────────────────────────────────────────
+    try:
+        with open(src_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        # 尝试其他编码
+        with open(src_path, "r", encoding="utf-8-sig") as f:
+            lines = f.readlines()
+
+    pool1_entries: List[dict] = []
+    pool2_entries: List[dict] = []
+    current_pool = None
+    errors: List[str] = []
+    header_seen = False
+
+    for line_no, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            header_seen = False
+            continue
+
+        # 识别池子标题
+        if "策略池 1" in line or "策略池1" in line:
+            current_pool = "pool1"
+            header_seen = False
+            continue
+        elif "策略池 2" in line or "策略池2" in line:
+            current_pool = "pool2"
+            header_seen = False
+            continue
+
+        # 跳过表头
+        if line.startswith("序号") or line.startswith("序号\t"):
+            header_seen = True
+            continue
+
+        if current_pool is None or not header_seen:
+            continue
+
+        # 解析数据行
+        cols = line.split("\t")
+        if len(cols) < 15:
+            errors.append(f"行 {line_no}: 列数不足 ({len(cols)} < 15)")
+            continue
+
+        try:
+            # 列顺序：序号、方向、层级、出现轮次、累计触发、累计命中、
+            #        综合命中率、平均命中率、波动、综合评分、各状态命中率、
+            #        估算总盈亏、单次EV、平均持仓、条件组合
+            direction_str = cols[1].strip()
+            direction = "long" if direction_str == "做多" else "short"
+            tier = cols[2].strip()
+            appear_rounds = int(cols[3].strip())
+            total_triggers = int(cols[4].strip())
+            total_hits = int(cols[5].strip())
+            overall_rate = _parse_rate(cols[6])
+            avg_rate = _parse_rate(cols[7])
+            rate_std = float(cols[8].strip()) if cols[8].strip() else 0.0
+            score = float(cols[9].strip()) if cols[9].strip() else 0.0
+            # cols[10] = 各状态命中率（暂不解析）
+            # cols[11] = 估算总盈亏
+            # cols[12] = 单次EV
+            avg_hold_str = cols[13].strip() if len(cols) > 13 else "-"
+            avg_hold = int(avg_hold_str) if avg_hold_str.isdigit() else 0
+            conditions_str = cols[14].strip() if len(cols) > 14 else ""
+
+            conditions = _parse_conditions(conditions_str, direction)
+            if not conditions:
+                errors.append(f"行 {line_no}: 无法解析条件组合 '{conditions_str}'")
+                continue
+
+            combo_key = f"{direction}|{'+'.join(conditions)}"
+            # Build appear_rounds fake history entries so that len(history) == appear_rounds.
+            # Triggers/hits are distributed evenly; remainder goes to the last entry.
+            n = max(appear_rounds, 1)
+            base_triggers = total_triggers // n
+            base_hits = total_hits // n
+            rem_triggers = total_triggers - base_triggers * n
+            rem_hits = total_hits - base_hits * n
+            fake_history = []
+            for i in range(n):
+                t = base_triggers + (rem_triggers if i == n - 1 else 0)
+                h = base_hits + (rem_hits if i == n - 1 else 0)
+                fake_history.append({
+                    "round_id": i + 1,
+                    "hit_rate": (h / t) if t > 0 else overall_rate,
+                    "trigger_count": t,
+                    "hit_count": h,
+                    "tier": tier,
+                })
+            entry = {
+                "direction": direction,
+                "pool_id": current_pool,
+                "conditions": conditions,
+                "appear_rounds": appear_rounds,
+                "total_triggers": total_triggers,
+                "total_hits": total_hits,
+                "overall_rate": overall_rate,
+                "avg_rate": avg_rate,
+                "rate_std": rate_std,
+                "综合评分": score,
+                "tier": tier,
+                "avg_hold_bars": avg_hold,
+                "combo_key": combo_key,
+                "history": fake_history,
+                "live_tracking": _default_live_tracking(),
+            }
+
+            if current_pool == "pool1":
+                pool1_entries.append(entry)
+            else:
+                pool2_entries.append(entry)
+
+        except (ValueError, IndexError) as e:
+            errors.append(f"行 {line_no}: 解析错误 - {e}")
+            continue
+
+    # ── 合并到各池 ───────────────────────────────────────────────────────────
+    def _merge_entries(entries: List[dict], pool_id: str) -> int:
+        if not entries:
+            return 0
+        data = _load_raw(pool_id)
+        dst_cumulative: dict = data.setdefault('cumulative', {})
+        merged = 0
+
+        for entry in entries:
+            key = entry.get("combo_key", "")
+            if not key:
+                continue
+
+            if key not in dst_cumulative:
+                dst_cumulative[key] = entry
+                merged += 1
+            else:
+                existing = dst_cumulative[key]
+                if entry.get("appear_rounds", 0) > existing.get("appear_rounds", 0):
+                    # TXT 数据轮次更多（代表更完整的历史），整体替换为 TXT 数据。
+                    # 保留现有 live_tracking（实盘跟踪记录不能丢）。
+                    old_live = existing.get("live_tracking", _default_live_tracking())
+                    dst_cumulative[key] = dict(entry)
+                    dst_cumulative[key]["live_tracking"] = old_live
+                merged += 1
+
+        data['last_updated'] = datetime.now().isoformat(timespec='seconds')
+        data['version'] = _SCHEMA_VERSION
+        _save_raw(data, pool_id)
+        return merged
+
+    p1_count = _merge_entries(pool1_entries, "pool1")
+    p2_count = _merge_entries(pool2_entries, "pool2")
+
+    return {
+        "pool1_imported": p1_count,
+        "pool2_imported": p2_count,
+        "errors": errors,
+    }
 
 
 def backup_to_github(target_dir: Optional[str] = None) -> Dict[str, object]:

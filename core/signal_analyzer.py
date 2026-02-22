@@ -599,6 +599,15 @@ def analyze(
             tp_pct=tp_pct, sl_pct=sl_pct,
         )
         conds_val = _build_condition_arrays(df_val, direction)
+        n_val = len(df_val)
+        adx_val = df_val['adx'].values.astype(float) if 'adx' in df_val.columns else np.full(n_val, 20.0)
+        ma5_slope_val = (
+            df_val['ma5_slope'].values.astype(float) if 'ma5_slope' in df_val.columns else np.zeros(n_val)
+        )
+        market_state_val = np.array(
+            [detect_state(float(adx_val[i]), float(ma5_slope_val[i])) for i in range(n_val)],
+            dtype=object,
+        )
 
         if pool_id == 'pool2':
             t_prem_v = POOL2_TIER_PREMIUM
@@ -648,6 +657,11 @@ def analyze(
             res['tier']            = val_tier
             res['low_sample_warn'] = val_trigger_count <= WARN_TRIGGERS_MAX
             res['hold_bars']       = hold_bars_val[val_indices].tolist()
+            res['trigger_count']   = val_trigger_count
+            res['hit_count']       = val_hit_count
+            res['market_state_breakdown'] = _build_market_state_breakdown(
+                val_indices, outcome_val, market_state_val
+            )
             val_results.append(res)
 
         results = val_results

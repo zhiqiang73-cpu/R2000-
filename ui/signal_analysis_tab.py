@@ -810,6 +810,28 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._btn_backup_github.setStyleSheet(self._btn_export_cumul.styleSheet())
         self._btn_backup_github.clicked.connect(self._backup_to_github)
         cumul_count_row.addWidget(self._btn_backup_github)
+
+        self._btn_import_pool = QtWidgets.QPushButton("📥 导入数据")
+        self._btn_import_pool.setFixedHeight(26)
+        self._btn_import_pool.setFixedWidth(100)
+        self._btn_import_pool.setToolTip("从 TXT/JSON 文件导入 Pool1/Pool2 数据（TXT自动识别池子）")
+        self._btn_import_pool.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {BG_CARD};
+                color: #7ecfad;
+                border: 1px solid #3a8a68;
+                border-radius: 3px;
+                font-size: 11px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                background-color: #3a8a68;
+                color: {BG_DARK};
+                border-color: #7ecfad;
+            }}
+        """)
+        self._btn_import_pool.clicked.connect(self._import_pool_data)
+        cumul_count_row.addWidget(self._btn_import_pool)
         
         # 方向筛选
         lbl_dir = QtWidgets.QLabel("方向:")
@@ -1629,6 +1651,86 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             f"已备份到:\n{target_dir}\n\n文件:\n{file_list}"
         )
 
+    def _import_pool_data(self):
+        """从外部 TXT/JSON 文件导入 Pool1/Pool2 数据，追加合并到现有数据中。"""
+        from PyQt6 import QtWidgets as _QW
+
+        # 选择要导入的文件（优先TXT，也支持JSON）
+        path, _ = _QW.QFileDialog.getOpenFileName(
+            self,
+            "选择要导入的文件（TXT 或 JSON）",
+            "",
+            "TXT 文件 (*.txt);;JSON 文件 (*.json);;所有文件 (*)"
+        )
+        if not path:
+            return
+
+        try:
+            from core import signal_store
+
+            if path.lower().endswith(".txt"):
+                # TXT 格式：自动识别 Pool1/Pool2
+                result = signal_store.import_from_txt(path)
+                p1_count = result.get("pool1_imported", 0)
+                p2_count = result.get("pool2_imported", 0)
+                errors = result.get("errors", [])
+
+                msg = f"导入完成！\n\n"
+                msg += f"Pool 1 导入：{p1_count} 条\n"
+                msg += f"Pool 2 导入：{p2_count} 条\n"
+                if errors:
+                    msg += f"\n警告（{len(errors)} 条）：\n"
+                    msg += "\n".join(errors[:5])
+                    if len(errors) > 5:
+                        msg += f"\n... 还有 {len(errors) - 5} 条警告"
+
+                _QW.QMessageBox.information(self, "导入完成", msg)
+
+                # 刷新两个池的缓存
+                signal_store.invalidate_cache()
+                if p1_count > 0:
+                    signal_store.rebuild_pruned_cache(pool_id='pool1')
+                if p2_count > 0:
+                    signal_store.rebuild_pruned_cache(pool_id='pool2')
+
+            else:
+                # JSON 格式：需要选择目标池
+                pool_choice, ok = _QW.QInputDialog.getItem(
+                    self, "选择导入目标",
+                    "将 JSON 数据导入到哪个策略池？",
+                    ["Pool 1（TP 0.6% / SL 0.8%）", "Pool 2（TP 1.0% / SL 0.8%）"],
+                    0, False
+                )
+                if not ok:
+                    return
+                pool_id = "pool1" if "Pool 1" in pool_choice else "pool2"
+
+                result = signal_store.import_from_file(path, pool_id)
+                merged_rounds  = result.get("merged_rounds", 0)
+                merged_combos  = result.get("merged_combos", 0)
+                skipped_rounds = result.get("skipped_rounds", 0)
+
+                _QW.QMessageBox.information(
+                    self,
+                    "导入完成",
+                    f"已合并到 {pool_choice}\n\n"
+                    f"新增轮次：{merged_rounds}\n"
+                    f"累计组合更新：{merged_combos}\n"
+                    f"跳过重复轮次：{skipped_rounds}\n\n"
+                    f"数据已写入，请刷新查看。"
+                )
+
+                signal_store.invalidate_cache()
+                signal_store.rebuild_pruned_cache(pool_id=pool_id)
+
+        except Exception as e:
+            import traceback
+            _QW.QMessageBox.critical(self, "导入失败", f"导入出错：\n{e}\n\n{traceback.format_exc()}")
+            return
+
+        self._refresh_cumul_tables()
+        self._refresh_history_text()
+
     def _refresh_backtest_feedback_table(self):
         """刷新回测信号反馈面板：从纸交易记录统计各组合表现。"""
         tbl = self._live_table
@@ -1637,7 +1739,9 @@ class SignalAnalysisTab(QtWidgets.QWidget):
 
         try:
             from core import signal_store
-            cumulative = signal_store.get_cumulative()
+            cumul1 = signal_store.get_cumulative(pool_id='pool1')
+            cumul2 = signal_store.get_cumulative(pool_id='pool2')
+            cumulative = {**cumul1, **cumul2}
         except Exception:
             cumulative = {}
 
@@ -1751,7 +1855,8 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             cumulative_entry = cumulative.get(key) or {}
             pool_rate = cumulative_entry.get("avg_rate", 0.0)
             tier_rate = cumulative_entry.get("overall_rate", pool_rate)
-            tier_str = _tier_from_rate(tier_rate, entry["direction"]) or "--"
+            _pool_id_for_tier = cumulative_entry.get('pool_id', 'pool1')
+            tier_str = _tier_from_rate(tier_rate, entry["direction"], pool_id=_pool_id_for_tier) or "--"
 
             conditions: List[str] = []
             if "|" in key:
@@ -1826,7 +1931,9 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         """从 signal_store 读取最大连亏次数，更新风控显示标签。"""
         try:
             from core import signal_store
-            cumulative = signal_store.get_cumulative()
+            cumul1 = signal_store.get_cumulative(pool_id='pool1')
+            cumul2 = signal_store.get_cumulative(pool_id='pool2')
+            cumulative = {**cumul1, **cumul2}
             max_streak = max(
                 (e.get('live_tracking', {}).get('streak_loss', 0) for e in cumulative.values()),
                 default=0
@@ -1840,31 +1947,39 @@ class SignalAnalysisTab(QtWidgets.QWidget):
     def _refresh_history_text(self):
         try:
             from core import signal_store
-            rounds = signal_store.get_rounds()
+            rounds_p1 = signal_store.get_rounds(pool_id='pool1')
+            rounds_p2 = signal_store.get_rounds(pool_id='pool2')
         except Exception:
             return
 
-        lines = []
-        for i, rnd in enumerate(reversed(rounds[-20:])):
-            rnd_id    = rnd.get('round_id', '?')
-            ts        = _format_timestamp(rnd.get('timestamp', ''))
-            results   = rnd.get('results', [])
-            cnt       = len(results)
-            top3      = results[:3]
-            lines.append(f"【第 {rnd_id} 轮】{ts}  |  共 {cnt} 个有效组合")
-            for j, item in enumerate(top3):
-                dir_str = "做多" if item.get("direction") == "long" else "做空"
-                conds   = _format_conditions(item.get("conditions", []), item.get("direction", ""))
-                tier    = item.get("tier", "")
-                hr      = item.get("hit_rate", 0.0)
-                tc      = item.get("trigger_count", 0)
-                lines.append(
-                    f"  {j+1}. {dir_str} {tier}  "
-                    f"命中率 {hr:.1%}  "
-                    f"触发 {tc} 次  [{conds}]"
-                )
-            lines.append("")
+        def _render_rounds(rounds, pool_label):
+            lines = []
+            if not rounds:
+                return lines
+            lines.append(f"═══ {pool_label} ═══")
+            for i, rnd in enumerate(reversed(rounds[-20:])):
+                rnd_id  = rnd.get('round_id', '?')
+                ts      = _format_timestamp(rnd.get('timestamp', ''))
+                results = rnd.get('results', [])
+                cnt     = len(results)
+                top3    = results[:3]
+                lines.append(f"【第 {rnd_id} 轮】{ts}  |  共 {cnt} 个有效组合")
+                for j, item in enumerate(top3):
+                    dir_str = "做多" if item.get("direction") == "long" else "做空"
+                    conds   = _format_conditions(item.get("conditions", []), item.get("direction", ""))
+                    tier    = item.get("tier", "")
+                    hr      = item.get("hit_rate", 0.0)
+                    tc      = item.get("trigger_count", 0)
+                    lines.append(
+                        f"  {j+1}. {dir_str} {tier}  "
+                        f"命中率 {hr:.1%}  "
+                        f"触发 {tc} 次  [{conds}]"
+                    )
+                lines.append("")
+            return lines
 
+        lines = _render_rounds(rounds_p1, "策略池 1（TP 0.6% / SL 0.8%）")
+        lines += _render_rounds(rounds_p2, "策略池 2（TP 1.0% / SL 0.8%）")
         self._history_text.setPlainText("\n".join(lines))
 
     # ── 外部接口 ──────────────────────────────────────────────────────────

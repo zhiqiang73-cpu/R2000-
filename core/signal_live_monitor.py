@@ -67,7 +67,10 @@ class SignalLiveMonitor:
         except ImportError:
             return []
 
-        cumulative = signal_store.get_cumulative()
+        # 合并 pool1 和 pool2 的累计组合，确保两个策略池的条件都被检测
+        cumul1 = signal_store.get_cumulative(pool_id='pool1')
+        cumul2 = signal_store.get_cumulative(pool_id='pool2')
+        cumulative = {**cumul1, **cumul2}
         if not cumulative:
             return []
 
@@ -171,7 +174,9 @@ class SignalLiveMonitor:
             breakdown = entry.get('market_state_breakdown', {})
             state_info = breakdown.get(market_state, {})
             direction = entry.get('direction', 'long')
-            _thresh = 0.64 if direction == 'long' else 0.52
+            pool_id = entry.get('pool_id', 'pool1')
+            # pool2 双向对称门槛 0.52；pool1 做多 0.64 / 做空 0.52
+            _thresh = 0.52 if pool_id == 'pool2' else (0.64 if direction == 'long' else 0.52)
             if state_info.get('total_triggers', 0) > 0:
                 _trig = state_info.get('total_triggers', 0)
                 _wr = state_info.get('avg_rate', 0.0)
