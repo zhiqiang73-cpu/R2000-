@@ -158,6 +158,7 @@ class LiveTradingEngine:
                  hold_alert_threshold: float = 0.5,
                  hold_derail_threshold: float = 0.3,
                  hold_check_interval: int = 3,
+                 trailing_stop_enabled: bool = True,
                  # 模板筛选
                  use_qualified_only: bool = True,
                  qualified_fingerprints: Optional[set] = None,
@@ -243,6 +244,8 @@ class LiveTradingEngine:
         self.hold_alert_threshold = hold_alert_threshold
         self.hold_derail_threshold = hold_derail_threshold
         self.hold_check_interval = hold_check_interval
+        # 兼容 UI 传参（目前核心追踪止损开关仍由交易执行层/配置控制）
+        self.trailing_stop_enabled = bool(trailing_stop_enabled)
         
         # 模板筛选
         self.use_qualified_only = use_qualified_only

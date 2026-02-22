@@ -1,7 +1,1856 @@
 {
   "version": "3.0",
-  "last_updated": "2026-02-22T16:45:23",
+  "last_updated": "2026-02-22T21:22:37",
   "cumulative": {
+    "short|consec_bull_strict+macd_hist_turn_loose+obv_trend_loose+vol_ratio_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "consec_bull_strict",
+        "macd_hist_turn_loose",
+        "obv_trend_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 35,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            2
+          ]
+        },
+        {
+          "round_id": 40,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            2
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.098612,
+      "综合评分": 53.83,
+      "total_triggers": 2,
+      "total_hits": 2,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 1.88,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 2,
+      "hold_bars_sample_count": 2
+    },
+    "short|close_vs_ma5_mod_strict+macd_hist_turn_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "macd_hist_turn_loose"
+      ],
+      "history": [
+        {
+          "round_id": 2,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 44.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 1,
+      "hold_bars_sample_count": 1
+    },
+    "short|atr_ratio_strict+j_strict+macd_hist_turn_loose+rsi_mod_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "j_strict",
+        "macd_hist_turn_loose",
+        "rsi_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 32,
+          "hit_rate": 0.5714285714285714,
+          "trigger_count": 7,
+          "hit_count": 4,
+          "tier": "优质",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 5,
+              "hits": 2,
+              "rate": 0.4
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            54,
+            28,
+            15,
+            11,
+            -1,
+            17,
+            -1
+          ]
+        },
+        {
+          "round_id": 52,
+          "hit_rate": 0.5714285714285714,
+          "trigger_count": 7,
+          "hit_count": 4,
+          "tier": "优质",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 5,
+              "hits": 2,
+              "rate": 0.4
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            54,
+            28,
+            15,
+            11,
+            -1,
+            17,
+            -1
+          ]
+        },
+        {
+          "round_id": 56,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 6,
+          "hit_count": 4,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 4,
+              "hits": 2,
+              "rate": 0.5
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            54,
+            28,
+            15,
+            11,
+            -1,
+            17
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 0.603175,
+      "rate_std": 0.044896,
+      "stability_score": 0.798637,
+      "综合评分": 43.39,
+      "total_triggers": 20,
+      "total_hits": 12,
+      "overall_rate": 0.6,
+      "estimated_pnl_pct": 4.4,
+      "ev_per_trigger_pct": 0.22,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 14,
+          "total_hits": 6,
+          "avg_rate": 0.428571
+        },
+        "空头趋势": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 17,
+      "hold_bars_sample_count": 15
+    },
+    "short|atr_ratio_strict+j_strict+k_loose+macd_hist_turn_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "j_strict",
+        "k_loose",
+        "macd_hist_turn_loose"
+      ],
+      "history": [
+        {
+          "round_id": 44,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            39
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 41.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 39,
+      "hold_bars_sample_count": 1
+    },
+    "short|atr_ratio_loose+consec_bull_strict+macd_hist_turn_loose+obv_trend_loose+upper_shd_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_loose",
+        "consec_bull_strict",
+        "macd_hist_turn_loose",
+        "obv_trend_loose",
+        "upper_shd_strict"
+      ],
+      "history": [
+        {
+          "round_id": 55,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            49
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 38.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 49,
+      "hold_bars_sample_count": 1
+    },
+    "long|close_vs_ma5_mod_strict+rsi_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "rsi_loose"
+      ],
+      "history": [
+        {
+          "round_id": 12,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14
+          ]
+        },
+        {
+          "round_id": 15,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14
+          ]
+        },
+        {
+          "round_id": 22,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            5
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.386294,
+      "综合评分": 67.66,
+      "total_triggers": 3,
+      "total_hits": 3,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 2.82,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 3
+    },
+    "long|boll_pos_loose+close_vs_ma5_mod_strict+rsi_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "boll_pos_loose",
+        "close_vs_ma5_mod_strict",
+        "rsi_loose"
+      ],
+      "history": [
+        {
+          "round_id": 3,
+          "hit_rate": 0.6,
+          "trigger_count": 5,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 4,
+              "hits": 2,
+              "rate": 0.5
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            -1,
+            47,
+            1,
+            0,
+            5
+          ]
+        },
+        {
+          "round_id": 12,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14
+          ]
+        },
+        {
+          "round_id": 15,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14
+          ]
+        },
+        {
+          "round_id": 22,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            5
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 4,
+      "avg_rate": 0.9,
+      "rate_std": 0.173205,
+      "stability_score": 1.197608,
+      "综合评分": 45.86,
+      "total_triggers": 8,
+      "total_hits": 6,
+      "overall_rate": 0.75,
+      "estimated_pnl_pct": 3.92,
+      "ev_per_trigger_pct": 0.49,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 6,
+          "total_hits": 4,
+          "avg_rate": 0.666667
+        },
+        "震荡市": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 5,
+      "hold_bars_sample_count": 7
+    },
+    "long|consec_bear_loose+lower_shd_strict+obv_trend_loose+rsi_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "consec_bear_loose",
+        "lower_shd_strict",
+        "obv_trend_loose",
+        "rsi_loose"
+      ],
+      "history": [
+        {
+          "round_id": 43,
+          "hit_rate": 0.75,
+          "trigger_count": 4,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 3,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            3,
+            34,
+            -1,
+            27
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.75,
+      "rate_std": 0.0,
+      "stability_score": 0.51986,
+      "综合评分": 41.83,
+      "total_triggers": 4,
+      "total_hits": 3,
+      "overall_rate": 0.75,
+      "estimated_pnl_pct": 1.96,
+      "ev_per_trigger_pct": 0.49,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 27,
+      "hold_bars_sample_count": 3
+    },
+    "long|atr_ratio_strict+k_loose+obv_trend_loose+rsi_loose+vol_ratio_mod_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "k_loose",
+        "obv_trend_loose",
+        "rsi_loose",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 50,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 38.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 0,
+      "hold_bars_sample_count": 1
+    },
+    "short|close_vs_ma5_mod_strict+consec_bull_strict+k_loose+rsi_loose+vol_ratio_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "consec_bull_strict",
+        "k_loose",
+        "rsi_loose",
+        "vol_ratio_loose"
+      ],
+      "history": [
+        {
+          "round_id": 4,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            -1,
+            29
+          ]
+        },
+        {
+          "round_id": 23,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            -1,
+            29
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.732408,
+      "综合评分": 50.83,
+      "total_triggers": 6,
+      "total_hits": 4,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 2.04,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 6,
+          "total_hits": 4,
+          "avg_rate": 0.666667
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 4
+    },
+    "short|close_vs_ma5_mod_strict+consec_bull_strict+k_loose+rsi_loose+vol_ratio_mod_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "consec_bull_strict",
+        "k_loose",
+        "rsi_loose",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 4,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            -1,
+            29
+          ]
+        },
+        {
+          "round_id": 23,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            -1,
+            29
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.732408,
+      "综合评分": 50.83,
+      "total_triggers": 6,
+      "total_hits": 4,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 2.04,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 6,
+          "total_hits": 4,
+          "avg_rate": 0.666667
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 4
+    },
+    "short|close_vs_ma5_mod_strict+consec_bull_strict+k_loose+ma5_slope_dir_strict+vol_ratio_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "consec_bull_strict",
+        "k_loose",
+        "ma5_slope_dir_strict",
+        "vol_ratio_loose"
+      ],
+      "history": [
+        {
+          "round_id": 4,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            -1,
+            29
+          ]
+        },
+        {
+          "round_id": 23,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            -1,
+            29
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.732408,
+      "综合评分": 50.83,
+      "total_triggers": 6,
+      "total_hits": 4,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 2.04,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 6,
+          "total_hits": 4,
+          "avg_rate": 0.666667
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 4
+    },
+    "short|close_vs_ma5_mod_strict+consec_bull_strict+k_loose+ma5_slope_dir_strict+vol_ratio_mod_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "consec_bull_strict",
+        "k_loose",
+        "ma5_slope_dir_strict",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 4,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            -1,
+            29
+          ]
+        },
+        {
+          "round_id": 23,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            -1,
+            29
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.732408,
+      "综合评分": 50.83,
+      "total_triggers": 6,
+      "total_hits": 4,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 2.04,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 6,
+          "total_hits": 4,
+          "avg_rate": 0.666667
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 4
+    },
+    "short|atr_ratio_loose+consec_bull_strict+j_strict+obv_trend_loose+rsi_mod_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_loose",
+        "consec_bull_strict",
+        "j_strict",
+        "obv_trend_loose",
+        "rsi_mod_strict"
+      ],
+      "history": [
+        {
+          "round_id": 30,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            58
+          ]
+        },
+        {
+          "round_id": 45,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            58
+          ]
+        },
+        {
+          "round_id": 54,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            58
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.386294,
+      "综合评分": 61.66,
+      "total_triggers": 3,
+      "total_hits": 3,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 2.82,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 58,
+      "hold_bars_sample_count": 3
+    },
+    "short|atr_ratio_loose+consec_bull_strict+j_loose+obv_trend_loose+vol_ratio_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_loose",
+        "consec_bull_strict",
+        "j_loose",
+        "obv_trend_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 40,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            32
+          ]
+        },
+        {
+          "round_id": 48,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            19,
+            32
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.098612,
+      "综合评分": 50.83,
+      "total_triggers": 3,
+      "total_hits": 3,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 2.82,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 32,
+      "hold_bars_sample_count": 3
+    },
+    "short|consec_bull_strict+obv_trend_loose+vol_ratio_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "consec_bull_strict",
+        "obv_trend_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 35,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            2,
+            37
+          ]
+        },
+        {
+          "round_id": 37,
+          "hit_rate": 0.6,
+          "trigger_count": 5,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 2,
+              "hits": 1,
+              "rate": 0.5
+            },
+            "空头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            42,
+            -1,
+            3,
+            8,
+            19
+          ]
+        },
+        {
+          "round_id": 40,
+          "hit_rate": 1.0,
+          "trigger_count": 3,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            32,
+            2,
+            37
+          ]
+        },
+        {
+          "round_id": 48,
+          "hit_rate": 0.8,
+          "trigger_count": 5,
+          "hit_count": 4,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 2,
+              "hits": 2,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 1,
+              "rate": 0.5
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            3,
+            8,
+            19,
+            32,
+            2
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 4,
+      "avg_rate": 0.85,
+      "rate_std": 0.165831,
+      "stability_score": 1.141161,
+      "综合评分": 45.86,
+      "total_triggers": 15,
+      "total_hits": 12,
+      "overall_rate": 0.8,
+      "estimated_pnl_pct": 8.7,
+      "ev_per_trigger_pct": 0.58,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 6,
+          "total_hits": 5,
+          "avg_rate": 0.833333
+        },
+        "空头趋势": {
+          "total_triggers": 7,
+          "total_hits": 5,
+          "avg_rate": 0.714286
+        },
+        "震荡市": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 14
+    },
+    "short|close_vs_ma5_mod_strict+obv_trend_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "obv_trend_loose"
+      ],
+      "history": [
+        {
+          "round_id": 25,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 1,
+              "rate": 0.5
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            57,
+            20,
+            18
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 44.83,
+      "total_triggers": 3,
+      "total_hits": 2,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 1.02,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 1,
+          "avg_rate": 0.5
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 20,
+      "hold_bars_sample_count": 3
+    },
     "short|close_vs_ma5_mod_strict+j_loose": {
       "direction": "short",
       "pool_id": "pool2",
@@ -160,6 +2009,320 @@
       "avg_hold_bars": 9,
       "hold_bars_sample_count": 29
     },
+    "short|atr_ratio_loose+close_vs_ma5_mod_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_loose",
+        "close_vs_ma5_mod_strict"
+      ],
+      "history": [
+        {
+          "round_id": 6,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            2,
+            43,
+            -1
+          ]
+        },
+        {
+          "round_id": 25,
+          "hit_rate": 0.5882352941176471,
+          "trigger_count": 17,
+          "hit_count": 10,
+          "tier": "优质",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 12,
+              "hits": 6,
+              "rate": 0.5
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 1,
+              "rate": 0.5
+            },
+            "震荡市": {
+              "triggers": 3,
+              "hits": 3,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            23,
+            57,
+            1,
+            5,
+            5,
+            20,
+            41,
+            13,
+            13,
+            3,
+            18,
+            7,
+            45,
+            51,
+            13,
+            2,
+            43
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.627451,
+      "rate_std": 0.039216,
+      "stability_score": 0.662293,
+      "综合评分": 45.22,
+      "total_triggers": 20,
+      "total_hits": 12,
+      "overall_rate": 0.6,
+      "estimated_pnl_pct": 4.4,
+      "ev_per_trigger_pct": 0.22,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 15,
+          "total_hits": 8,
+          "avg_rate": 0.533333
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 1,
+          "avg_rate": 0.5
+        },
+        "震荡市": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 13,
+      "hold_bars_sample_count": 19
+    },
+    "short|boll_pos_mod_loose+close_vs_ma5_mod_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "boll_pos_mod_loose",
+        "close_vs_ma5_mod_strict"
+      ],
+      "history": [
+        {
+          "round_id": 6,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            2,
+            43,
+            -1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 44.83,
+      "total_triggers": 3,
+      "total_hits": 2,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 1.02,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 3,
+          "total_hits": 2,
+          "avg_rate": 0.666667
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 22,
+      "hold_bars_sample_count": 2
+    },
+    "short|close_vs_ma5_mod_strict+rsi_mod_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "rsi_mod_strict"
+      ],
+      "history": [
+        {
+          "round_id": 6,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            2,
+            43,
+            -1
+          ]
+        },
+        {
+          "round_id": 25,
+          "hit_rate": 0.5714285714285714,
+          "trigger_count": 14,
+          "hit_count": 8,
+          "tier": "优质",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 11,
+              "hits": 5,
+              "rate": 0.454545
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 3,
+              "hits": 3,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            23,
+            1,
+            5,
+            5,
+            41,
+            13,
+            13,
+            3,
+            7,
+            45,
+            51,
+            13,
+            2,
+            43
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.619048,
+      "rate_std": 0.047619,
+      "stability_score": 0.647708,
+      "综合评分": 42.14,
+      "total_triggers": 17,
+      "total_hits": 10,
+      "overall_rate": 0.588235,
+      "estimated_pnl_pct": 3.38,
+      "ev_per_trigger_pct": 0.1988,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 14,
+          "total_hits": 7,
+          "avg_rate": 0.5
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 13,
+      "hold_bars_sample_count": 16
+    },
     "short|close_vs_ma5_mod_strict+consec_bull_loose+vol_ratio_mod_loose": {
       "direction": "short",
       "pool_id": "pool2",
@@ -311,6 +2474,124 @@
       },
       "avg_hold_bars": 20,
       "hold_bars_sample_count": 22
+    },
+    "short|close_vs_ma5_mod_strict+consec_bull_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "consec_bull_loose"
+      ],
+      "history": [
+        {
+          "round_id": 7,
+          "hit_rate": 0.5555555555555556,
+          "trigger_count": 9,
+          "hit_count": 5,
+          "tier": "优质",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 8,
+              "hits": 4,
+              "rate": 0.5
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            20,
+            4,
+            8,
+            20,
+            3,
+            9,
+            26,
+            57,
+            -1
+          ]
+        },
+        {
+          "round_id": 16,
+          "hit_rate": 0.5555555555555556,
+          "trigger_count": 9,
+          "hit_count": 5,
+          "tier": "优质",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 8,
+              "hits": 4,
+              "rate": 0.5
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            20,
+            4,
+            8,
+            20,
+            3,
+            9,
+            26,
+            57,
+            -1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.555556,
+      "rate_std": 0.0,
+      "stability_score": 0.61034,
+      "综合评分": 41.08,
+      "total_triggers": 18,
+      "total_hits": 10,
+      "overall_rate": 0.555556,
+      "estimated_pnl_pct": 2.52,
+      "ev_per_trigger_pct": 0.14,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 16,
+          "total_hits": 8,
+          "avg_rate": 0.5
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 16
     },
     "short|close_vs_ma5_mod_strict+consec_bull_loose+j_loose": {
       "direction": "short",
@@ -469,16 +2750,700 @@
       "avg_hold_bars": 9,
       "hold_bars_sample_count": 27
     },
-    "short|close_vs_ma5_mod_strict+macd_hist_turn_loose": {
-      "direction": "short",
+    "long|close_vs_ma5_mod_strict+consec_bear_strict": {
+      "direction": "long",
       "pool_id": "pool2",
       "conditions": [
         "close_vs_ma5_mod_strict",
-        "macd_hist_turn_loose"
+        "consec_bear_strict"
       ],
       "history": [
         {
-          "round_id": 2,
+          "round_id": 9,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            11
+          ]
+        },
+        {
+          "round_id": 17,
+          "hit_rate": 0.5714285714285714,
+          "trigger_count": 7,
+          "hit_count": 4,
+          "tier": "优质",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 6,
+              "hits": 4,
+              "rate": 0.666667
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14,
+            4,
+            11,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "round_id": 21,
+          "hit_rate": 0.5714285714285714,
+          "trigger_count": 7,
+          "hit_count": 4,
+          "tier": "优质",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 6,
+              "hits": 4,
+              "rate": 0.666667
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14,
+            4,
+            11,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 0.714286,
+      "rate_std": 0.202031,
+      "stability_score": 0.790158,
+      "综合评分": 36.01,
+      "total_triggers": 15,
+      "total_hits": 9,
+      "overall_rate": 0.6,
+      "estimated_pnl_pct": 3.3,
+      "ev_per_trigger_pct": 0.22,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 2,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 13,
+          "total_hits": 9,
+          "avg_rate": 0.692308
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 0,
+      "hold_bars_sample_count": 15
+    },
+    "long|boll_pos_strict+consec_bear_strict+obv_trend_loose+rsi_mod_strict+vol_ratio_mod_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "boll_pos_strict",
+        "consec_bear_strict",
+        "obv_trend_loose",
+        "rsi_mod_strict",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            43
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 38.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 43,
+      "hold_bars_sample_count": 1
+    },
+    "long|consec_bear_strict+obv_trend_loose+rsi_mod_strict+vol_ratio_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "consec_bear_strict",
+        "obv_trend_loose",
+        "rsi_mod_strict",
+        "vol_ratio_loose"
+      ],
+      "history": [
+        {
+          "round_id": 46,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 2,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            17,
+            25
+          ]
+        },
+        {
+          "round_id": 50,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            17,
+            25,
+            -1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.833333,
+      "rate_std": 0.166667,
+      "stability_score": 0.762925,
+      "综合评分": 37.83,
+      "total_triggers": 5,
+      "total_hits": 4,
+      "overall_rate": 0.8,
+      "estimated_pnl_pct": 2.9,
+      "ev_per_trigger_pct": 0.58,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 5,
+          "total_hits": 4,
+          "avg_rate": 0.8
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 21,
+      "hold_bars_sample_count": 4
+    },
+    "long|boll_pos_mod_loose+consec_bear_strict+obv_trend_loose+rsi_mod_strict+vol_ratio_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "boll_pos_mod_loose",
+        "consec_bear_strict",
+        "obv_trend_loose",
+        "rsi_mod_strict",
+        "vol_ratio_loose"
+      ],
+      "history": [
+        {
+          "round_id": 46,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            17
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 38.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 17,
+      "hold_bars_sample_count": 1
+    },
+    "long|consec_bear_strict+k_loose+macd_hist_turn_loose+rsi_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "consec_bear_strict",
+        "k_loose",
+        "macd_hist_turn_loose",
+        "rsi_loose"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 1.0,
+          "trigger_count": 3,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 3,
+              "hits": 3,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            41,
+            23,
+            3
+          ]
+        },
+        {
+          "round_id": 39,
+          "hit_rate": 1.0,
+          "trigger_count": 3,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 2,
+              "hits": 2,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            27,
+            41,
+            23
+          ]
+        },
+        {
+          "round_id": 47,
+          "hit_rate": 1.0,
+          "trigger_count": 3,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            8,
+            27,
+            41
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.386294,
+      "综合评分": 64.66,
+      "total_triggers": 9,
+      "total_hits": 9,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 8.46,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 6,
+          "total_hits": 6,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 27,
+      "hold_bars_sample_count": 9
+    },
+    "long|atr_ratio_loose+consec_bear_strict+macd_hist_turn_loose+rsi_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_loose",
+        "consec_bear_strict",
+        "macd_hist_turn_loose",
+        "rsi_loose"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 1.0,
+          "trigger_count": 4,
+          "hit_count": 4,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 4,
+              "hits": 4,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            41,
+            54,
+            23,
+            3
+          ]
+        },
+        {
+          "round_id": 39,
+          "hit_rate": 1.0,
+          "trigger_count": 4,
+          "hit_count": 4,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 3,
+              "hits": 3,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            27,
+            41,
+            54,
+            23
+          ]
+        },
+        {
+          "round_id": 47,
+          "hit_rate": 1.0,
+          "trigger_count": 4,
+          "hit_count": 4,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 3,
+              "hits": 3,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            57,
+            27,
+            41,
+            54
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.386294,
+      "综合评分": 64.66,
+      "total_triggers": 12,
+      "total_hits": 12,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 11.28,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 10,
+          "total_hits": 10,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 41,
+      "hold_bars_sample_count": 12
+    },
+    "long|atr_ratio_strict+j_loose+macd_hist_turn_loose+rsi_loose+vol_ratio_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "j_loose",
+        "macd_hist_turn_loose",
+        "rsi_loose",
+        "vol_ratio_loose"
+      ],
+      "history": [
+        {
+          "round_id": 34,
           "hit_rate": 1.0,
           "trigger_count": 1,
           "hit_count": 1,
@@ -501,7 +3466,415 @@
             }
           },
           "hold_bars": [
-            1
+            54
+          ]
+        },
+        {
+          "round_id": 39,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            27,
+            54
+          ]
+        },
+        {
+          "round_id": 47,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            27,
+            54
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.386294,
+      "综合评分": 61.66,
+      "total_triggers": 5,
+      "total_hits": 5,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 4.7,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 54,
+      "hold_bars_sample_count": 5
+    },
+    "long|atr_ratio_strict+j_loose+macd_hist_turn_loose+rsi_loose+vol_ratio_mod_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "j_loose",
+        "macd_hist_turn_loose",
+        "rsi_loose",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            54
+          ]
+        },
+        {
+          "round_id": 39,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            27,
+            54
+          ]
+        },
+        {
+          "round_id": 47,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            27,
+            54
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.386294,
+      "综合评分": 61.66,
+      "total_triggers": 5,
+      "total_hits": 5,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 4.7,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 54,
+      "hold_bars_sample_count": 5
+    },
+    "long|atr_ratio_strict+k_loose+macd_hist_turn_loose+rsi_mod_loose+vol_ratio_mod_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "k_loose",
+        "macd_hist_turn_loose",
+        "rsi_mod_loose",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            3
+          ]
+        },
+        {
+          "round_id": 39,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            27
+          ]
+        },
+        {
+          "round_id": 47,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 2,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            48,
+            27
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.386294,
+      "综合评分": 61.66,
+      "total_triggers": 4,
+      "total_hits": 4,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 3.76,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 27,
+      "hold_bars_sample_count": 4
+    },
+    "long|atr_ratio_loose+boll_pos_strict+consec_bear_strict+macd_hist_turn_loose+vol_ratio_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_loose",
+        "boll_pos_strict",
+        "consec_bear_strict",
+        "macd_hist_turn_loose",
+        "vol_ratio_loose"
+      ],
+      "history": [
+        {
+          "round_id": 47,
+          "hit_rate": 0.625,
+          "trigger_count": 8,
+          "hit_count": 5,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 1,
+              "rate": 0.333333
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 2,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            }
+          },
+          "hold_bars": [
+            29,
+            57,
+            6,
+            44,
+            27,
+            -1,
+            23,
+            -1
           ]
         }
       ],
@@ -515,14 +3888,143 @@
         "alert": false
       },
       "appear_rounds": 1,
+      "avg_rate": 0.625,
+      "rate_std": 0.0,
+      "stability_score": 0.433217,
+      "综合评分": 12.04,
+      "total_triggers": 8,
+      "total_hits": 5,
+      "overall_rate": 0.625,
+      "estimated_pnl_pct": 2.12,
+      "ev_per_trigger_pct": 0.265,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 3,
+          "total_hits": 1,
+          "avg_rate": 0.333333
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 3,
+          "total_hits": 2,
+          "avg_rate": 0.666667
+        }
+      },
+      "avg_hold_bars": 28,
+      "hold_bars_sample_count": 6
+    },
+    "long|boll_pos_loose+close_vs_ma5_mod_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "boll_pos_loose",
+        "close_vs_ma5_mod_strict"
+      ],
+      "history": [
+        {
+          "round_id": 12,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14
+          ]
+        },
+        {
+          "round_id": 15,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14
+          ]
+        },
+        {
+          "round_id": 22,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            5
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
       "avg_rate": 1.0,
       "rate_std": 0.0,
-      "stability_score": 0.693147,
-      "综合评分": 44.83,
-      "total_triggers": 1,
-      "total_hits": 1,
+      "stability_score": 1.386294,
+      "综合评分": 67.66,
+      "total_triggers": 3,
+      "total_hits": 3,
       "overall_rate": 1.0,
-      "estimated_pnl_pct": 0.94,
+      "estimated_pnl_pct": 2.82,
       "ev_per_trigger_pct": 0.94,
       "market_state_breakdown": {
         "多头趋势": {
@@ -531,9 +4033,9 @@
           "avg_rate": 0.0
         },
         "空头趋势": {
-          "total_triggers": 0,
-          "total_hits": 0,
-          "avg_rate": 0.0
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
         },
         "震荡市": {
           "total_triggers": 1,
@@ -541,15 +4043,15 @@
           "avg_rate": 1.0
         }
       },
-      "avg_hold_bars": 1,
-      "hold_bars_sample_count": 1
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 3
     },
-    "long|close_vs_ma5_mod_strict+rsi_loose": {
+    "long|close_vs_ma5_mod_strict+rsi_mod_loose": {
       "direction": "long",
       "pool_id": "pool2",
       "conditions": [
         "close_vs_ma5_mod_strict",
-        "rsi_loose"
+        "rsi_mod_loose"
       ],
       "history": [
         {
@@ -646,11 +4148,11 @@
       "avg_hold_bars": 14,
       "hold_bars_sample_count": 2
     },
-    "long|boll_pos_loose+close_vs_ma5_mod_strict": {
+    "long|boll_pos_mod_loose+close_vs_ma5_mod_strict": {
       "direction": "long",
       "pool_id": "pool2",
       "conditions": [
-        "boll_pos_loose",
+        "boll_pos_mod_loose",
         "close_vs_ma5_mod_strict"
       ],
       "history": [
@@ -747,6 +4249,135 @@
       },
       "avg_hold_bars": 14,
       "hold_bars_sample_count": 2
+    },
+    "long|close_vs_ma5_mod_strict+ma5_slope_dir_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "ma5_slope_dir_loose"
+      ],
+      "history": [
+        {
+          "round_id": 12,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14
+          ]
+        },
+        {
+          "round_id": 15,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14
+          ]
+        },
+        {
+          "round_id": 22,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            5
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 3,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.386294,
+      "综合评分": 67.66,
+      "total_triggers": 3,
+      "total_hits": 3,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 2.82,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 3
     },
     "long|close_vs_ma5_mod_strict+vol_ratio_loose": {
       "direction": "long",
@@ -952,184 +4583,31 @@
       "avg_hold_bars": 14,
       "hold_bars_sample_count": 2
     },
-    "short|close_vs_ma5_mod_loose+obv_trend_loose+vol_ratio_loose": {
-      "direction": "short",
-      "pool_id": "pool2",
-      "conditions": [
-        "close_vs_ma5_mod_loose",
-        "obv_trend_loose",
-        "vol_ratio_loose"
-      ],
-      "history": [
-        {
-          "round_id": 6,
-          "hit_rate": 1.0,
-          "trigger_count": 1,
-          "hit_count": 1,
-          "tier": "精品",
-          "market_state_breakdown": {
-            "多头趋势": {
-              "triggers": 1,
-              "hits": 1,
-              "rate": 1.0
-            },
-            "空头趋势": {
-              "triggers": 0,
-              "hits": 0,
-              "rate": 0.0
-            },
-            "震荡市": {
-              "triggers": 0,
-              "hits": 0,
-              "rate": 0.0
-            }
-          },
-          "hold_bars": [
-            9
-          ]
-        }
-      ],
-      "live_tracking": {
-        "total": 0,
-        "hits": 0,
-        "miss": 0,
-        "live_rate": 0.0,
-        "last_updated": "",
-        "streak_loss": 0,
-        "alert": false
-      },
-      "appear_rounds": 1,
-      "avg_rate": 1.0,
-      "rate_std": 0.0,
-      "stability_score": 0.693147,
-      "综合评分": 44.83,
-      "total_triggers": 1,
-      "total_hits": 1,
-      "overall_rate": 1.0,
-      "estimated_pnl_pct": 0.94,
-      "ev_per_trigger_pct": 0.94,
-      "market_state_breakdown": {
-        "多头趋势": {
-          "total_triggers": 1,
-          "total_hits": 1,
-          "avg_rate": 1.0
-        },
-        "空头趋势": {
-          "total_triggers": 0,
-          "total_hits": 0,
-          "avg_rate": 0.0
-        },
-        "震荡市": {
-          "total_triggers": 0,
-          "total_hits": 0,
-          "avg_rate": 0.0
-        }
-      },
-      "avg_hold_bars": 9,
-      "hold_bars_sample_count": 1
-    },
-    "short|atr_ratio_loose+close_vs_ma5_mod_loose+consec_bull_strict+obv_trend_loose": {
-      "direction": "short",
+    "long|atr_ratio_loose+close_vs_ma5_mod_strict+consec_bear_strict+k_strict": {
+      "direction": "long",
       "pool_id": "pool2",
       "conditions": [
         "atr_ratio_loose",
-        "close_vs_ma5_mod_loose",
-        "consec_bull_strict",
-        "obv_trend_loose"
+        "close_vs_ma5_mod_strict",
+        "consec_bear_strict",
+        "k_strict"
       ],
       "history": [
         {
-          "round_id": 6,
-          "hit_rate": 1.0,
-          "trigger_count": 1,
-          "hit_count": 1,
-          "tier": "精品",
-          "market_state_breakdown": {
-            "多头趋势": {
-              "triggers": 0,
-              "hits": 0,
-              "rate": 0.0
-            },
-            "空头趋势": {
-              "triggers": 1,
-              "hits": 1,
-              "rate": 1.0
-            },
-            "震荡市": {
-              "triggers": 0,
-              "hits": 0,
-              "rate": 0.0
-            }
-          },
-          "hold_bars": [
-            52
-          ]
-        }
-      ],
-      "live_tracking": {
-        "total": 0,
-        "hits": 0,
-        "miss": 0,
-        "live_rate": 0.0,
-        "last_updated": "",
-        "streak_loss": 0,
-        "alert": false
-      },
-      "appear_rounds": 1,
-      "avg_rate": 1.0,
-      "rate_std": 0.0,
-      "stability_score": 0.693147,
-      "综合评分": 41.83,
-      "total_triggers": 1,
-      "total_hits": 1,
-      "overall_rate": 1.0,
-      "estimated_pnl_pct": 0.94,
-      "ev_per_trigger_pct": 0.94,
-      "market_state_breakdown": {
-        "多头趋势": {
-          "total_triggers": 0,
-          "total_hits": 0,
-          "avg_rate": 0.0
-        },
-        "空头趋势": {
-          "total_triggers": 1,
-          "total_hits": 1,
-          "avg_rate": 1.0
-        },
-        "震荡市": {
-          "total_triggers": 0,
-          "total_hits": 0,
-          "avg_rate": 0.0
-        }
-      },
-      "avg_hold_bars": 52,
-      "hold_bars_sample_count": 1
-    },
-    "short|atr_ratio_loose+close_vs_ma5_mod_loose+obv_trend_loose+vol_ratio_mod_loose": {
-      "direction": "short",
-      "pool_id": "pool2",
-      "conditions": [
-        "atr_ratio_loose",
-        "close_vs_ma5_mod_loose",
-        "obv_trend_loose",
-        "vol_ratio_mod_loose"
-      ],
-      "history": [
-        {
-          "round_id": 6,
+          "round_id": 17,
           "hit_rate": 1.0,
           "trigger_count": 2,
           "hit_count": 2,
           "tier": "精品",
           "market_state_breakdown": {
             "多头趋势": {
-              "triggers": 1,
-              "hits": 1,
-              "rate": 1.0
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
             },
             "空头趋势": {
-              "triggers": 1,
-              "hits": 1,
+              "triggers": 2,
+              "hits": 2,
               "rate": 1.0
             },
             "震荡市": {
@@ -1139,8 +4617,36 @@
             }
           },
           "hold_bars": [
-            52,
-            9
+            0,
+            0
+          ]
+        },
+        {
+          "round_id": 21,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 2,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            0,
+            0
           ]
         }
       ],
@@ -1153,25 +4659,25 @@
         "streak_loss": 0,
         "alert": false
       },
-      "appear_rounds": 1,
+      "appear_rounds": 2,
       "avg_rate": 1.0,
       "rate_std": 0.0,
-      "stability_score": 0.693147,
-      "综合评分": 41.83,
-      "total_triggers": 2,
-      "total_hits": 2,
+      "stability_score": 1.098612,
+      "综合评分": 53.83,
+      "total_triggers": 4,
+      "total_hits": 4,
       "overall_rate": 1.0,
-      "estimated_pnl_pct": 1.88,
+      "estimated_pnl_pct": 3.76,
       "ev_per_trigger_pct": 0.94,
       "market_state_breakdown": {
         "多头趋势": {
-          "total_triggers": 1,
-          "total_hits": 1,
-          "avg_rate": 1.0
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
         },
         "空头趋势": {
-          "total_triggers": 1,
-          "total_hits": 1,
+          "total_triggers": 4,
+          "total_hits": 4,
           "avg_rate": 1.0
         },
         "震荡市": {
@@ -1180,35 +4686,36 @@
           "avg_rate": 0.0
         }
       },
-      "avg_hold_bars": 30,
-      "hold_bars_sample_count": 2
+      "avg_hold_bars": 0,
+      "hold_bars_sample_count": 4
     },
-    "short|boll_pos_mod_loose+close_vs_ma5_mod_loose+obv_trend_loose+vol_ratio_mod_loose": {
-      "direction": "short",
+    "long|atr_ratio_loose+close_vs_ma5_mod_strict+consec_bear_strict+j_loose+rsi_strict": {
+      "direction": "long",
       "pool_id": "pool2",
       "conditions": [
-        "boll_pos_mod_loose",
-        "close_vs_ma5_mod_loose",
-        "obv_trend_loose",
-        "vol_ratio_mod_loose"
+        "atr_ratio_loose",
+        "close_vs_ma5_mod_strict",
+        "consec_bear_strict",
+        "j_loose",
+        "rsi_strict"
       ],
       "history": [
         {
-          "round_id": 6,
-          "hit_rate": 1.0,
-          "trigger_count": 1,
-          "hit_count": 1,
+          "round_id": 17,
+          "hit_rate": 0.75,
+          "trigger_count": 4,
+          "hit_count": 3,
           "tier": "精品",
           "market_state_breakdown": {
             "多头趋势": {
-              "triggers": 1,
-              "hits": 1,
-              "rate": 1.0
-            },
-            "空头趋势": {
               "triggers": 0,
               "hits": 0,
               "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 4,
+              "hits": 3,
+              "rate": 0.75
             },
             "震荡市": {
               "triggers": 0,
@@ -1217,7 +4724,118 @@
             }
           },
           "hold_bars": [
-            9
+            14,
+            4,
+            0,
+            0
+          ]
+        },
+        {
+          "round_id": 21,
+          "hit_rate": 0.75,
+          "trigger_count": 4,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 4,
+              "hits": 3,
+              "rate": 0.75
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14,
+            4,
+            0,
+            0
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 0.75,
+      "rate_std": 0.0,
+      "stability_score": 0.823959,
+      "综合评分": 50.83,
+      "total_triggers": 8,
+      "total_hits": 6,
+      "overall_rate": 0.75,
+      "estimated_pnl_pct": 3.92,
+      "ev_per_trigger_pct": 0.49,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 8,
+          "total_hits": 6,
+          "avg_rate": 0.75
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 2,
+      "hold_bars_sample_count": 8
+    },
+    "long|atr_ratio_loose+boll_pos_mod_loose+macd_hist_turn_strict+rsi_loose+vol_ratio_mod_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_loose",
+        "boll_pos_mod_loose",
+        "macd_hist_turn_strict",
+        "rsi_loose",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 28,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            37
           ]
         }
       ],
@@ -1234,7 +4852,7 @@
       "avg_rate": 1.0,
       "rate_std": 0.0,
       "stability_score": 0.693147,
-      "综合评分": 41.83,
+      "综合评分": 38.83,
       "total_triggers": 1,
       "total_hits": 1,
       "overall_rate": 1.0,
@@ -1242,14 +4860,14 @@
       "ev_per_trigger_pct": 0.94,
       "market_state_breakdown": {
         "多头趋势": {
-          "total_triggers": 1,
-          "total_hits": 1,
-          "avg_rate": 1.0
-        },
-        "空头趋势": {
           "total_triggers": 0,
           "total_hits": 0,
           "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
         },
         "震荡市": {
           "total_triggers": 0,
@@ -1257,20 +4875,101 @@
           "avg_rate": 0.0
         }
       },
-      "avg_hold_bars": 9,
+      "avg_hold_bars": 37,
       "hold_bars_sample_count": 1
     },
-    "long|close_vs_ma5_mod_loose+consec_bear_strict+macd_hist_turn_loose": {
+    "long|atr_ratio_loose+j_loose+k_strict+obv_trend_loose+vol_ratio_strict": {
       "direction": "long",
       "pool_id": "pool2",
       "conditions": [
-        "close_vs_ma5_mod_loose",
-        "consec_bear_strict",
-        "macd_hist_turn_loose"
+        "atr_ratio_loose",
+        "j_loose",
+        "k_strict",
+        "obv_trend_loose",
+        "vol_ratio_strict"
       ],
       "history": [
         {
-          "round_id": 11,
+          "round_id": 34,
+          "hit_rate": 0.6,
+          "trigger_count": 5,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 4,
+              "hits": 2,
+              "rate": 0.5
+            }
+          },
+          "hold_bars": [
+            -1,
+            30,
+            43,
+            51,
+            43
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.6,
+      "rate_std": 0.0,
+      "stability_score": 0.415888,
+      "综合评分": 8.83,
+      "total_triggers": 5,
+      "total_hits": 3,
+      "overall_rate": 0.6,
+      "estimated_pnl_pct": 1.1,
+      "ev_per_trigger_pct": 0.22,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 4,
+          "total_hits": 2,
+          "avg_rate": 0.5
+        }
+      },
+      "avg_hold_bars": 43,
+      "hold_bars_sample_count": 4
+    },
+    "long|close_vs_ma5_mod_strict+vol_ratio_mod_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 12,
           "hit_rate": 1.0,
           "trigger_count": 1,
           "hit_count": 1,
@@ -1282,22 +4981,22 @@
               "rate": 0.0
             },
             "空头趋势": {
-              "triggers": 0,
-              "hits": 0,
-              "rate": 0.0
-            },
-            "震荡市": {
               "triggers": 1,
               "hits": 1,
               "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
             }
           },
           "hold_bars": [
-            23
+            14
           ]
         },
         {
-          "round_id": 14,
+          "round_id": 15,
           "hit_rate": 1.0,
           "trigger_count": 1,
           "hit_count": 1,
@@ -1309,18 +5008,18 @@
               "rate": 0.0
             },
             "空头趋势": {
-              "triggers": 0,
-              "hits": 0,
-              "rate": 0.0
-            },
-            "震荡市": {
               "triggers": 1,
               "hits": 1,
               "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
             }
           },
           "hold_bars": [
-            23
+            14
           ]
         }
       ],
@@ -1350,17 +5049,1412 @@
           "avg_rate": 0.0
         },
         "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 2,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 14,
+      "hold_bars_sample_count": 2
+    },
+    "long|atr_ratio_strict+close_vs_ma5_mod_strict+consec_bear_strict+rsi_strict+vol_ratio_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "close_vs_ma5_mod_strict",
+        "consec_bear_strict",
+        "rsi_strict",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 17,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 2,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14,
+            4
+          ]
+        },
+        {
+          "round_id": 21,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 2,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            14,
+            4
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 2,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 1.098612,
+      "综合评分": 50.83,
+      "total_triggers": 4,
+      "total_hits": 4,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 3.76,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 4,
+          "total_hits": 4,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 9,
+      "hold_bars_sample_count": 4
+    },
+    "long|atr_ratio_strict+consec_bear_loose+k_strict+lower_shd_strict+vol_ratio_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "consec_bear_loose",
+        "k_strict",
+        "lower_shd_strict",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 26,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 1,
+              "rate": 0.5
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            23,
+            -1,
+            24
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 20.97,
+      "total_triggers": 3,
+      "total_hits": 2,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 1.02,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 1,
+          "avg_rate": 0.5
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 24,
+      "hold_bars_sample_count": 2
+    },
+    "long|close_vs_ma5_mod_loose+lower_shd_loose+rsi_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_loose",
+        "lower_shd_loose",
+        "rsi_strict"
+      ],
+      "history": [
+        {
+          "round_id": 19,
+          "hit_rate": 0.6,
+          "trigger_count": 10,
+          "hit_count": 6,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 10,
+              "hits": 6,
+              "rate": 0.6
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            3,
+            7,
+            11,
+            9,
+            0,
+            1,
+            1,
+            1,
+            13,
+            -1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.6,
+      "rate_std": 0.0,
+      "stability_score": 0.415888,
+      "综合评分": 14.83,
+      "total_triggers": 10,
+      "total_hits": 6,
+      "overall_rate": 0.6,
+      "estimated_pnl_pct": 2.2,
+      "ev_per_trigger_pct": 0.22,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 10,
+          "total_hits": 6,
+          "avg_rate": 0.6
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 3,
+      "hold_bars_sample_count": 9
+    },
+    "long|close_vs_ma5_mod_loose+j_loose+lower_shd_strict+vol_ratio_mod_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_loose",
+        "j_loose",
+        "lower_shd_strict",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 20,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 1,
+              "rate": 0.5
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            24,
+            1,
+            0
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 23.97,
+      "total_triggers": 3,
+      "total_hits": 2,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 1.02,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 1,
+          "avg_rate": 0.5
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 1,
+      "hold_bars_sample_count": 3
+    },
+    "long|j_loose+lower_shd_strict+obv_trend_loose+rsi_mod_loose+vol_ratio_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "j_loose",
+        "lower_shd_strict",
+        "obv_trend_loose",
+        "rsi_mod_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 6,
+          "hit_count": 4,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 3,
+              "hits": 1,
+              "rate": 0.333333
+            },
+            "震荡市": {
+              "triggers": 3,
+              "hits": 3,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            30,
+            43,
+            53,
+            -1,
+            51,
+            -1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 20.97,
+      "total_triggers": 6,
+      "total_hits": 4,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 2.04,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 3,
+          "total_hits": 1,
+          "avg_rate": 0.333333
+        },
+        "震荡市": {
+          "total_triggers": 3,
+          "total_hits": 3,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 47,
+      "hold_bars_sample_count": 4
+    },
+    "long|boll_pos_mod_loose+j_loose+lower_shd_strict+obv_trend_loose+vol_ratio_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "boll_pos_mod_loose",
+        "j_loose",
+        "lower_shd_strict",
+        "obv_trend_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 0.625,
+          "trigger_count": 8,
+          "hit_count": 5,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 3,
+              "hits": 1,
+              "rate": 0.333333
+            },
+            "震荡市": {
+              "triggers": 5,
+              "hits": 4,
+              "rate": 0.8
+            }
+          },
+          "hold_bars": [
+            30,
+            43,
+            43,
+            53,
+            -1,
+            -1,
+            51,
+            -1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.625,
+      "rate_std": 0.0,
+      "stability_score": 0.433217,
+      "综合评分": 12.04,
+      "total_triggers": 8,
+      "total_hits": 5,
+      "overall_rate": 0.625,
+      "estimated_pnl_pct": 2.12,
+      "ev_per_trigger_pct": 0.265,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 3,
+          "total_hits": 1,
+          "avg_rate": 0.333333
+        },
+        "震荡市": {
+          "total_triggers": 5,
+          "total_hits": 4,
+          "avg_rate": 0.8
+        }
+      },
+      "avg_hold_bars": 43,
+      "hold_bars_sample_count": 5
+    },
+    "long|close_vs_ma5_mod_strict+k_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "close_vs_ma5_mod_strict",
+        "k_loose"
+      ],
+      "history": [
+        {
+          "round_id": 22,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            5
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 44.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
           "total_triggers": 0,
           "total_hits": 0,
           "avg_rate": 0.0
         },
         "震荡市": {
-          "total_triggers": 2,
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 5,
+      "hold_bars_sample_count": 1
+    },
+    "long|atr_ratio_strict+consec_bear_loose+j_strict+k_loose+lower_shd_loose": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "consec_bear_loose",
+        "j_strict",
+        "k_loose",
+        "lower_shd_loose"
+      ],
+      "history": [
+        {
+          "round_id": 26,
+          "hit_rate": 0.625,
+          "trigger_count": 8,
+          "hit_count": 5,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 7,
+              "hits": 4,
+              "rate": 0.571429
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            23,
+            14,
+            -1,
+            -1,
+            25,
+            16,
+            0,
+            24
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.625,
+      "rate_std": 0.0,
+      "stability_score": 0.433217,
+      "综合评分": 12.04,
+      "total_triggers": 8,
+      "total_hits": 5,
+      "overall_rate": 0.625,
+      "estimated_pnl_pct": 2.12,
+      "ev_per_trigger_pct": 0.265,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 7,
+          "total_hits": 4,
+          "avg_rate": 0.571429
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 20,
+      "hold_bars_sample_count": 6
+    },
+    "long|atr_ratio_strict+consec_bear_loose+j_strict+lower_shd_strict+vol_ratio_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "consec_bear_loose",
+        "j_strict",
+        "lower_shd_strict",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 26,
+          "hit_rate": 0.75,
+          "trigger_count": 4,
+          "hit_count": 3,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            23,
+            14,
+            -1,
+            24
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.75,
+      "rate_std": 0.0,
+      "stability_score": 0.51986,
+      "综合评分": 38.83,
+      "total_triggers": 4,
+      "total_hits": 3,
+      "overall_rate": 0.75,
+      "estimated_pnl_pct": 1.96,
+      "ev_per_trigger_pct": 0.49,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 3,
           "total_hits": 2,
+          "avg_rate": 0.666667
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
           "avg_rate": 1.0
         }
       },
       "avg_hold_bars": 23,
+      "hold_bars_sample_count": 3
+    },
+    "long|j_strict+lower_shd_loose+obv_trend_loose+rsi_mod_loose+vol_ratio_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "j_strict",
+        "lower_shd_loose",
+        "obv_trend_loose",
+        "rsi_mod_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 1.0,
+          "trigger_count": 2,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            30,
+            43
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 38.83,
+      "total_triggers": 2,
+      "total_hits": 2,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 1.88,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 36,
+      "hold_bars_sample_count": 2
+    },
+    "long|atr_ratio_strict+consec_bear_loose+j_strict+lower_shd_loose+vol_ratio_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "consec_bear_loose",
+        "j_strict",
+        "lower_shd_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 26,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 6,
+          "hit_count": 4,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 5,
+              "hits": 3,
+              "rate": 0.6
+            },
+            "震荡市": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            }
+          },
+          "hold_bars": [
+            23,
+            14,
+            -1,
+            16,
+            0,
+            24
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 20.97,
+      "total_triggers": 6,
+      "total_hits": 4,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 2.04,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 5,
+          "total_hits": 3,
+          "avg_rate": 0.6
+        },
+        "震荡市": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        }
+      },
+      "avg_hold_bars": 16,
+      "hold_bars_sample_count": 5
+    },
+    "long|boll_pos_mod_loose+j_strict+lower_shd_loose+obv_trend_loose+vol_ratio_strict": {
+      "direction": "long",
+      "pool_id": "pool2",
+      "conditions": [
+        "boll_pos_mod_loose",
+        "j_strict",
+        "lower_shd_loose",
+        "obv_trend_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 34,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 2,
+              "hits": 1,
+              "rate": 0.5
+            }
+          },
+          "hold_bars": [
+            30,
+            43,
+            -1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 20.97,
+      "total_triggers": 3,
+      "total_hits": 2,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 1.02,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 2,
+          "total_hits": 1,
+          "avg_rate": 0.5
+        }
+      },
+      "avg_hold_bars": 36,
+      "hold_bars_sample_count": 2
+    },
+    "short|atr_ratio_strict+k_strict+upper_shd_strict+vol_ratio_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "k_strict",
+        "upper_shd_strict",
+        "vol_ratio_loose"
+      ],
+      "history": [
+        {
+          "round_id": 37,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            5,
+            17,
+            0
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 41.83,
+      "total_triggers": 3,
+      "total_hits": 2,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 1.02,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 3,
+          "total_hits": 2,
+          "avg_rate": 0.666667
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 5,
+      "hold_bars_sample_count": 3
+    },
+    "short|atr_ratio_strict+k_strict+upper_shd_strict+vol_ratio_mod_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "k_strict",
+        "upper_shd_strict",
+        "vol_ratio_mod_loose"
+      ],
+      "history": [
+        {
+          "round_id": 37,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 3,
+              "hits": 2,
+              "rate": 0.666667
+            },
+            "空头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            5,
+            17,
+            0
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 41.83,
+      "total_triggers": 3,
+      "total_hits": 2,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 1.02,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 3,
+          "total_hits": 2,
+          "avg_rate": 0.666667
+        },
+        "空头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 5,
+      "hold_bars_sample_count": 3
+    },
+    "short|atr_ratio_strict+boll_pos_strict+consec_bull_loose+obv_trend_loose+vol_ratio_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "boll_pos_strict",
+        "consec_bull_loose",
+        "obv_trend_loose",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 44,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            45
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 38.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 45,
+      "hold_bars_sample_count": 1
+    },
+    "short|atr_ratio_strict+consec_bull_loose+obv_trend_loose+rsi_mod_strict+vol_ratio_strict": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "atr_ratio_strict",
+        "consec_bull_loose",
+        "obv_trend_loose",
+        "rsi_mod_strict",
+        "vol_ratio_strict"
+      ],
+      "history": [
+        {
+          "round_id": 44,
+          "hit_rate": 1.0,
+          "trigger_count": 1,
+          "hit_count": 1,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            },
+            "空头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            45
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 1.0,
+      "rate_std": 0.0,
+      "stability_score": 0.693147,
+      "综合评分": 38.83,
+      "total_triggers": 1,
+      "total_hits": 1,
+      "overall_rate": 1.0,
+      "estimated_pnl_pct": 0.94,
+      "ev_per_trigger_pct": 0.94,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        },
+        "空头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 45,
+      "hold_bars_sample_count": 1
+    },
+    "short|boll_pos_mod_loose+macd_hist_turn_strict+rsi_loose+vol_ratio_loose": {
+      "direction": "short",
+      "pool_id": "pool2",
+      "conditions": [
+        "boll_pos_mod_loose",
+        "macd_hist_turn_strict",
+        "rsi_loose",
+        "vol_ratio_loose"
+      ],
+      "history": [
+        {
+          "round_id": 42,
+          "hit_rate": 0.6666666666666666,
+          "trigger_count": 3,
+          "hit_count": 2,
+          "tier": "精品",
+          "market_state_breakdown": {
+            "多头趋势": {
+              "triggers": 1,
+              "hits": 1,
+              "rate": 1.0
+            },
+            "空头趋势": {
+              "triggers": 2,
+              "hits": 1,
+              "rate": 0.5
+            },
+            "震荡市": {
+              "triggers": 0,
+              "hits": 0,
+              "rate": 0.0
+            }
+          },
+          "hold_bars": [
+            27,
+            58,
+            -1
+          ]
+        }
+      ],
+      "live_tracking": {
+        "total": 0,
+        "hits": 0,
+        "miss": 0,
+        "live_rate": 0.0,
+        "last_updated": "",
+        "streak_loss": 0,
+        "alert": false
+      },
+      "appear_rounds": 1,
+      "avg_rate": 0.666667,
+      "rate_std": 0.0,
+      "stability_score": 0.462098,
+      "综合评分": 41.83,
+      "total_triggers": 3,
+      "total_hits": 2,
+      "overall_rate": 0.666667,
+      "estimated_pnl_pct": 1.02,
+      "ev_per_trigger_pct": 0.34,
+      "market_state_breakdown": {
+        "多头趋势": {
+          "total_triggers": 1,
+          "total_hits": 1,
+          "avg_rate": 1.0
+        },
+        "空头趋势": {
+          "total_triggers": 2,
+          "total_hits": 1,
+          "avg_rate": 0.5
+        },
+        "震荡市": {
+          "total_triggers": 0,
+          "total_hits": 0,
+          "avg_rate": 0.0
+        }
+      },
+      "avg_hold_bars": 42,
       "hold_bars_sample_count": 2
     }
   }

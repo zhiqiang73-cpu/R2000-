@@ -2074,11 +2074,12 @@ class BinanceTestnetTrader:
     def get_pending_entry_orders_snapshot(self, current_bar_idx: int = None) -> List[dict]:
         """获取委托单快照（优先使用短TTL缓存，避免UI高频刷新打爆API）"""
         snapshots: List[dict] = []
+        open_orders: List[dict] = []
         try:
             open_orders = self._get_open_orders_cached(source="get_pending_entry_orders_snapshot")
         except Exception as e:
             print(f"[BinanceTrader] ⚠ 拉取委托单失败: {e}")
-            return snapshots
+            open_orders = []
 
         pos = self.current_position
         for o in open_orders:
@@ -2143,6 +2144,69 @@ class BinanceTestnetTrader:
                     "status": f"🎯{lbl}" if is_tp else f"🛡️{lbl}",
                     "entry_price": pos.entry_price if pos else None,
                     "order_type": "tp" if is_tp else "sl",
+                })
+
+        # 兜底1：API短时失败或缓存未刷新时，至少显示本地记录的入场挂单
+        existing_client_ids = {str(s.get("client_id", "")) for s in snapshots}
+        for local in self._entry_stop_orders:
+            cid = str(local.get("client_id", ""))
+            if cid and cid in existing_client_ids:
+                continue
+            expire_bar = int(local.get("expire_bar", -1) or -1)
+            remaining_bars = None
+            if current_bar_idx is not None and expire_bar >= 0:
+                remaining_bars = max(0, expire_bar - int(current_bar_idx))
+            snapshots.append({
+                "order_id": local.get("order_id", 0),
+                "client_id": cid,
+                "side": local.get("side", ""),
+                "trigger_price": float(local.get("trigger_price", 0.0) or 0.0),
+                "quantity": float(local.get("quantity", 0.0) or 0.0),
+                "start_bar": int(local.get("start_bar", -1) or -1),
+                "expire_bar": expire_bar,
+                "remaining_bars": remaining_bars,
+                "template_fingerprint": local.get("template_fingerprint", "-") or "-",
+                "entry_similarity": float(local.get("entry_similarity", 0.0) or 0.0),
+                "status": "入场挂单",
+                "take_profit": local.get("take_profit"),
+                "stop_loss": local.get("stop_loss"),
+            })
+
+        # 兜底2：若交易所保护单短时未回读到，仍显示持仓自带 TP/SL 保护信息，避免 UI 看起来“无挂单”
+        has_protection_row = any((s.get("order_type") in ("tp", "sl")) for s in snapshots)
+        if (not has_protection_row) and pos is not None:
+            exit_side = "BUY" if pos.side == OrderSide.SHORT else "SELL"
+            if pos.stop_loss is not None:
+                snapshots.append({
+                    "order_id": f"LOCAL_SL_{pos.order_id}",
+                    "client_id": "R3000_LOCAL_SL",
+                    "side": exit_side,
+                    "trigger_price": float(pos.stop_loss),
+                    "quantity": float(pos.quantity),
+                    "start_bar": -1,
+                    "expire_bar": -1,
+                    "remaining_bars": None,
+                    "template_fingerprint": "止损保护",
+                    "entry_similarity": 0.0,
+                    "status": "🛡️止损(本地回填)",
+                    "entry_price": float(pos.entry_price),
+                    "order_type": "sl",
+                })
+            if pos.take_profit is not None:
+                snapshots.append({
+                    "order_id": f"LOCAL_TP_{pos.order_id}",
+                    "client_id": "R3000_LOCAL_TP",
+                    "side": exit_side,
+                    "trigger_price": float(pos.take_profit),
+                    "quantity": float(pos.quantity),
+                    "start_bar": -1,
+                    "expire_bar": -1,
+                    "remaining_bars": None,
+                    "template_fingerprint": "止盈保护",
+                    "entry_similarity": 0.0,
+                    "status": "🎯止盈(本地回填)",
+                    "entry_price": float(pos.entry_price),
+                    "order_type": "tp",
                 })
         return snapshots
 

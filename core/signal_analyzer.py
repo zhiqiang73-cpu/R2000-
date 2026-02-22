@@ -476,8 +476,15 @@ def analyze(
                                                    min_atr_ratio=min_atr_ratio,
                                                    max_atr_sl_mult=max_atr_sl_mult)
 
+    # ── 随机基准命中率（null hypothesis）── ─────────────────────────────────
+    # 在可入场的 bar 上无条件统计 TP 先触发的比例，作为多重检验对照基准
+    _enterable_mask = (hold_bars_arr >= 0)  # 排除超时和ATR门控跳过的 bar
+    _n_enterable = int(_enterable_mask.sum())
+    _n_hits_all  = int(outcome[_enterable_mask].sum()) if _n_enterable > 0 else 0
+    _random_baseline = _n_hits_all / _n_enterable if _n_enterable > 0 else 0.0
+
     if progress_cb:
-        progress_cb(5, "正在构建条件数组...")
+        progress_cb(5, f"随机基准命中率 {_random_baseline:.1%}（{_n_hits_all}/{_n_enterable}），正在构建条件数组...")
 
     # ── 3. 策略2：构建 30 个条件 bool 数组 ──────────────────────────────────
     all_conds = _build_condition_arrays(df, direction)
@@ -576,6 +583,8 @@ def analyze(
                         indices, outcome, market_state_arr
                     ),
                     'hold_bars':              hold_bars,
+                    'random_baseline':        _random_baseline,
+                    'edge_over_random':       round(hit_rate - _random_baseline, 6),
                 })
 
             if processed % report_gap == 0 and progress_cb:
@@ -673,7 +682,7 @@ def analyze(
               for t in ('候选', '优质', '精品')}
         progress_cb(
             100,
-            f"分析完成：候选 {tc['候选']} / 优质 {tc['优质']} / 精品 {tc['精品']}"
+            f"分析完成：候选 {tc['候选']} / 优质 {tc['优质']} / 精品 {tc['精品']}  |  随机基准 {_random_baseline:.1%}"
         )
 
     return results

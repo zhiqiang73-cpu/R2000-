@@ -243,7 +243,6 @@ def _make_table(headers: List[str]) -> QtWidgets.QTableWidget:
     tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
     tbl.setAlternatingRowColors(True)
     tbl.verticalHeader().setVisible(False)
-    tbl.horizontalHeader().setStretchLastSection(False)
     tbl.setShowGrid(False)
     tbl.setStyleSheet(f"""
         QTableWidget {{
@@ -271,9 +270,39 @@ def _make_table(headers: List[str]) -> QtWidgets.QTableWidget:
             color: {TEXT_PRIMARY};
         }}
     """)
-    tbl.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+    hdr = tbl.horizontalHeader()
+    hdr.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+    hdr.setStretchLastSection(True)   # 最后一列自动填满剩余宽度，避免横向滚动
     tbl.setSortingEnabled(True)
     return tbl
+
+
+def _set_cumul_col_widths(tbl: QtWidgets.QTableWidget) -> None:
+    """为累计结果表设置紧凑固定宽度的列，避免窄列浪费空间。"""
+    hdr = tbl.horizontalHeader()
+    RM = QtWidgets.QHeaderView.ResizeMode
+    # 极短列固定宽度
+    _fixed: dict[int, int] = {
+        0:  30,   # #
+        1:  44,   # 方向
+        2:  44,   # 层级
+        3:  60,   # 出现轮次
+        4:  60,   # 累计触发
+        5:  60,   # 累计命中
+        6:  72,   # 综合命中率
+        7:  72,   # 平均命中率
+        8:  48,   # 波动
+        9:  60,   # 综合评分
+        10: 110,  # 随机基准（含超越幅度）
+        11: 90,   # 各状态命中率
+        12: 72,   # 估算总盈亏
+        13: 58,   # 单次EV
+        14: 56,   # 平均持仓
+        # 15 条件组合 → Stretch（由 setStretchLastSection 控制，不设固定宽度）
+    }
+    for col, width in _fixed.items():
+        hdr.setSectionResizeMode(col, RM.Fixed)
+        tbl.setColumnWidth(col, width)
 
 
 class _SortableItem(QtWidgets.QTableWidgetItem):
@@ -566,54 +595,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         exclude_row.addWidget(lbl_max_hold)
         exclude_row.addWidget(self._spn_max_hold)
 
-        # ATR 区间 SpinBox（下限 / 上限倍数）
-        _spn_style = f"""
-            QDoubleSpinBox {{
-                background-color: {BG_CARD};
-                color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR};
-                border-radius: 3px;
-                padding: 2px 4px;
-                font-size: 11px;
-            }}
-            QDoubleSpinBox:hover {{ border-color: {ACCENT_CYAN}; }}
-            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
-                background-color: {BG_PANEL}; border: none; width: 14px;
-            }}
-            QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{
-                background-color: {ACCENT_CYAN};
-            }}
-        """
-        lbl_atr_min = QtWidgets.QLabel("ATR下限%:")
-        lbl_atr_min.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
-        self._spn_atr_min = QtWidgets.QDoubleSpinBox()
-        self._spn_atr_min.setRange(0.01, 0.50)
-        self._spn_atr_min.setSingleStep(0.01)
-        self._spn_atr_min.setDecimals(3)
-        self._spn_atr_min.setValue(float(_sig_settings.get("min_atr_ratio_pct", 0.04)))
-        self._spn_atr_min.setFixedWidth(72)
-        self._spn_atr_min.setFixedHeight(24)
-        self._spn_atr_min.setToolTip("ATR/价格 低于此值(%)时视为低波动，跳过该bar（默认 0.04%）")
-        self._spn_atr_min.setStyleSheet(_spn_style)
-        self._spn_atr_min.valueChanged.connect(self._on_exclude_changed)
-
-        lbl_atr_max = QtWidgets.QLabel("ATR上限(×SL):")
-        lbl_atr_max.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
-        self._spn_atr_max = QtWidgets.QDoubleSpinBox()
-        self._spn_atr_max.setRange(0.30, 2.00)
-        self._spn_atr_max.setSingleStep(0.05)
-        self._spn_atr_max.setDecimals(2)
-        self._spn_atr_max.setValue(float(_sig_settings.get("max_atr_sl_mult", 1.50)))
-        self._spn_atr_max.setFixedWidth(72)
-        self._spn_atr_max.setFixedHeight(24)
-        self._spn_atr_max.setToolTip("ATR/价格 超过 SL距离×此倍数时视为高波动，跳过该bar（默认 1.50）")
-        self._spn_atr_max.setStyleSheet(_spn_style)
-        self._spn_atr_max.valueChanged.connect(self._on_exclude_changed)
-
-        exclude_row.addWidget(lbl_atr_min)
-        exclude_row.addWidget(self._spn_atr_min)
-        exclude_row.addWidget(lbl_atr_max)
-        exclude_row.addWidget(self._spn_atr_max)
         exclude_row.addStretch()
 
         exclude_frame = QtWidgets.QFrame()
@@ -944,8 +925,9 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._cumul_table_p1 = _make_table([
             "#", "方向", "层级", "出现轮次", "累计触发", "累计命中",
             "综合命中率", "平均命中率", "波动", "综合评分",
-            "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
+            "随机基准", "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
         ])
+        _set_cumul_col_widths(self._cumul_table_p1)
         p1_layout.addWidget(self._cumul_table_p1)
         cumul_splitter.addWidget(p1_box)
 
@@ -958,8 +940,9 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._cumul_table_p2 = _make_table([
             "#", "方向", "层级", "出现轮次", "累计触发", "累计命中",
             "综合命中率", "平均命中率", "波动", "综合评分",
-            "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
+            "随机基准", "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
         ])
+        _set_cumul_col_widths(self._cumul_table_p2)
         p2_layout.addWidget(self._cumul_table_p2)
         cumul_splitter.addWidget(p2_box)
 
@@ -1194,8 +1177,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         _settings["exclude_ma5_slope"] = self._chk_exclude_ma5_slope.isChecked()
         _settings["validation_split_enabled"] = self._chk_validation_split.isChecked()
         _settings["max_hold"] = self._spn_max_hold.value()
-        _settings["min_atr_ratio_pct"] = self._spn_atr_min.value()
-        _settings["max_atr_sl_mult"] = self._spn_atr_max.value()
         _save_signal_settings(_settings)
 
     def _on_filter_changed(self):
@@ -1210,8 +1191,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         state['exclude_ma5_slope'] = self._chk_exclude_ma5_slope.isChecked()
         state['validation_split_enabled'] = self._chk_validation_split.isChecked()
         state['max_hold'] = self._spn_max_hold.value()
-        state['min_atr_ratio_pct'] = self._spn_atr_min.value()
-        state['max_atr_sl_mult'] = self._spn_atr_max.value()
         if hasattr(self, "_cmb_regime_filter"):
             state['regime_filter'] = self._cmb_regime_filter.currentText()
         _save_signal_settings(state)
@@ -1304,8 +1283,6 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             excluded_families=excluded_families,
             validation_split=validation_split,
             max_hold=self._spn_max_hold.value(),
-            min_atr_ratio=self._spn_atr_min.value() / 100.0,
-            max_atr_sl_mult=self._spn_atr_max.value(),
         )
         self._worker.moveToThread(self._thread)
 
@@ -1485,6 +1462,23 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                 tier_str   = _tier_from_rate(overall_rate, direction_val, pool_id=pool_id)
                 tier_color = _tier_color(tier_str) if tier_str else TEXT_DIM
 
+                # 随机基准 & 超越随机幅度（edge_over_random）
+                avg_rb = c.get("avg_random_baseline", 0.0) or 0.0
+                if avg_rb > 0.0:
+                    edge = overall_rate - avg_rb
+                    edge_sign = "+" if edge >= 0 else ""
+                    rb_tip = f"随机基准 {avg_rb:.1%}，策略超越随机 {edge_sign}{edge:.1%}"
+                    # 颜色：超越10%+绿，5-10%黄，<5%橙红
+                    if edge >= 0.10:
+                        rb_color = "#4caf50"
+                    elif edge >= 0.05:
+                        rb_color = ACCENT_GOLD
+                    else:
+                        rb_color = "#ff7043"
+                    rb_str = f"{avg_rb:.1%}（{edge_sign}{edge:.0%}）"
+                else:
+                    rb_str, rb_color, rb_tip = "-", TEXT_DIM, "暂无随机基准（需重新分析以生成）"
+
                 _set_item(tbl, row,  0, str(seq), TEXT_DIM)
                 _set_item(tbl, row,  1, dir_str, dir_color, bold=True)
                 _set_item(tbl, row,  2, tier_str or "--", tier_color, bold=bool(tier_str))
@@ -1500,10 +1494,12 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                 _set_item(tbl, row,  8, f"{rate_std:.3f}", TEXT_DIM, sort_value=rate_std)
                 _set_item(tbl, row,  9, f"{score:.1f}", score_color, bold=True,
                           sort_value=score)
-                _set_item(tbl, row, 10, dom_state, TEXT_DIM)
-                _set_item(tbl, row, 11, pnl_str, pnl_color, bold=(pnl_pct != 0),
+                _set_item(tbl, row, 10, rb_str, rb_color,
+                          sort_value=avg_rb, tooltip=rb_tip)
+                _set_item(tbl, row, 11, dom_state, TEXT_DIM)
+                _set_item(tbl, row, 12, pnl_str, pnl_color, bold=(pnl_pct != 0),
                           sort_value=pnl_pct)
-                _set_item(tbl, row, 12, ev_str, ev_color, bold=(ev_pct != 0),
+                _set_item(tbl, row, 13, ev_str, ev_color, bold=(ev_pct != 0),
                           sort_value=ev_pct)
                 # 平均持仓（0 显示 "-"）
                 avg_hold = c.get("avg_hold_bars", 0) or 0
@@ -1512,9 +1508,9 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                 if avg_hold >= 10:
                     d1, d2 = int(avg_hold * 0.50), int(avg_hold * 0.70)
                     decay_tip = f"衰减计划: {d1}根/-6% | {d2}根/-3%"
-                _set_item(tbl, row, 13, avg_hold_str, TEXT_DIM, sort_value=avg_hold,
+                _set_item(tbl, row, 14, avg_hold_str, TEXT_DIM, sort_value=avg_hold,
                           tooltip=decay_tip or None)
-                _set_item(tbl, row, 14,
+                _set_item(tbl, row, 15,
                           _format_conditions(c.get("conditions", []), c.get("direction", "")),
                           TEXT_DIM)
             tbl.setSortingEnabled(True)

@@ -416,6 +416,7 @@ class SignalBacktestWorker(QtCore.QObject):
             pos_stage = 1                # 1=阶段1(固定SL+时间衰减), 2=阶段2(追踪止损)
             peak_price = 0.0             # 阶段2追踪用峰值价格
             stage2_margin = 0.0          # 阶段2剩余保证金
+            _pending_signal = None       # 延迟入场：信号bar→下一bar open入场（与signal_analyzer一致）
             
             def _append_trade_log(event, idx, side, price, info=None):
                 trade_logs.append({
@@ -465,8 +466,68 @@ class SignalBacktestWorker(QtCore.QObject):
                 if prep_initialized and cur >= 50 and cur < len(df_work):
                     row = df_work.iloc[cur]
                     hi, lo, cl = float(row['high']), float(row['low']), float(row['close'])
+                    op = float(row['open'])
                     adx   = row.get('adx')
                     slope = row.get('ma5_slope')
+
+                    # ── 延迟入场：上一bar触发信号 → 本bar open入场（与signal_analyzer一致）──
+                    if _pending_signal is not None and not in_pos:
+                        _ps = _pending_signal
+                        _pending_signal = None
+                        _ps_d = _ps['direction']
+                        _ps_pool_id = _ps['pool_id']
+                        if _ps_pool_id == 'pool2':
+                            _ps_long_tp, _ps_long_sl = POOL2_LONG_TP_PCT, POOL2_LONG_SL_PCT
+                            _ps_short_tp, _ps_short_sl = POOL2_SHORT_TP_PCT, POOL2_SHORT_SL_PCT
+                        else:
+                            _ps_long_tp, _ps_long_sl = long_tp_pct, long_sl_pct
+                            _ps_short_tp, _ps_short_sl = short_tp_pct, short_sl_pct
+                        _ps_tp = op * (1 + _ps_long_tp) if _ps_d == 'long' else op * (1 - _ps_short_tp)
+                        _ps_sl = op * (1 - _ps_long_sl) if _ps_d == 'long' else op * (1 + _ps_short_sl)
+                        _ps_atr_val = float(row.get('atr', 0) or 0)
+                        _ps_sl_dist = abs(_ps_sl - op) / op if op > 0 else 0.0
+                        _ps_atr_ratio = (_ps_atr_val / op) if op > 0 and _ps_atr_val > 0 else 0.0
+                        _ps_atr_skip = False
+                        if _ps_atr_val > 0:
+                            from core.signal_analyzer import MIN_ATR_RATIO, MAX_ATR_SL_MULT
+                            if _ps_atr_ratio < MIN_ATR_RATIO:
+                                _ps_atr_skip = True
+                            elif _ps_sl_dist > 0 and _ps_atr_ratio > _ps_sl_dist * MAX_ATR_SL_MULT:
+                                _ps_atr_skip = True
+                        if not _ps_atr_skip:
+                            in_pos, e_price, e_idx, e_dir = True, op, cur, _ps_d
+                            e_state = _ps['state']
+                            e_key, e_info = _ps['key'], _ps['info']
+                            e_pool_id = _ps_pool_id
+                            tp = _ps_tp
+                            sl = _ps_sl
+                            labels_arr[cur] = 1 if _ps_d == 'long' else -1
+                            self.label_found.emit(cur, int(labels_arr[cur]))
+                            e_margin = capital * PCT
+                            e_avg_hold_bars = int(_ps['info'].get('avg_hold_bars', 0) or 0)
+                            peak_pnl_pct = 0.0
+                            ever_reached_threshold = False
+                            pos_stage  = 1
+                            peak_price = op
+                            stage2_margin = 0.0
+                            _append_trade_log("entry", cur, _ps_d, op, {
+                                "reason": "signal",
+                                "meta": {"signal_key": _ps['key'], "pool_id": _ps_pool_id},
+                                "stop_loss": sl,
+                                "take_profit": tp,
+                                "leverage": LEVERAGE,
+                                "margin": e_margin,
+                            })
+                            cur_pos = Position(
+                                side=PositionSide.LONG if _ps_d == 'long' else PositionSide.SHORT,
+                                entry_price=e_price, entry_idx=e_idx,
+                                size=e_margin * LEVERAGE / e_price,
+                                stop_loss=sl, take_profit=tp, liquidation_price=0.0,
+                                margin=e_margin,
+                            )
+                            m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
+                            m["current_bar"] = cur
+                            _emit_rt_update(m)
 
                     if in_pos:
                         _cfg   = PAPER_TRADING_CONFIG
@@ -753,64 +814,10 @@ class SignalBacktestWorker(QtCore.QObject):
                         best_entry = (_best[0], _best[1], _best[2], _best[5])
                     if best_entry:
                         key, info, d, pool_id = best_entry
-
-                        if pool_id == 'pool2':
-                            p_long_tp, p_long_sl = POOL2_LONG_TP_PCT, POOL2_LONG_SL_PCT
-                            p_short_tp, p_short_sl = POOL2_SHORT_TP_PCT, POOL2_SHORT_SL_PCT
-                        else:
-                            p_long_tp, p_long_sl = long_tp_pct, long_sl_pct
-                            p_short_tp, p_short_sl = short_tp_pct, short_sl_pct
-
-                        _tp = cl * (1 + p_long_tp) if d == 'long' else cl * (1 - p_short_tp)
-                        _sl = cl * (1 - p_long_sl) if d == 'long' else cl * (1 + p_short_sl)
-
-                        # ATR 双向门控（与 signal_analyzer._precompute_outcomes 口径一致）
-                        _atr_val = float(row.get('atr', 0) or 0)
-                        _sl_dist = abs(_sl - cl) / cl if cl > 0 else 0.0
-                        _atr_ratio = (_atr_val / cl) if cl > 0 and _atr_val > 0 else 0.0
-                        _atr_skip = False
-                        if _atr_val > 0:
-                            from core.signal_analyzer import MIN_ATR_RATIO, MAX_ATR_SL_MULT
-                            if _atr_ratio < MIN_ATR_RATIO:
-                                _atr_skip = True   # 波动过小，60根内走不出 TP/SL，跳过
-                            elif _sl_dist > 0 and _atr_ratio > _sl_dist * MAX_ATR_SL_MULT:
-                                _atr_skip = True   # 波动过大，止损距离不足以覆盖，跳过
-                        if not _atr_skip:
-                            in_pos, e_price, e_idx, e_dir = True, cl, cur, d
-                            e_state = state          # 记录入场时的三态市场状态
-                            e_key, e_info = key, info
-                            e_pool_id = pool_id
-                            tp = _tp
-                            sl = _sl
-                            labels_arr[cur] = 1 if d == 'long' else -1
-                            self.label_found.emit(cur, int(labels_arr[cur]))
-                            e_margin = capital * PCT
-                            e_avg_hold_bars = int(info.get('avg_hold_bars', 0) or 0)
-                            # 重置动态止损状态
-                            peak_pnl_pct = 0.0
-                            ever_reached_threshold = False
-                            pos_stage  = 1
-                            peak_price = cl
-                            stage2_margin = 0.0
-                            _append_trade_log("entry", cur, d, cl, {
-                                "reason": "signal",
-                                "meta": {"signal_key": key, "pool_id": pool_id},
-                                "stop_loss": sl,
-                                "take_profit": tp,
-                                "leverage": LEVERAGE,
-                                "margin": e_margin,
-                            })
-                            # 开仓时立即刷新持仓和交易明细
-                            cur_pos = Position(
-                                side=PositionSide.LONG if d == 'long' else PositionSide.SHORT,
-                                entry_price=e_price, entry_idx=e_idx,
-                                size=e_margin * LEVERAGE / e_price,
-                                stop_loss=sl, take_profit=tp, liquidation_price=0.0,
-                                margin=e_margin,
-                            )
-                            m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
-                            m["current_bar"] = cur
-                            _emit_rt_update(m)
+                        _pending_signal = {
+                            'key': key, 'info': info, 'direction': d,
+                            'pool_id': pool_id, 'state': state,
+                        }
 
                 self.step_completed.emit(cur)
                 cur += 1

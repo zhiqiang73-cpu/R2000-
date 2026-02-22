@@ -495,6 +495,11 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long',
     avg_hold_bars = int(round(statistics.median(valid_holds))) if valid_holds else 0
     hold_bars_sample_count = len(valid_holds)
 
+    # 随机基准：各轮的随机基准命中率均值（排除未记录的旧数据，值为0的跳过）
+    baseline_vals = [h.get('random_baseline', 0.0) for h in history
+                     if h.get('random_baseline', 0.0) > 0.0]
+    avg_random_baseline = sum(baseline_vals) / len(baseline_vals) if baseline_vals else 0.0
+
     if n == 0:
         return {
             'appear_rounds':          0,
@@ -509,6 +514,7 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long',
             'market_state_breakdown': _merge_market_state_breakdown([]),
             'avg_hold_bars':          avg_hold_bars,
             'hold_bars_sample_count': hold_bars_sample_count,
+            'avg_random_baseline':    round(avg_random_baseline, 6),
         }
 
     avg_rate = sum(rates) / n
@@ -546,6 +552,7 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long',
         'market_state_breakdown': _merge_market_state_breakdown(history),
         'avg_hold_bars':          avg_hold_bars,
         'hold_bars_sample_count': hold_bars_sample_count,
+        'avg_random_baseline':    round(avg_random_baseline, 6),
     }
 
 
@@ -601,6 +608,7 @@ def _merge_round_into_data(
             'tier':                   item['tier'],
             'market_state_breakdown': item.get('market_state_breakdown'),
             'hold_bars':              item.get('hold_bars', []),
+            'random_baseline':        item.get('random_baseline', 0.0),
         })
 
         metrics = _compute_cumulative_metrics(entry['history'], direction=item['direction'],
