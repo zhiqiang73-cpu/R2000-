@@ -31,6 +31,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from config import (
+    POOL2_LONG_TP_PCT, POOL2_LONG_SL_PCT, 
+    POOL2_SHORT_TP_PCT, POOL2_SHORT_SL_PCT,
+    POOL2_TIER_CANDIDATE, POOL2_TIER_QUALITY, POOL2_TIER_PREMIUM
+)
 from core.market_state_detector import detect_state
 
 # ── 回测参数 ────────────────────────────────────────────────────────────────
@@ -366,6 +371,8 @@ def analyze(
     progress_cb: Optional[Callable[[int, str], None]] = None,
     excluded_families: Optional[List[str]] = None,
     validation_split: float = 0.0,
+    pool_id: str = "pool1",
+    max_hold: int = MAX_HOLD,
 ) -> List[dict]:
     """
     对给定 K 线数据执行信号组合分析。
@@ -430,10 +437,14 @@ def analyze(
         progress_cb(0, "正在预计算止盈止损结果数组...")
 
     # ── 2. 策略1：预计算 outcome 数组（O(N×240)，执行一次）───────────────────
-    tp_pct = LONG_TP1_PCT if direction == 'long' else SHORT_TP1_PCT
-    sl_pct = LONG_SL_PCT  if direction == 'long' else SHORT_SL_PCT
+    if pool_id == 'pool2':
+        tp_pct = POOL2_LONG_TP_PCT if direction == 'long' else POOL2_SHORT_TP_PCT
+        sl_pct = POOL2_LONG_SL_PCT if direction == 'long' else POOL2_SHORT_SL_PCT
+    else:
+        tp_pct = LONG_TP1_PCT if direction == 'long' else SHORT_TP1_PCT
+        sl_pct = LONG_SL_PCT  if direction == 'long' else SHORT_SL_PCT
     outcome, hold_bars_arr = _precompute_outcomes(high_arr, low_arr, open_arr, close_arr, direction,
-                                                   tp_pct=tp_pct, sl_pct=sl_pct)
+                                                   tp_pct=tp_pct, sl_pct=sl_pct, max_hold=max_hold)
 
     if progress_cb:
         progress_cb(5, "正在构建条件数组...")
@@ -503,9 +514,14 @@ def analyze(
             hit_rate  = hit_count / trigger_count
             hold_bars = hold_bars_arr[indices].tolist()  # 每触发点的持仓根数，-1=超时排除
 
-            t_prem = TIER_PREMIUM   if direction == 'long' else SHORT_TIER_PREMIUM
-            t_qual = TIER_QUALITY   if direction == 'long' else SHORT_TIER_QUALITY
-            t_cand = TIER_CANDIDATE if direction == 'long' else SHORT_TIER_CANDIDATE
+            if pool_id == 'pool2':
+                t_prem = POOL2_TIER_PREMIUM
+                t_qual = POOL2_TIER_QUALITY
+                t_cand = POOL2_TIER_CANDIDATE
+            else:
+                t_prem = TIER_PREMIUM   if direction == 'long' else SHORT_TIER_PREMIUM
+                t_qual = TIER_QUALITY   if direction == 'long' else SHORT_TIER_QUALITY
+                t_cand = TIER_CANDIDATE if direction == 'long' else SHORT_TIER_CANDIDATE
 
             if hit_rate >= t_prem:
                 tier = '精品'
@@ -519,6 +535,7 @@ def analyze(
             if tier:
                 results.append({
                     'direction':              direction,
+                    'pool_id':                pool_id,
                     'conditions':             [cond_names[i] for i in combo_indices],
                     'trigger_count':          trigger_count,
                     'hit_count':              hit_count,
@@ -553,9 +570,14 @@ def analyze(
         )
         conds_val = _build_condition_arrays(df_val, direction)
 
-        t_prem_v = TIER_PREMIUM   if direction == 'long' else SHORT_TIER_PREMIUM
-        t_qual_v = TIER_QUALITY   if direction == 'long' else SHORT_TIER_QUALITY
-        t_cand_v = TIER_CANDIDATE if direction == 'long' else SHORT_TIER_CANDIDATE
+        if pool_id == 'pool2':
+            t_prem_v = POOL2_TIER_PREMIUM
+            t_qual_v = POOL2_TIER_QUALITY
+            t_pass_v = POOL2_TIER_QUALITY
+        else:
+            t_prem_v = TIER_PREMIUM   if direction == 'long' else SHORT_TIER_PREMIUM
+            t_qual_v = TIER_QUALITY   if direction == 'long' else SHORT_TIER_QUALITY
+            t_pass_v = TIER_QUALITY   if direction == 'long' else SHORT_TIER_QUALITY
 
         val_results: List[dict] = []
         for res in results:
@@ -581,7 +603,7 @@ def analyze(
             val_indices = np.nonzero(trigger_mask_val)[0]
             val_hit_count = int(outcome_val[val_indices].sum())
             val_hit_rate  = val_hit_count / val_trigger_count
-            if val_hit_rate < t_cand_v:
+            if val_hit_rate < t_pass_v:
                 continue
 
             if val_hit_rate >= t_prem_v:

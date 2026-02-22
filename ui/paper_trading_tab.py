@@ -273,6 +273,12 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         self.oscillation_filter_chk.setChecked(True)
         control_layout.addWidget(self.oscillation_filter_chk)
         
+        # 追踪止盈止损开关
+        self.trailing_stop_chk = QtWidgets.QCheckBox("追踪止盈止损（阶段2）")
+        self.trailing_stop_chk.setToolTip("关闭时使用固定TP/SL全平，与策略验证逻辑一致")
+        self.trailing_stop_chk.setChecked(False)
+        control_layout.addWidget(self.trailing_stop_chk)
+        
         # 清除学习记忆按钮
         self.clear_memory_btn = QtWidgets.QPushButton("🗑 清除学习记忆")
         self.clear_memory_btn.setToolTip(
@@ -344,6 +350,7 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
             "leverage": self.leverage_spin.value(),
             "use_qualified_only": self.use_qualified_radio.isChecked(),
             "oscillation_filter_enabled": self.oscillation_filter_chk.isChecked(),
+            "trailing_stop_enabled": self.trailing_stop_chk.isChecked(),
         }
         self.start_requested.emit(config)
     
@@ -393,6 +400,7 @@ class PaperTradingControlPanel(QtWidgets.QWidget):
         self.balance_spin.setEnabled(not running)
         self.leverage_spin.setEnabled(not running)
         self.oscillation_filter_chk.setEnabled(not running)
+        self.trailing_stop_chk.setEnabled(not running)
         
         if running:
             self.run_status_label.setText("运行中")
@@ -3637,11 +3645,11 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         
         # 表格页
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(17)  # 16列 + 衰减列
+        self.table.setColumnCount(18)  # 17列 + 衰减列
         self.table.setHorizontalHeaderLabels([
             "时间", "方向", "数量", "入场价", "出场价", "止盈", "止损", 
             "盈亏%", "峰值%", "精准度", "信号",  # 峰值利润、止盈精准度、信号触发
-            "盈亏(USDT)", "手续费", "原因", "持仓", "衰减", "操作"
+            "盈亏(USDT)", "手续费", "原因", "持仓", "策略池", "衰减", "操作"
         ])
         
         # 【自动调整列宽】确保所有内容都能完整显示
@@ -3668,8 +3676,9 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             12: 70,  # 手续费：0.0000
             13: 80,  # 原因：追踪止盈
             14: 50,  # 持仓：12
-            15: 60,  # 衰减：16/23根
-            16: 60,  # 操作：删除按钮
+            15: 60,  # 策略池：pool1
+            16: 60,  # 衰减：16/23根
+            17: 60,  # 操作：删除按钮
         }
         
         for col, min_width in min_widths.items():
@@ -3970,13 +3979,24 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
         # 持仓时长（索引 +3）
         self.table.setItem(row, 14, QtWidgets.QTableWidgetItem(str(order.hold_bars)))
         
+        # 策略池
+        pool_id_val = getattr(order, "pool_id", "") or "-"
+        pool_id_item = QtWidgets.QTableWidgetItem(pool_id_val)
+        if pool_id_val == "pool1":
+            pool_id_item.setForeground(QtGui.QColor("#00BCD4"))  # ACCENT_CYAN
+        elif pool_id_val == "pool2":
+            pool_id_item.setForeground(QtGui.QColor("#FFC107"))  # ACCENT_GOLD
+        else:
+            pool_id_item.setForeground(QtGui.QColor("#9e9e9e"))
+        self.table.setItem(row, 15, pool_id_item)
+        
         # 衰减（decay_bar_1/decay_bar_2）
         d1 = getattr(order, "decay_bar_1", 0) or 0
         d2 = getattr(order, "decay_bar_2", 0) or 0
         decay_text = f"{d1}/{d2}根" if (d1 and d2) else "-"
         decay_item = QtWidgets.QTableWidgetItem(decay_text)
         decay_item.setForeground(QtGui.QColor("#9e9e9e"))
-        self.table.setItem(row, 15, decay_item)
+        self.table.setItem(row, 16, decay_item)
         
         # 操作按钮（索引 +3）
         delete_btn = QtWidgets.QPushButton("删除")
@@ -3997,7 +4017,7 @@ class PaperTradingTradeLog(QtWidgets.QWidget):
             }
         """)
         delete_btn.clicked.connect(lambda checked=False, o=order: self._on_delete_clicked(o))
-        self.table.setCellWidget(row, 16, delete_btn)
+        self.table.setCellWidget(row, 17, delete_btn)
 
     def _format_signal_description(self, order) -> str:
         """格式化信号列描述，支持精品信号解析"""

@@ -236,6 +236,12 @@ class ControlPanel(QtWidgets.QWidget):
         self.strict_state_filter_chk.setStyleSheet("color: #e0a020; font-size: 12px;")
         play_layout.addWidget(self.strict_state_filter_chk)
 
+        # 追踪止盈止损开关
+        self.trailing_stop_chk = QtWidgets.QCheckBox("追踪止盈止损（阶段2）")
+        self.trailing_stop_chk.setToolTip("关闭时使用固定TP/SL全平，与策略验证逻辑一致")
+        self.trailing_stop_chk.setChecked(False)
+        play_layout.addWidget(self.trailing_stop_chk)
+
         # 回测试验 TP/SL 开关
         self.alt_tpsl_chk = QtWidgets.QCheckBox("试验新TP/SL：+0.4% / -0.5%（仅回测）")
         self.alt_tpsl_chk.setToolTip(
@@ -383,6 +389,10 @@ class ControlPanel(QtWidgets.QWidget):
     def get_strict_state_filter(self) -> bool:
         """获取严格市场状态过滤开关状态"""
         return self.strict_state_filter_chk.isChecked()
+
+    def get_trailing_stop(self) -> bool:
+        """获取追踪止盈止损开关状态"""
+        return self.trailing_stop_chk.isChecked()
 
     def get_alt_tpsl(self) -> bool:
         """获取回测试验TP/SL开关状态"""

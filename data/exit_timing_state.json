@@ -9,9 +9,9 @@
   "state": {
     "data_version": 1,
     "created_at": 1771460922.2447605,
-    "last_save_time": 1771666860.709614,
+    "last_save_time": 1771668603.9099927,
     "total_exits_recorded": 11,
-    "total_evaluations_done": 9,
+    "total_evaluations_done": 10,
     "total_adjustments_applied": 0
   },
   "reason_scores": {
@@ -32,10 +32,10 @@
     "止损": {
       "close_reason": "止损",
       "premature_count": 4,
-      "correct_count": 2,
+      "correct_count": 3,
       "late_count": 0,
-      "total": 6,
-      "correct": 2,
+      "total": 7,
+      "correct": 3,
       "total_left_on_table_pct": 6.5968,
       "total_excess_retracement_pct": 0.0,
       "recent_verdicts": [
@@ -43,6 +43,7 @@
         "premature",
         "premature",
         "premature",
+        "correct",
         "correct",
         "correct"
       ]
@@ -277,6 +278,30 @@
       "price_at_max_favorable": 67671.1,
       "verdict": "correct",
       "evaluation_time": 1771649940.0790575
+    },
+    {
+      "id": "5c1504e0-80fb-439d-be29-1a90be030443",
+      "timestamp": 1771666820.8152912,
+      "timestamp_str": "2026-02-21 17:40:20",
+      "direction": "SHORT",
+      "close_reason": "止损",
+      "entry_price": 67820.4,
+      "exit_price": 68198.2,
+      "profit_pct": -11.9456,
+      "peak_profit_pct": 0.0,
+      "hold_bars": 500,
+      "trailing_stage": 0,
+      "market_regime": "空头趋势",
+      "bar_idx_at_exit": 500,
+      "template_fingerprint": "",
+      "evaluated": true,
+      "price_after_eval": 68185.3,
+      "bars_tracked": 30,
+      "max_favorable_pct": 0.121,
+      "max_adverse_pct": 0.0117,
+      "price_at_max_favorable": 68115.7,
+      "verdict": "correct",
+      "evaluation_time": 1771668603.8780792
     }
   ],
   "pending_eval": [
@@ -301,30 +326,6 @@
       "max_favorable_pct": 0.0,
       "max_adverse_pct": 0.0,
       "price_at_max_favorable": null,
-      "verdict": "",
-      "evaluation_time": null
-    },
-    {
-      "id": "5c1504e0-80fb-439d-be29-1a90be030443",
-      "timestamp": 1771666820.8152912,
-      "timestamp_str": "2026-02-21 17:40:20",
-      "direction": "SHORT",
-      "close_reason": "止损",
-      "entry_price": 67820.4,
-      "exit_price": 68198.2,
-      "profit_pct": -11.9456,
-      "peak_profit_pct": 0.0,
-      "hold_bars": 500,
-      "trailing_stage": 0,
-      "market_regime": "空头趋势",
-      "bar_idx_at_exit": 500,
-      "template_fingerprint": "",
-      "evaluated": false,
-      "price_after_eval": null,
-      "bars_tracked": 1,
-      "max_favorable_pct": 0.0053,
-      "max_adverse_pct": 0.0,
-      "price_at_max_favorable": 68194.6,
       "verdict": "",
       "evaluation_time": null
     }

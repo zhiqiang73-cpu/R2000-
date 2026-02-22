@@ -146,6 +146,7 @@ def load_trade_history_from_file(filepath: str) -> List["PaperOrder"]:
                 avg_hold_bars=int(t.get("avg_hold_bars", 0) or 0),
                 decay_bar_1=int(t.get("decay_bar_1", 0) or 0),
                 decay_bar_2=int(t.get("decay_bar_2", 0) or 0),
+                pool_id=t.get("pool_id", ""),
             )
             loaded.append(order)
         return loaded
@@ -270,6 +271,7 @@ class PaperOrder:
     avg_hold_bars: int = 0       # 策略平均持仓（开仓时写入，0=使用全局配置）
     decay_bar_1: int = 0         # 衰减第1档触发点（50% × avg）
     decay_bar_2: int = 0         # 衰减第2档触发点（70% × avg）
+    pool_id: str = ""            # "pool1" 或 "pool2"
 
     def update_pnl(self, current_price: float, leverage: float = 10):
         """更新未实现盈亏 + 追踪峰值"""
@@ -370,6 +372,7 @@ class PaperOrder:
             "avg_hold_bars": getattr(self, "avg_hold_bars", 0),
             "decay_bar_1": getattr(self, "decay_bar_1", 0),
             "decay_bar_2": getattr(self, "decay_bar_2", 0),
+            "pool_id": self.pool_id,
         }
 
 
@@ -831,6 +834,52 @@ class PaperTrader:
             is_long = (order.side == OrderSide.LONG)
             stage2 = bool(getattr(order, "stage_2_active", False)) or order.partial_tp_count > 0 or getattr(order, "trailing_stage", 0) > 0
             trail_enabled = bool(_ptc.get("TRAILING_STOP_ENABLED", True))
+
+            # 阶段1：动态止损（保本上移 + 时间衰减）
+            if not stage2:
+                # 更新峰值浮盈（用 bar 的最有利价格）
+                best_bar = high if is_long else low
+                if is_long:
+                    bar_pnl = (best_bar - order.entry_price) / order.entry_price * self.leverage * 100
+                else:
+                    bar_pnl = (order.entry_price - best_bar) / order.entry_price * self.leverage * 100
+                if bar_pnl > order.peak_profit_pct:
+                    order.peak_profit_pct = bar_pnl
+
+                threshold = float(_ptc.get("BREAKEVEN_THRESHOLD_PCT", 6.0))
+                if not getattr(order, "ever_reached_6pct", False) and order.peak_profit_pct >= threshold:
+                    # 第一次浮盈达到阈值：止损上移到 BREAKEVEN_SL_PCT
+                    order.ever_reached_6pct = True
+                    sl_pct = float(_ptc.get("BREAKEVEN_SL_PCT", -3.0)) / 100 / self.leverage
+                    target_sl = (order.entry_price * (1 + sl_pct) if is_long
+                                 else order.entry_price * (1 - sl_pct))
+                    if order.stop_loss is None:
+                        order.stop_loss = target_sl
+                    else:
+                        order.stop_loss = max(order.stop_loss, target_sl) if is_long else min(order.stop_loss, target_sl)
+                elif not getattr(order, "ever_reached_6pct", False):
+                    # 未触发阶梯上移时：时间衰减止损收窄（止损只能收紧）
+                    if bool(_ptc.get("TIME_DECAY_ENABLED", True)):
+                        if getattr(order, "avg_hold_bars", 0) >= 10:
+                            bar1 = int(order.avg_hold_bars * 0.50)
+                            bar2 = int(order.avg_hold_bars * 0.70)
+                        else:
+                            bar1 = int(_ptc.get("TIME_DECAY_BAR_1", 30))
+                            bar2 = int(_ptc.get("TIME_DECAY_BAR_2", 60))
+                        sl2_pct = float(_ptc.get("TIME_DECAY_SL_2", -5.0)) / 100 / self.leverage
+                        sl1_pct = float(_ptc.get("TIME_DECAY_SL_1", -10.0)) / 100 / self.leverage
+                        target_sl = None
+                        if order.hold_bars > bar2:
+                            target_sl = (order.entry_price * (1 + sl2_pct) if is_long
+                                         else order.entry_price * (1 - sl2_pct))
+                        elif order.hold_bars > bar1:
+                            target_sl = (order.entry_price * (1 + sl1_pct) if is_long
+                                         else order.entry_price * (1 - sl1_pct))
+                        if target_sl is not None:
+                            if order.stop_loss is None:
+                                order.stop_loss = target_sl
+                            else:
+                                order.stop_loss = max(order.stop_loss, target_sl) if is_long else min(order.stop_loss, target_sl)
 
             # 阶段2追踪止损更新（每次价格更新均可触发）
             if stage2 and trail_enabled:

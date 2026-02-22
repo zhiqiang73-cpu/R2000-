@@ -133,6 +133,15 @@ GA_CONFIG = {
     },
 }
 
+# ==================== Pool 2 策略池配置 ====================
+POOL2_LONG_TP_PCT    = 0.010
+POOL2_LONG_SL_PCT    = 0.008
+POOL2_SHORT_TP_PCT   = 0.010
+POOL2_SHORT_SL_PCT   = 0.008
+POOL2_TIER_CANDIDATE = 0.52   # 两方向对称，break-even 47.8%
+POOL2_TIER_QUALITY   = 0.55
+POOL2_TIER_PREMIUM   = 0.59
+
 # ==================== 回测配置 ====================
 BACKTEST_CONFIG = {
     "INITIAL_CAPITAL": 5000,    # 初始资金 (USDT)
@@ -146,7 +155,7 @@ BACKTEST_CONFIG = {
     "TP_SP_LOOKBACK": 20,       # TP/SP 近端高低点窗口
 
     # ── 追踪止盈止损系统 ──
-    "TRAILING_STOP_ENABLED": True,          # 启用追踪止损（TP1后阶段2）
+    "TRAILING_STOP_ENABLED": False,         # 启用追踪止损（TP1后阶段2）
     "TRAILING_STOP_PCT": 0.02,              # 追踪止损间距 2%（价格）- 短线优化
 
     # 阶梯止损上移（杠杆后%）
@@ -154,7 +163,7 @@ BACKTEST_CONFIG = {
     "BREAKEVEN_SL_PCT": -3.0,               # 止损上移目标：-3%（杠杆后）
 
     # 时间衰减止损（杠杆后%）
-    "TIME_DECAY_ENABLED": True,             # 启用时间衰减止损收窄
+    "TIME_DECAY_ENABLED": False,            # 启用时间衰减止损收窄
     "TIME_DECAY_BAR_1": 30,                 # 超过30根K线触发第一档收窄 - 短线优化
     "TIME_DECAY_SL_1": -6.0,                # 第一档：止损收窄至 -6%（杠杆后）- 短线优化
     "TIME_DECAY_BAR_2": 60,                 # 超过60根K线触发第二档收窄 - 短线优化
@@ -626,7 +635,7 @@ PAPER_TRADING_CONFIG = {
     # ── 追踪止盈止损系统 ──
     # 阶段1：入场→TP1（+12%），动态调整止损
     # 阶段2：TP1后，剩余30%用追踪止损跑利润
-    "TRAILING_STOP_ENABLED": True,       # 启用追踪止损（阶段2使用）
+    "TRAILING_STOP_ENABLED": False,      # 启用追踪止损（阶段2使用）
     "TRAILING_STOP_PCT": 0.02,           # 追踪止损间距 2%（价格变动）- 短线优化
 
     # 阶梯止损上移（阶段1）
@@ -634,7 +643,7 @@ PAPER_TRADING_CONFIG = {
     "BREAKEVEN_SL_PCT": -3.0,            # 上移后止损：-3%（杠杆后）
 
     # 时间衰减止损（阶段1，未到过+6%时才触发）
-    "TIME_DECAY_ENABLED": True,          # 启用时间衰减
+    "TIME_DECAY_ENABLED": False,         # 启用时间衰减
     "TIME_DECAY_BAR_1": 30,              # 第一档：持仓超过30根K线 - 短线优化
     "TIME_DECAY_SL_1": -6.0,             # 第一档止损收窄到：-6%（杠杆后）- 短线优化
     "TIME_DECAY_BAR_2": 60,              # 第二档：持仓超过60根K线 - 短线优化
@@ -786,7 +795,7 @@ PAPER_TRADING_CONFIG = {
     "NEAR_MISS_STATE_FILE": "data/near_miss_tracker_state.json",  # 持久化文件路径
 
     # ── 追踪止盈止损系统 ──
-    "TRAILING_STOP_ENABLED": True,          # 启用追踪止损（TP1后进入阶段2时生效）
+    "TRAILING_STOP_ENABLED": False,         # 启用追踪止损（TP1后进入阶段2时生效）
     "TRAILING_STOP_PCT": 0.02,              # 追踪止损间距 2%（价格，非杠杆后）- 短线优化
 
     # 阶梯止损上移（杠杆后%）
@@ -794,7 +803,7 @@ PAPER_TRADING_CONFIG = {
     "BREAKEVEN_SL_PCT": -3.0,               # 第一档止损：-3%（杠杆后）
 
     # 时间衰减止损（杠杆后%）
-    "TIME_DECAY_ENABLED": True,             # 启用时间衰减止损收窄
+    "TIME_DECAY_ENABLED": False,            # 启用时间衰减止损收窄
     "TIME_DECAY_BAR_1": 30,                 # 第一档：持仓超过30根K线 - 短线优化
     "TIME_DECAY_SL_1": -6.0,                # 第一档止损收窄目标：-6%（杠杆后）- 短线优化
     "TIME_DECAY_BAR_2": 60,                 # 第二档：持仓超过60根K线 - 短线优化

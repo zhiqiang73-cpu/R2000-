@@ -43,6 +43,9 @@ class MarketRegime:
         WEAK_BEAR:   "#EF5350",   # 红
         STRONG_BEAR: "#FF1744",   # 亮红
         UNKNOWN:     "#888888",   # 灰
+        "多头趋势":   "#00E676",   # 亮绿
+        "震荡市":     "#A5D6A7",   # 浅绿 (or neutral color)
+        "空头趋势":   "#FF1744",   # 亮红
     }
 
 
@@ -156,7 +159,8 @@ class MarketRegimeClassifier:
             {regime: {count, long, short, wins, losses, win_rate, avg_profit_pct, total_profit}}
         """
         stats = {}
-        for regime in MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN]:
+        # 为了兼容新的3态，也初始化它们
+        for regime in MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN, "多头趋势", "空头趋势", "震荡市"]:
             stats[regime] = {
                 "count": 0,
                 "long": 0,
@@ -212,7 +216,7 @@ class MarketRegimeClassifier:
                                         avg_profit_pct, total_profit}}
         """
         stats = {}
-        regimes = MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN]
+        regimes = MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN, "多头趋势", "空头趋势", "震荡市"]
         for direction in ("long", "short"):
             for regime in regimes:
                 stats[(direction, regime)] = {

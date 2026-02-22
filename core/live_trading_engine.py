@@ -588,9 +588,9 @@ class LiveTradingEngine:
         if not template_fingerprint:
             return 0
         try:
-            from core.signal_store import _load_cumulative_fast
-            cumulative = _load_cumulative_fast()
-            entry = cumulative.get(template_fingerprint)
+            from core.signal_store import get_cumulative_both_pools
+            p1, p2 = get_cumulative_both_pools()
+            entry = p1.get(template_fingerprint) or p2.get(template_fingerprint)
             if not entry:
                 return 0
             sample = entry.get("hold_bars_sample_count", 0)
@@ -1980,9 +1980,9 @@ class LiveTradingEngine:
                 self._signal_live_monitor = SignalLiveMonitor()
 
             from core import signal_store as _sig_store
-            cumulative = _sig_store.get_cumulative()
+            p1, p2 = _sig_store.get_cumulative_both_pools()
 
-            if not cumulative:
+            if not p1 and not p2:
                 self.state.signal_mode_info = {
                     **pool_info,
                     "state": current_state,
@@ -1992,10 +1992,26 @@ class LiveTradingEngine:
                 self.state.last_event = "⚠ [精品信号] 策略池为空"
                 return
 
-            best_res = self._signal_live_monitor.get_best_for_state(
-                self._pending_signal_combos, cumulative, current_state,
+            best_p1 = self._signal_live_monitor.get_best_for_state(
+                self._pending_signal_combos, p1, current_state,
                 tier_map=None,
             )
+            best_p2 = self._signal_live_monitor.get_best_for_state(
+                self._pending_signal_combos, p2, current_state,
+                tier_map=None,
+            )
+            
+            def _pick_by_ev_per_bar(b1, b2, store):
+                if not b1 and not b2: return None
+                if not b1: return b2
+                if not b2: return b1
+                ev1 = store.get_ev_per_bar(p1.get(b1[0], {}))
+                ev2 = store.get_ev_per_bar(p2.get(b2[0], {}))
+                return b1 if ev1 >= ev2 else b2
+                
+            best_res = _pick_by_ev_per_bar(best_p1, best_p2, _sig_store)
+            pool_id = 'pool1' if best_res is best_p1 else 'pool2'
+            cumulative = p1 if pool_id == 'pool1' else p2
 
             if not best_res:
                 # 记录匹配情况（无触发 / 无有效触发）
@@ -2107,20 +2123,32 @@ class LiveTradingEngine:
             import traceback; traceback.print_exc()
             return
 
-        # 6. 固定 TP/SL (与回测一致)
+        # 6. 固定 TP/SL (与回测一致，按池选择)
         from core.signal_analyzer import (
             LONG_TP1_PCT, LONG_SL_PCT,
             SHORT_TP1_PCT, SHORT_SL_PCT
         )
+        from config import (
+            POOL2_LONG_TP_PCT, POOL2_LONG_SL_PCT,
+            POOL2_SHORT_TP_PCT, POOL2_SHORT_SL_PCT
+        )
 
         entry_price = kline.close
         if direction == 'long':
-            tp_price = entry_price * (1 + LONG_TP1_PCT)
-            sl_price = entry_price * (1 - LONG_SL_PCT)
+            if pool_id == 'pool2':
+                tp_price = entry_price * (1 + POOL2_LONG_TP_PCT)
+                sl_price = entry_price * (1 - POOL2_LONG_SL_PCT)
+            else:
+                tp_price = entry_price * (1 + LONG_TP1_PCT)
+                sl_price = entry_price * (1 - LONG_SL_PCT)
             side = OrderSide.LONG
         else:
-            tp_price = entry_price * (1 - SHORT_TP1_PCT)
-            sl_price = entry_price * (1 + SHORT_SL_PCT)
+            if pool_id == 'pool2':
+                tp_price = entry_price * (1 - POOL2_SHORT_TP_PCT)
+                sl_price = entry_price * (1 + POOL2_SHORT_SL_PCT)
+            else:
+                tp_price = entry_price * (1 - SHORT_TP1_PCT)
+                sl_price = entry_price * (1 + SHORT_SL_PCT)
             side = OrderSide.SHORT
 
         # 7. 固定 5% 仓位下单
@@ -2136,8 +2164,9 @@ class LiveTradingEngine:
             position_size_pct=0.05,
             regime_at_entry=current_state,
         )
-        self._apply_avg_hold_to_order(order, combo_key)
         if order:
+            order.pool_id = pool_id
+            self._apply_avg_hold_to_order(order, combo_key)
             today_str = kline.open_time.strftime("%Y-%m-%d")
             if today_str != self._sm_last_date:
                 self._sm_today_count = 1
@@ -2242,9 +2271,11 @@ class LiveTradingEngine:
         try:
             from core import signal_store
             triggered_set = set(info["triggered_keys"])
-            cumul = signal_store.get_cumulative()
+            p1, p2 = signal_store.get_cumulative_both_pools()
             info["pool_total"] = sum(
-                1 for e in cumul.values() if e.get("appear_rounds", 0) >= 3
+                1 for e in p1.values() if e.get("appear_rounds", 0) >= 3
+            ) + sum(
+                1 for e in p2.values() if e.get("appear_rounds", 0) >= 3
             )
         except Exception:
             return info
@@ -4794,97 +4825,30 @@ class LiveTradingEngine:
     
     def _infer_market_regime(self) -> str:
         """
-        使用上帝视角6态市场状态分类（与训练一致）
+        使用 3 态市场状态分类（与训练一致）
         
-        6个状态：
-          - 强多头 (STRONG_BULL)
-          - 弱多头 (WEAK_BULL)
-          - 震荡偏多 (RANGE_BULL)
-          - 震荡偏空 (RANGE_BEAR)
-          - 弱空头 (WEAK_BEAR)
-          - 强空头 (STRONG_BEAR)
+        3个状态：
+          - 多头趋势
+          - 空头趋势
+          - 震荡市
         """
-        if self._df_buffer is None or len(self._df_buffer) < 30:
-            return MarketRegime.UNKNOWN
+        if self._df_buffer is None or len(self._df_buffer) < 2:
+            return "未知"
         
         try:
-            # 1. 更新摆动点检测（只使用已确认的历史数据）
-            self._update_swing_points()
+            # 1. 获取当前 K 线指标
+            adx = float(self._df_buffer['adx'].iloc[-1])
+            ma5_slope = float(self._df_buffer['ma5_slope'].iloc[-1])
             
-            # 更新状态中的摆动点计数（供UI显示）
-            self.state.swing_points_count = len(self._swing_points)
+            # 2. 调用一致的状态检测函数
+            from core.market_state_detector import detect_state
+            regime = detect_state(adx, ma5_slope)
             
-            # 2. 检查是否有足够的摆动点（与上帝视角一致，需要 4 个：2高2低）
-            if len(self._swing_points) < 4:
-                return MarketRegime.UNKNOWN
-            
-            # 3. 创建/更新分类器
-            from config import MARKET_REGIME_CONFIG
-            self._regime_classifier = MarketRegimeClassifier(
-                alternating_swings=self._swing_points,
-                config=MARKET_REGIME_CONFIG
-            )
-            
-            # 4. 分类当前K线的市场状态
-            current_idx = len(self._df_buffer) - 1
-            regime = self._regime_classifier.classify_at(current_idx)
-
-            # 5. 短期趋势修正（让 regime 更贴近 K 线走势）
-            try:
-                from config import MARKET_REGIME_CONFIG
-                lookback = int(MARKET_REGIME_CONFIG.get("SHORT_TREND_LOOKBACK", 12))
-                threshold = float(MARKET_REGIME_CONFIG.get("SHORT_TREND_THRESHOLD", 0.002))
-                if lookback > 0 and len(self._df_buffer) >= lookback + 1:
-                    start_px = float(self._df_buffer["close"].iloc[-lookback - 1])
-                    end_px = float(self._df_buffer["close"].iloc[-1])
-                    if start_px > 0:
-                        short_trend = (end_px - start_px) / start_px
-                        bull_votes = 0
-                        bear_votes = 0
-
-                        if short_trend > threshold:
-                            bull_votes += 1
-                        elif short_trend < -threshold:
-                            bear_votes += 1
-
-                        # MACD 柱状图方向作为额外投票
-                        if "macd_hist" in self._df_buffer.columns and len(self._df_buffer) >= 2:
-                            curr_hist = float(self._df_buffer["macd_hist"].iloc[-1])
-                            prev_hist = float(self._df_buffer["macd_hist"].iloc[-2])
-                            if curr_hist > prev_hist:
-                                bull_votes += 1
-                            elif curr_hist < prev_hist:
-                                bear_votes += 1
-
-                        # 短期趋势修正：允许同向增强 + 对立反转
-                        # 条件放宽：只需 1 票 + 明确的短期趋势
-                        if bull_votes >= 1 and short_trend > threshold:
-                            if short_trend > threshold * 3:  # 强趋势 > 0.45%
-                                if regime in (MarketRegime.RANGE_BEAR, MarketRegime.WEAK_BEAR, MarketRegime.STRONG_BEAR, MarketRegime.UNKNOWN):
-                                    return MarketRegime.WEAK_BULL
-                                elif regime == MarketRegime.RANGE_BULL:
-                                    return MarketRegime.WEAK_BULL  # 同向增强
-                            elif short_trend > threshold * 1.5:  # 中等趋势 > 0.225%
-                                if regime in (MarketRegime.RANGE_BEAR, MarketRegime.WEAK_BEAR, MarketRegime.STRONG_BEAR, MarketRegime.UNKNOWN):
-                                    return MarketRegime.RANGE_BULL
-
-                        if bear_votes >= 1 and short_trend < -threshold:
-                            if short_trend < -threshold * 3:  # 强趋势 < -0.45%
-                                if regime in (MarketRegime.RANGE_BULL, MarketRegime.WEAK_BULL, MarketRegime.STRONG_BULL, MarketRegime.UNKNOWN):
-                                    return MarketRegime.WEAK_BEAR
-                                elif regime == MarketRegime.RANGE_BEAR:
-                                    return MarketRegime.WEAK_BEAR  # 同向增强
-                            elif short_trend < -threshold * 1.5:  # 中等趋势 < -0.225%
-                                if regime in (MarketRegime.RANGE_BULL, MarketRegime.WEAK_BULL, MarketRegime.STRONG_BULL, MarketRegime.UNKNOWN):
-                                    return MarketRegime.RANGE_BEAR
-            except Exception:
-                pass
-
             return regime
             
         except Exception as e:
             print(f"[LiveEngine] 市场状态分类失败: {e}")
-            return MarketRegime.UNKNOWN
+            return "未知"
     
     def _confirm_market_regime(self) -> str:
         """

@@ -2,9 +2,9 @@
   "version": 1,
   "state": {
     "created_at": 1771460922.2460523,
-    "last_save_time": 1771666860.710893,
+    "last_save_time": 1771668604.1279867,
     "total_records": 10,
-    "total_evaluations": 8
+    "total_evaluations": 9
   },
   "history": [
     {
@@ -270,6 +270,39 @@
       "move_pct": 0.2052,
       "outcome": "neutral",
       "evaluation_time": 1771649940.0805604
+    },
+    {
+      "id": "8fafcfdb-0e44-4137-9c77-d8d86ebb84ea",
+      "timestamp": 1771666820.8154273,
+      "timestamp_str": "02-21 17:40:20",
+      "exit_price": 68198.2,
+      "direction": "SHORT",
+      "reason": "STOP_LOSS",
+      "bar_idx_at_exit": 500,
+      "detail": {
+        "close_reason": "STOP_LOSS",
+        "original_sl": 68362.9632,
+        "template_fingerprint": "",
+        "market_regime": "空头趋势"
+      },
+      "entry_price": 67820.4,
+      "entry_atr": 29.142857142857142,
+      "sl_price": 68362.9632,
+      "tp_price": 67413.4776,
+      "sl_distance_pct": 0.8,
+      "tp_distance_pct": 0.6,
+      "sl_atr_multiple": 18.62,
+      "tp_atr_multiple": 13.96,
+      "profit_pct": -11.95,
+      "peak_profit_pct": 0.0,
+      "hold_bars": 500,
+      "trailing_stage": 0,
+      "evaluated": true,
+      "price_after_eval": 68185.3,
+      "bars_waited": 30,
+      "move_pct": 0.0189,
+      "outcome": "neutral",
+      "evaluation_time": 1771668604.096949
     }
   ],
   "pending": [
@@ -305,39 +338,6 @@
       "move_pct": null,
       "outcome": null,
       "evaluation_time": null
-    },
-    {
-      "id": "8fafcfdb-0e44-4137-9c77-d8d86ebb84ea",
-      "timestamp": 1771666820.8154273,
-      "timestamp_str": "02-21 17:40:20",
-      "exit_price": 68198.2,
-      "direction": "SHORT",
-      "reason": "STOP_LOSS",
-      "bar_idx_at_exit": 500,
-      "detail": {
-        "close_reason": "STOP_LOSS",
-        "original_sl": 68362.9632,
-        "template_fingerprint": "",
-        "market_regime": "空头趋势"
-      },
-      "entry_price": 67820.4,
-      "entry_atr": 29.142857142857142,
-      "sl_price": 68362.9632,
-      "tp_price": 67413.4776,
-      "sl_distance_pct": 0.8,
-      "tp_distance_pct": 0.6,
-      "sl_atr_multiple": 18.62,
-      "tp_atr_multiple": 13.96,
-      "profit_pct": -11.95,
-      "peak_profit_pct": 0.0,
-      "hold_bars": 500,
-      "trailing_stage": 0,
-      "evaluated": false,
-      "price_after_eval": null,
-      "bars_waited": 0,
-      "move_pct": null,
-      "outcome": null,
-      "evaluation_time": null
     }
   ],
   "scores": {
@@ -356,8 +356,8 @@
       "reason": "STOP_LOSS",
       "correct": 0,
       "too_tight": 4,
-      "neutral": 2,
-      "total": 6,
+      "neutral": 3,
+      "total": 7,
       "accuracy": 0.0,
       "recent_trend": 0.5,
       "total_missed_pct": 4.35,

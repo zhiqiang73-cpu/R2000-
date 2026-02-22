@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import statistics
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -60,16 +61,23 @@ CUMULATIVE_CACHE_FILE = os.path.join(_DATA_DIR, 'signal_cumulative_cache.json')
 _SCHEMA_VERSION = "3.0"
 
 # ── 内存缓存（避免每次调用重新解析大文件） ──────────────────────────────────
-_cache: Optional[dict] = None
-_cache_mtime: float = 0.0
+_cache: Dict[str, dict] = {}
+_cache_mtime: Dict[str, float] = {}
 
 # ── 轻量级 cumulative 缓存（仅缓存 cumulative 部分，~2-5MB） ──────────────
-_cumul_cache: Optional[dict] = None
-_cumul_cache_mtime: float = 0.0
+_cumul_cache: Dict[str, dict] = {}
+_cumul_cache_mtime: Dict[str, float] = {}
 
 # ── rounds 内存缓存（避免每次重新解析大文件的 rounds 字段） ─────────────────
-_rounds_cache: Optional[list] = None
-_rounds_cache_mtime: float = 0.0
+_rounds_cache: Dict[str, list] = {}
+_rounds_cache_mtime: Dict[str, float] = {}
+
+def _get_files(pool_id: str) -> Tuple[str, str]:
+    if pool_id == "pool2":
+        return (os.path.join(_DATA_DIR, "signal_analysis_state_pool2.json"),
+                os.path.join(_DATA_DIR, "signal_cumulative_cache_pool2.json"))
+    return (STATE_FILE, CUMULATIVE_CACHE_FILE)
+
 
 # ── 写入锁（防止同进程并发写） ────────────────────────────────────────────
 import threading as _threading
@@ -139,20 +147,21 @@ def _combo_key(direction: str, conditions: List[str]) -> str:
     return f"{direction}|{'+'.join(sorted(conditions))}"
 
 
-def _load_raw() -> dict:
+def _load_raw(pool_id: str = "pool1") -> dict:
     """加载 JSON 文件，不存在则返回空骨架。文件未变化时直接返回内存缓存。"""
     global _cache, _cache_mtime
-    if _safe_exists(STATE_FILE):
+    state_file, _ = _get_files(pool_id)
+    if _safe_exists(state_file):
         try:
-            mtime = _safe_getmtime(STATE_FILE)
-            if _cache is not None and mtime == _cache_mtime:
-                return _cache
-            with _open_file(STATE_FILE, 'r', encoding='utf-8') as f:
+            mtime = _safe_getmtime(state_file)
+            if pool_id in _cache and mtime == _cache_mtime.get(pool_id):
+                return _cache[pool_id]
+            with _open_file(state_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                _cache = data
-                _cache_mtime = mtime
-                return _cache
+                _cache[pool_id] = data
+                _cache_mtime[pool_id] = mtime
+                return _cache[pool_id]
         except (json.JSONDecodeError, OSError):
             pass
     return _empty_state()
@@ -167,28 +176,30 @@ def _empty_state() -> dict:
     }
 
 
-def _save_raw(data: dict) -> None:
+def _save_raw(data: dict, pool_id: str = "pool1") -> None:
     """直接写入目标文件（使用 orjson 高速序列化，移除 fsync 提速）。"""
     global _cache, _cache_mtime, _rounds_cache, _rounds_cache_mtime
     _safe_makedirs(_DATA_DIR)
+    state_file, _ = _get_files(pool_id)
     with _write_lock:
         if _USE_ORJSON:
-            with _open_file(STATE_FILE, 'wb') as f:
+            with _open_file(state_file, 'wb') as f:
                 f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2))
         else:
-            with _open_file(STATE_FILE, 'w', encoding='utf-8') as f:
+            with _open_file(state_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False)
-        _cache = data
-        _cache_mtime = _safe_getmtime(STATE_FILE)
-        _rounds_cache = data.get('rounds', [])
-        _rounds_cache_mtime = _cache_mtime
-    _save_cumulative_cache(data)
+        _cache[pool_id] = data
+        _cache_mtime[pool_id] = _safe_getmtime(state_file)
+        _rounds_cache[pool_id] = data.get('rounds', [])
+        _rounds_cache_mtime[pool_id] = _cache_mtime[pool_id]
+    _save_cumulative_cache(data, pool_id)
 
 
-def _save_cumulative_cache(data: dict) -> None:
+def _save_cumulative_cache(data: dict, pool_id: str = "pool1") -> None:
     """将 cumulative 部分单独写入轻量级缓存文件（使用 orjson 高速序列化）。"""
     global _cumul_cache, _cumul_cache_mtime
     _safe_makedirs(_DATA_DIR)
+    _, cumul_file = _get_files(pool_id)
     cache_data = {
         "version":      data.get("version", _SCHEMA_VERSION),
         "last_updated": data.get("last_updated", ""),
@@ -196,54 +207,48 @@ def _save_cumulative_cache(data: dict) -> None:
     }
     with _write_lock:
         if _USE_ORJSON:
-            with _open_file(CUMULATIVE_CACHE_FILE, 'wb') as f:
+            with _open_file(cumul_file, 'wb') as f:
                 f.write(orjson.dumps(cache_data, option=orjson.OPT_INDENT_2))
         else:
-            with _open_file(CUMULATIVE_CACHE_FILE, 'w', encoding='utf-8') as f:
+            with _open_file(cumul_file, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, ensure_ascii=False)
-        _cumul_cache = cache_data["cumulative"]
-        _cumul_cache_mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE)
+        _cumul_cache[pool_id] = cache_data["cumulative"]
+        _cumul_cache_mtime[pool_id] = _safe_getmtime(cumul_file)
 
 
-def _load_cumulative_fast() -> dict:
-    """
-    轻量级 cumulative 加载：优先读取 2-5MB 的缓存文件，避免解析 537MB 的完整文件。
-
-    优先级：
-      1. 内存命中（_cumul_cache mtime 未变）→ 立即返回，~0ms
-      2. 缓存文件存在且 mtime 已变 → 解析 ~2-5MB，~50ms
-      3. 缓存文件不存在但 STATE_FILE 存在 → 回退到 _load_raw()，并顺便生成缓存文件
-      4. 两者都不存在 → 返回空 dict
-    """
+def _load_cumulative_fast(pool_id: str = "pool1") -> dict:
     global _cumul_cache, _cumul_cache_mtime
 
+    _, cumul_file = _get_files(pool_id)
+
     # 1. 内存命中
-    if _cumul_cache is not None and _safe_exists(CUMULATIVE_CACHE_FILE):
+    if pool_id in _cumul_cache and _safe_exists(cumul_file):
         try:
-            mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE)
-            if mtime == _cumul_cache_mtime:
-                return _cumul_cache
+            mtime = _safe_getmtime(cumul_file)
+            if mtime == _cumul_cache_mtime.get(pool_id):
+                return _cumul_cache[pool_id]
         except OSError:
             pass
 
     # 2. 缓存文件存在，读取它
-    if _safe_exists(CUMULATIVE_CACHE_FILE):
+    if _safe_exists(cumul_file):
         try:
-            mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE)
-            with _open_file(CUMULATIVE_CACHE_FILE, 'r', encoding='utf-8') as f:
+            mtime = _safe_getmtime(cumul_file)
+            with _open_file(cumul_file, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
             if isinstance(cache_data, dict):
-                _cumul_cache = cache_data.get('cumulative', {})
-                _cumul_cache_mtime = mtime
-                return _cumul_cache
+                _cumul_cache[pool_id] = cache_data.get('cumulative', {})
+                _cumul_cache_mtime[pool_id] = mtime
+                return _cumul_cache[pool_id]
         except (json.JSONDecodeError, OSError):
             pass
 
     # 3. 缓存文件不存在，回退到完整文件并生成缓存
-    if _safe_exists(STATE_FILE):
-        data = _load_raw()
+    state_file, _ = _get_files(pool_id)
+    if _safe_exists(state_file):
+        data = _load_raw(pool_id)
         try:
-            _save_cumulative_cache(data)
+            _save_cumulative_cache(data, pool_id)
         except Exception:
             pass
         return data.get('cumulative', {})
@@ -252,40 +257,33 @@ def _load_cumulative_fast() -> dict:
     return {}
 
 
-def _load_rounds_fast() -> list:
-    """
-    轻量级 rounds 加载：内存命中（mtime 未变）时立即返回，否则回退到 _load_raw() 并更新缓存。
-
-    优先级：
-      1. 内存命中（_rounds_cache mtime 未变）→ 立即返回，~0ms
-      2. 缓存失效或首次调用 → 调用 _load_raw()（~50ms，STATE_FILE 内存缓存命中时），
-         并将 rounds 列表写入 _rounds_cache
-    """
+def _load_rounds_fast(pool_id: str = "pool1") -> list:
     global _rounds_cache, _rounds_cache_mtime
 
-    if _rounds_cache is not None and _safe_exists(STATE_FILE):
+    state_file, _ = _get_files(pool_id)
+    if pool_id in _rounds_cache and _safe_exists(state_file):
         try:
-            mtime = _safe_getmtime(STATE_FILE)
-            if mtime == _rounds_cache_mtime:
-                return _rounds_cache
+            mtime = _safe_getmtime(state_file)
+            if mtime == _rounds_cache_mtime.get(pool_id):
+                return _rounds_cache[pool_id]
         except OSError:
             pass
 
-    data = _load_raw()
-    _rounds_cache = data.get('rounds', [])
-    _rounds_cache_mtime = _cache_mtime   # _load_raw() 已更新 _cache_mtime
-    return _rounds_cache
+    data = _load_raw(pool_id)
+    _rounds_cache[pool_id] = data.get('rounds', [])
+    _rounds_cache_mtime[pool_id] = _cache_mtime.get(pool_id, 0.0)
+    return _rounds_cache[pool_id]
 
 
 def invalidate_cache() -> None:
     """强制清除所有内存缓存，下次加载将重新读取磁盘文件。"""
     global _cache, _cache_mtime, _cumul_cache, _cumul_cache_mtime, _rounds_cache, _rounds_cache_mtime
-    _cache = None
-    _cache_mtime = 0.0
-    _cumul_cache = None
-    _cumul_cache_mtime = 0.0
-    _rounds_cache = None
-    _rounds_cache_mtime = 0.0
+    _cache.clear()
+    _cache_mtime.clear()
+    _cumul_cache.clear()
+    _cumul_cache_mtime.clear()
+    _rounds_cache.clear()
+    _rounds_cache_mtime.clear()
 
 
 def _next_round_id(data: dict) -> int:
@@ -299,36 +297,49 @@ def _next_round_id(data: dict) -> int:
 # 累计指标计算
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 做多：含费后 TP净0.54%，SL净0.86%
+# Pool1 做多：含费后 TP净0.54%，SL净0.86%
 _LONG_TP_PCT  = 0.0054
 _LONG_SL_PCT  = 0.0086
 
-# 做空：含费后 TP净0.74%，SL净0.66%
+# Pool1 做空：含费后 TP净0.74%，SL净0.66%
 _SHORT_TP_PCT = 0.0074
 _SHORT_SL_PCT = 0.0066
+
+# Pool2 双向对称：含费后 TP净0.94%，SL净0.86%
+_POOL2_TP_PCT = 0.0094
+_POOL2_SL_PCT = 0.0086
 
 _ALL_STATES = ("多头趋势", "空头趋势", "震荡市")
 
 
+def _get_tp_sl(direction: str, pool_id: str = 'pool1'):
+    """根据方向和策略池返回含费后净 TP/SL。"""
+    if pool_id == 'pool2':
+        return _POOL2_TP_PCT, _POOL2_SL_PCT
+    if direction == 'long':
+        return _LONG_TP_PCT, _LONG_SL_PCT
+    return _SHORT_TP_PCT, _SHORT_SL_PCT
+
+
 def _estimated_pnl_pct(overall_rate: float, total_triggers: int,
-                        direction: str = 'long') -> float:
+                        direction: str = 'long', pool_id: str = 'pool1') -> float:
     """
     估算累计盈亏百分比。
 
-    做多：每笔期望 = overall_rate × 0.54% - (1 - overall_rate) × 0.86%
-    做空：每笔期望 = overall_rate × 0.74% - (1 - overall_rate) × 0.66%
+    Pool1 做多：每笔期望 = overall_rate × 0.54% - (1 - overall_rate) × 0.86%
+    Pool1 做空：每笔期望 = overall_rate × 0.74% - (1 - overall_rate) × 0.66%
+    Pool2 双向：每笔期望 = overall_rate × 0.94% - (1 - overall_rate) × 0.86%
     估算总盈亏 = 每笔期望 × total_triggers
     """
-    tp_pct = _LONG_TP_PCT  if direction == 'long' else _SHORT_TP_PCT
-    sl_pct = _LONG_SL_PCT  if direction == 'long' else _SHORT_SL_PCT
+    tp_pct, sl_pct = _get_tp_sl(direction, pool_id)
     per_trade = overall_rate * tp_pct - (1.0 - overall_rate) * sl_pct
     return round(per_trade * total_triggers * 100, 4)   # 单位：%
 
 
-def _ev_per_trigger_pct(overall_rate: float, direction: str = 'long') -> float:
+def _ev_per_trigger_pct(overall_rate: float, direction: str = 'long',
+                         pool_id: str = 'pool1') -> float:
     """单次触发期望盈亏（百分比，未考虑杠杆）。"""
-    tp_pct = _LONG_TP_PCT  if direction == 'long' else _SHORT_TP_PCT
-    sl_pct = _LONG_SL_PCT  if direction == 'long' else _SHORT_SL_PCT
+    tp_pct, sl_pct = _get_tp_sl(direction, pool_id)
     per_trade = overall_rate * tp_pct - (1.0 - overall_rate) * sl_pct
     return round(per_trade * 100, 4)   # 单位：%
 
@@ -381,7 +392,8 @@ def _default_live_tracking() -> dict:
     }
 
 
-def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') -> dict:
+def _compute_cumulative_metrics(history: List[dict], direction: str = 'long',
+                                 pool_id: str = 'pool1') -> dict:
     """
     根据历次命中率记录计算累计指标。
 
@@ -415,7 +427,7 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') ->
     for h in history:
         all_hold_bars.extend(h.get('hold_bars', []))
     valid_holds = [hb for hb in all_hold_bars if hb >= 0]
-    avg_hold_bars = int(round(sum(valid_holds) / len(valid_holds))) if valid_holds else 0
+    avg_hold_bars = int(round(statistics.median(valid_holds))) if valid_holds else 0
     hold_bars_sample_count = len(valid_holds)
 
     if n == 0:
@@ -464,8 +476,8 @@ def _compute_cumulative_metrics(history: List[dict], direction: str = 'long') ->
         'total_triggers':         total_triggers,
         'total_hits':             total_hits,
         'overall_rate':           round(overall_rate, 6),
-        'estimated_pnl_pct':      _estimated_pnl_pct(overall_rate, total_triggers, direction),
-        'ev_per_trigger_pct':     _ev_per_trigger_pct(overall_rate, direction),
+        'estimated_pnl_pct':      _estimated_pnl_pct(overall_rate, total_triggers, direction, pool_id),
+        'ev_per_trigger_pct':     _ev_per_trigger_pct(overall_rate, direction, pool_id),
         'market_state_breakdown': _merge_market_state_breakdown(history),
         'avg_hold_bars':          avg_hold_bars,
         'hold_bars_sample_count': hold_bars_sample_count,
@@ -499,16 +511,21 @@ def _merge_round_into_data(
 
     for item in new_results:
         key = _combo_key(item['direction'], item['conditions'])
+        item_pool_id = item.get('pool_id', 'pool1')
 
         if key not in cumulative:
             cumulative[key] = {
                 'direction':    item['direction'],
+                'pool_id':      item_pool_id,
                 'conditions':   sorted(item['conditions']),
                 'history':      [],
                 'live_tracking': _default_live_tracking(),
             }
-        elif 'live_tracking' not in cumulative[key]:
-            cumulative[key]['live_tracking'] = _default_live_tracking()
+        else:
+            if 'live_tracking' not in cumulative[key]:
+                cumulative[key]['live_tracking'] = _default_live_tracking()
+            # 确保 pool_id 始终更新（兼容旧数据）
+            cumulative[key]['pool_id'] = item_pool_id
 
         entry = cumulative[key]
         entry['history'].append({
@@ -521,7 +538,8 @@ def _merge_round_into_data(
             'hold_bars':              item.get('hold_bars', []),
         })
 
-        metrics = _compute_cumulative_metrics(entry['history'], direction=item['direction'])
+        metrics = _compute_cumulative_metrics(entry['history'], direction=item['direction'],
+                                               pool_id=item_pool_id)
         entry.update(metrics)
         # 条件数量惩罚：超过 3 条每多 1 条扣 3 分（防过拟合）
         n_conds = len(entry.get('conditions', []))
@@ -538,20 +556,9 @@ def merge_round(
     direction: str,
     bar_count: int = 5000,
     timestamp: Optional[str] = None,
+    pool_id: str = "pool1",
 ) -> dict:
-    """
-    将一轮分析结果合并到持久化状态中。
-
-    Args:
-        new_results: signal_analyzer.analyze() 的返回值
-        direction:   'long' 或 'short'
-        bar_count:   本轮使用的 K 线数量（用于记录）
-        timestamp:   ISO 格式时间字符串，默认取当前时间
-
-    Returns:
-        本轮新增/更新的 cumulative 条目 dict（key 为 combo_key）
-    """
-    data = _load_raw()
+    data = _load_raw(pool_id)
 
     if timestamp is None:
         timestamp = datetime.now().isoformat(timespec='seconds')
@@ -563,21 +570,53 @@ def merge_round(
 
     data['version']      = _SCHEMA_VERSION
     data['last_updated'] = timestamp
-    _save_raw(data)
+    _save_raw(data, pool_id)
 
     return updated_keys
 
+
+def merge_results(
+    results: List[dict],
+    pool_id: str = "pool1",
+    bar_count: int = 5000,
+    timestamp: Optional[str] = None,
+) -> dict:
+    """合并 signal_analyzer.analyze 返回的结果，支持 pool_id。"""
+    data = _load_raw(pool_id)
+    if timestamp is None:
+        timestamp = datetime.now().isoformat(timespec='seconds')
+
+    updated_keys: dict = {}
+    round_id = _next_round_id(data)
+    
+    long_results = [r for r in results if r.get('direction') == 'long']
+    short_results = [r for r in results if r.get('direction') == 'short']
+
+    if long_results:
+        updated_keys.update(
+            _merge_round_into_data(data, long_results, 'long', bar_count, timestamp, round_id)
+        )
+        round_id += 1
+    if short_results:
+        updated_keys.update(
+            _merge_round_into_data(data, short_results, 'short', bar_count, timestamp, round_id)
+        )
+
+    data['version']      = _SCHEMA_VERSION
+    data['last_updated'] = timestamp
+    _save_raw(data, pool_id)
+
+    return updated_keys
 
 def merge_rounds(
     long_results: Optional[List[dict]],
     short_results: Optional[List[dict]],
     bar_count: int = 5000,
     timestamp: Optional[str] = None,
+    pool_id: str = "pool1",
 ) -> dict:
-    """
-    合并多方向结果，并只落盘一次（提升写入速度）。
-    """
-    data = _load_raw()
+    """旧的接口，通过 pool_id 支持多池"""
+    data = _load_raw(pool_id)
     if timestamp is None:
         timestamp = datetime.now().isoformat(timespec='seconds')
 
@@ -596,7 +635,7 @@ def merge_rounds(
 
     data['version']      = _SCHEMA_VERSION
     data['last_updated'] = timestamp
-    _save_raw(data)
+    _save_raw(data, pool_id)
 
     return updated_keys
 
@@ -768,36 +807,124 @@ def _prune_redundant_subsets(entries: Dict[str, dict]) -> Dict[str, dict]:
     return {k: v for k, v in entries.items() if k not in to_remove}
 
 
-def _ensure_pruned_cache_fresh() -> None:
-    """若去重缓存不存在或早于原始状态文件，则同步重建（同步/轻量操作）。"""
+def _ensure_pruned_cache_fresh(pool_id: str = "pool1") -> None:
+    state_file, cumul_file = _get_files(pool_id)
     try:
-        cache_mtime = _safe_getmtime(CUMULATIVE_CACHE_FILE) if _safe_exists(CUMULATIVE_CACHE_FILE) else 0.0
+        cache_mtime = _safe_getmtime(cumul_file) if _safe_exists(cumul_file) else 0.0
     except OSError:
         cache_mtime = 0.0
     try:
-        state_mtime = _safe_getmtime(STATE_FILE) if _safe_exists(STATE_FILE) else 0.0
+        state_mtime = _safe_getmtime(state_file) if _safe_exists(state_file) else 0.0
     except OSError:
         state_mtime = 0.0
-    if cache_mtime < state_mtime:   # 包含 cache_mtime==0（文件不存在）的情况
-        rebuild_pruned_cache()
+    if cache_mtime < state_mtime:
+        rebuild_pruned_cache(pool_id)
 
 
-def rebuild_pruned_cache() -> None:
+def _anchor_dedup(entries: Dict[str, dict], max_per_anchor: int = 4) -> Dict[str, dict]:
     """
-    对完整 cumulative 做一次层级过滤 + 去重，结果写入轻量级缓存文件。
+    锚点分组去重：相同方向且共享同一"锚定条件"（该方向下出现频次最高的条件）
+    的策略，按综合评分保留 Top max_per_anchor 条。
 
-    应在后台线程调用（两次 merge_round 均完成后），只执行一次，
-    避免在主线程 get_cumulative() 中重复去重操作。
+    互补保护：若两条策略的主导市场状态不同（如一条以空头市场为主、
+    另一条以震荡市为主），则认为它们互补，不计入同一限额。
     """
-    data = _load_raw()
+    from collections import defaultdict
+
+    def _main_state(v: dict) -> str:
+        """返回该策略触发最多的市场状态，如无则返回空字符串。"""
+        bd = v.get('market_state_breakdown') or {}
+        best, best_t = '', 0
+        for state, info in bd.items():
+            t = info.get('total_triggers', 0) if isinstance(info, dict) else 0
+            if t > best_t:
+                best_t, best = t, state
+        return best
+
+    # 统计每个方向下条件出现频次，用于决定“最高频锚点”
+    cond_freq: dict = defaultdict(lambda: defaultdict(int))
+    for entry in entries.values():
+        direction = entry.get('direction', 'long')
+        for cond in entry.get('conditions', []) or []:
+            cond_freq[direction][cond] += 1
+
+    def _choose_anchor(conds: list, direction: str) -> str:
+        """选择该方向下出现频次最高的条件作为锚点（频次并列取更短的条件）。"""
+        if not conds:
+            return '__none__'
+        freq_map = cond_freq.get(direction, {})
+        # 频次优先，其次条件长度（更短更通用），最后按字符串稳定排序
+        return sorted(
+            conds,
+            key=lambda c: (-freq_map.get(c, 0), len(c), c)
+        )[0]
+
+    # 按 (方向, 锚点条件) 分组
+    groups: dict = defaultdict(list)
+    for key, entry in entries.items():
+        conds = entry.get('conditions', []) or []
+        direction = entry.get('direction', 'long')
+        anchor = _choose_anchor(conds, direction)
+        groups[(direction, anchor)].append((key, entry))
+
+    result = {}
+    for group in groups.values():
+        if len(group) <= max_per_anchor:
+            # 数量未超限，全部保留
+            for key, entry in group:
+                result[key] = entry
+            continue
+
+        # 按综合评分降序排列
+        group.sort(key=lambda x: x[1].get('综合评分', 0.0), reverse=True)
+
+        kept = []
+        kept_states: list = []  # 已保留条目的主导状态列表
+
+        for key, entry in group:
+            ms = _main_state(entry)
+            # 互补保护：主导状态与已保留的全部不同，直接保留（不占名额）
+            if ms and ms not in kept_states:
+                kept.append((key, entry))
+                kept_states.append(ms)
+                continue
+            # 普通情况：按 Top-K 限额保留
+            if len(kept) < max_per_anchor:
+                kept.append((key, entry))
+                if ms and ms not in kept_states:
+                    kept_states.append(ms)
+
+        for key, entry in kept:
+            result[key] = entry
+
+    return result
+
+
+def rebuild_pruned_cache(pool_id: str = "pool1") -> None:
+    data = _load_raw(pool_id)
     cumulative = data.get("cumulative", {})
 
-    # 层级过滤：精品/优质直接保留；候选组合需满足稳定性准入条件
-    CANDIDATE_MAX_STD    = 0.05   # 候选组合的稳定性准入门槛
-    CANDIDATE_MIN_ROUNDS = 5      # 候选组合的最少出现轮次
+    CANDIDATE_MAX_STD    = 0.05
+    CANDIDATE_MIN_ROUNDS = 5
 
     def _keep_entry(v: dict) -> bool:
-        tier = _tier_from_rate(v.get('overall_rate', 0.0), v.get('direction', 'long'))
+        rate = v.get('overall_rate', 0.0)
+        direction = v.get('direction', 'long')
+
+        # 负期望策略直接排除（先于层级判断）
+        tp_pct, sl_pct = _get_tp_sl(direction, pool_id)
+        ev = rate * tp_pct - (1.0 - rate) * sl_pct
+        if ev <= 0:
+            return False
+
+        # pool2 两方向对称门槛：精品≥59%，优质≥55%，候选≥52%
+        if pool_id == 'pool2':
+            if rate >= 0.59: tier = '精品'
+            elif rate >= 0.55: tier = '优质'
+            elif rate >= 0.52: tier = '候选'
+            else: tier = ''
+        else:
+            tier = _tier_from_rate(rate, direction)
         if tier in ('精品', '优质'):
             return True
         if tier == '候选':
@@ -806,40 +933,29 @@ def rebuild_pruned_cache() -> None:
         return False
 
     filtered = {k: v for k, v in cumulative.items() if _keep_entry(v)}
-
-    # 对存量条目规范化（去除同族宽松+严格并存）
     normalized = _normalize_all_entries(filtered)
-
-    # 去重，只跑一次
     pruned = _prune_redundant_subsets(normalized)
+    # 锚点分组去重：每个同方向同核心条件的组最多保留 4 条（互补状态不受限）
+    pruned = _anchor_dedup(pruned, max_per_anchor=4)
 
-    # 写入轻量级缓存（不重写完整 STATE_FILE）
-    _save_cumulative_cache({**data, "cumulative": pruned})
+    # 用正确的 pool_id TP/SL 参数重新计算估算盈亏字段（修正旧数据用错参数的问题）
+    for entry in pruned.values():
+        rate = entry.get('overall_rate', 0.0)
+        direction = entry.get('direction', 'long')
+        total_triggers = entry.get('total_triggers', 0)
+        entry['estimated_pnl_pct'] = _estimated_pnl_pct(rate, total_triggers, direction, pool_id)
+        entry['ev_per_trigger_pct'] = _ev_per_trigger_pct(rate, direction, pool_id)
+
+    _save_cumulative_cache({**data, "cumulative": pruned}, pool_id)
 
 
-def get_cumulative(direction: Optional[str] = None) -> Dict[str, dict]:
-    """
-    读取所有（或指定方向的）累计结果。
-
-    去重由后台线程在两次 merge_round 完成后调用 rebuild_pruned_cache() 完成，
-    此处只做方向过滤，不再执行 O(n²) 去重操作。
-
-    Args:
-        direction: 'long' / 'short' / None（返回全部）
-
-    Returns:
-        dict，key 为 combo_key，value 为累计条目（已层级过滤+去重）。
-    """
-    # 检测：若 cumulative_cache 不存在或比 state_file 旧，则重建
-    _ensure_pruned_cache_fresh()
-
-    cumulative = _load_cumulative_fast()
-
-    # 方向过滤
+def get_cumulative(direction: Optional[str] = None, pool_id: str = "pool1") -> Dict[str, dict]:
+    _ensure_pruned_cache_fresh(pool_id)
+    cumulative = _load_cumulative_fast(pool_id)
+    
     if direction is not None:
-        cumulative = {k: v for k, v in cumulative.items()
-                      if v.get('direction') == direction}
-
+        cumulative = {k: v for k, v in cumulative.items() if v.get('direction') == direction}
+        
     return cumulative
 
 
@@ -1044,7 +1160,7 @@ def get_premium_pool(
           combo_key, direction, conditions, market_state,
           score, state_rate, state_triggers, tier
     """
-    cumulative = get_cumulative(direction)
+    cumulative = get_cumulative(direction, "pool1")
     if not cumulative:
         return []
 
@@ -1144,32 +1260,30 @@ def get_premium_pool(
     return results
 
 
-def get_rounds() -> List[dict]:
-    """返回所有历史轮次记录列表（按 round_id 升序）。内存缓存命中时无磁盘 IO。"""
-    rounds = _load_rounds_fast()
+def get_rounds(pool_id: str = "pool1") -> List[dict]:
+    rounds = _load_rounds_fast(pool_id)
     return sorted(rounds, key=lambda r: r.get('round_id', 0))
 
 
-def get_round(round_id: int) -> Optional[dict]:
-    """返回指定轮次的记录，不存在返回 None。"""
-    for r in get_rounds():
+def get_round(round_id: int, pool_id: str = "pool1") -> Optional[dict]:
+    for r in get_rounds(pool_id):
         if r.get('round_id') == round_id:
             return r
     return None
 
 
-def clear_all() -> None:
-    """清空所有历史记录（写入空骨架），同时删除轻量级缓存文件。"""
+def clear_all(pool_id: str = "pool1") -> None:
     global _cumul_cache, _cumul_cache_mtime
     invalidate_cache()
-    if _safe_exists(CUMULATIVE_CACHE_FILE):
+    
+    _, cumul_file = _get_files(pool_id)
+    if _safe_exists(cumul_file):
         try:
-            os.remove(CUMULATIVE_CACHE_FILE)
+            os.remove(cumul_file)
         except OSError:
             pass
-    _cumul_cache = None
-    _cumul_cache_mtime = 0.0
-    _save_raw(_empty_state())
+            
+    _save_raw(_empty_state(), pool_id)
 
 
 def get_stable_combos(
@@ -1177,25 +1291,9 @@ def get_stable_combos(
     min_avg_rate: float = 0.62,
     max_rate_std: float = 0.05,
     direction: Optional[str] = None,
+    pool_id: str = "pool1",
 ) -> List[dict]:
-    """
-    返回通过多轮稳定性筛选的组合列表，按综合评分降序。
-
-    筛选条件（默认值）：
-      - appear_rounds >= 5
-      - avg_rate      >= 0.62
-      - rate_std      <= 0.05
-
-    Args:
-        min_rounds:   最少出现轮次
-        min_avg_rate: 最低平均命中率
-        max_rate_std: 最高命中率标准差
-        direction:    过滤方向（None = 全部）
-
-    Returns:
-        List[dict]，每个元素即 cumulative 条目，附加字段 'combo_key'。
-    """
-    cumulative = get_cumulative(direction)
+    cumulative = get_cumulative(direction, pool_id)
     stable = []
     for key, entry in cumulative.items():
         if (
@@ -1208,20 +1306,9 @@ def get_stable_combos(
     return stable
 
 
-def summary() -> dict:
-    """
-    返回当前状态摘要（用于 UI 信息展示）。
-
-    Returns:
-        {
-          "total_rounds"   : int,
-          "total_combos"   : int,
-          "stable_combos"  : int,
-          "last_updated"   : str,
-        }
-    """
-    data = _load_raw()
-    stable = get_stable_combos()
+def summary(pool_id: str = "pool1") -> dict:
+    data = _load_raw(pool_id)
+    stable = get_stable_combos(pool_id=pool_id)
     return {
         'total_rounds':  len(data.get('rounds', [])),
         'total_combos':  len(data.get('cumulative', {})),
@@ -1230,20 +1317,8 @@ def summary() -> dict:
     }
 
 
-def record_live_result(combo_key: str, hit: bool) -> dict:
-    """
-    记录一笔实盘/模拟盘结果，更新对应组合的 live_tracking，并触发衰减告警检查。
-
-    衰减告警条件：total >= 10 AND live_rate < avg_rate - 0.10
-
-    Args:
-        combo_key: 组合唯一键（格式同 _combo_key）
-        hit:       True 表示止盈命中，False 表示止损/超时
-
-    Returns:
-        更新后的 live_tracking dict；若 combo_key 不存在则返回空 dict。
-    """
-    data = _load_raw()
+def record_live_result(combo_key: str, hit: bool, pool_id: str = "pool1") -> dict:
+    data = _load_raw(pool_id)
     cumulative = data.get('cumulative', {})
 
     if combo_key not in cumulative:
@@ -1267,21 +1342,12 @@ def record_live_result(combo_key: str, hit: bool) -> dict:
     lt['alert'] = (lt['total'] >= 10) and (lt['live_rate'] < avg_rate - 0.10)
 
     data['last_updated'] = lt['last_updated']
-    _save_raw(data)
+    _save_raw(data, pool_id)
     return dict(lt)
 
 
-def get_live_alerts() -> List[dict]:
-    """
-    返回所有触发衰减告警的组合列表。
-
-    衰减定义：live_rate < avg_rate - 0.10（且 total >= 10）
-
-    Returns:
-        List[dict]，每个元素包含 combo_key、avg_rate、live_tracking 字段，
-        按 (avg_rate - live_rate) 降序排列（衰减最严重的排前面）。
-    """
-    cumulative = get_cumulative()
+def get_live_alerts(pool_id: str = "pool1") -> List[dict]:
+    cumulative = get_cumulative(None, pool_id)
     alerts: List[dict] = []
 
     for key, entry in cumulative.items():
@@ -1304,20 +1370,86 @@ def get_live_alerts() -> List[dict]:
     return alerts
 
 
-def get_cumulative_results(top_n: int = 1000, direction: Optional[str] = None) -> Tuple[List[dict], dict]:
-    """
-    UI 调用的接口，返回按综合评分降序的累计结果列表及原始 cumulative 字典。
-
-    返回值为 (items, cumulative)：
-      items      : List[dict]，每个元素为附加了 combo_key 字段的累计条目，按综合评分降序
-      cumulative : dict，原始 cumulative 字典，供调用方复用（避免重复调用 get_cumulative()）
-    """
-    cumulative = get_cumulative(direction)
+def get_cumulative_results(top_n: int = 1000, direction: Optional[str] = None, pool_id: str = "pool1") -> Tuple[List[dict], dict]:
+    cumulative = get_cumulative(direction, pool_id)
     items = [{**v, 'combo_key': k} for k, v in cumulative.items()]
     items.sort(key=lambda x: x.get('综合评分', 0.0), reverse=True)
     return items[:top_n], cumulative
 
 
-def clear() -> None:
-    """UI 调用的清空接口，等同于 clear_all()。"""
-    clear_all()
+def clear(pool_id: str = "pool1") -> None:
+    clear_all(pool_id)
+
+
+def get_cumulative_both_pools() -> Tuple[Dict[str, dict], Dict[str, dict]]:
+    """一次性返回两个池子的 cumulative dict"""
+    return get_cumulative(pool_id='pool1'), get_cumulative(pool_id='pool2')
+
+def get_ev_per_bar(combo: dict) -> float:
+    """
+    根据 combo 内的 pool_id 字段和 overall_rate 自动选择净 TP/SL 计算每根 K 线的期望收益。
+    """
+    from config import (
+        POOL2_LONG_TP_PCT, POOL2_LONG_SL_PCT, 
+        POOL2_SHORT_TP_PCT, POOL2_SHORT_SL_PCT
+    )
+    
+    pool_id = combo.get('pool_id', 'pool1')
+    direction = combo.get('direction', 'long')
+    overall_rate = combo.get('overall_rate', 0.0)
+    avg_hold_bars = max(combo.get('avg_hold_bars', 1), 1)  # 避免除以 0
+    
+    if pool_id == 'pool2':
+        if direction == 'long':
+            tp = POOL2_LONG_TP_PCT - 0.0006
+            sl = POOL2_LONG_SL_PCT + 0.0006
+        else:
+            tp = POOL2_SHORT_TP_PCT - 0.0006
+            sl = POOL2_SHORT_SL_PCT + 0.0006
+    else:
+        if direction == 'long':
+            tp = 0.0054  # 0.6% - 0.06%
+            sl = 0.0086  # 0.8% + 0.06%
+        else:
+            tp = 0.0074  # 0.8% - 0.06%
+            sl = 0.0066  # 0.6% + 0.06%
+
+    ev_per_trade = overall_rate * tp - (1.0 - overall_rate) * sl
+    return ev_per_trade / avg_hold_bars
+
+
+def backup_to_github(target_dir: Optional[str] = None) -> Dict[str, object]:
+    """备份信号分析数据到可提交目录（支持 pool1/pool2）。"""
+    if target_dir is None:
+        target_dir = os.path.join(_DATA_DIR, "github_backup")
+    _safe_makedirs(target_dir)
+
+    def _write_json(path: str, payload: dict) -> None:
+        if _USE_ORJSON:
+            with _open_file(path, 'wb') as f:
+                f.write(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
+        else:
+            with _open_file(path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    result: Dict[str, object] = {"target_dir": target_dir, "files": []}
+
+    for pool_id in ("pool1", "pool2"):
+        data = _load_raw(pool_id)
+        state_name = "signal_analysis_state.json" if pool_id == "pool1" else "signal_analysis_state_pool2.json"
+        cumul_name = "signal_cumulative_cache.json" if pool_id == "pool1" else "signal_cumulative_cache_pool2.json"
+
+        state_path = os.path.join(target_dir, state_name)
+        cumul_path = os.path.join(target_dir, cumul_name)
+
+        _write_json(state_path, data)
+        _write_json(cumul_path, {
+            "version": data.get("version", _SCHEMA_VERSION),
+            "last_updated": data.get("last_updated", ""),
+            "cumulative": data.get("cumulative", {}),
+        })
+
+        result["files"].extend([state_path, cumul_path])
+
+    return result
+

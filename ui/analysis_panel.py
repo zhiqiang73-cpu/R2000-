@@ -298,9 +298,9 @@ class TradeLogWidget(QtWidgets.QWidget):
         layout.addLayout(toolbar)
         
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(11)
+        self.table.setColumnCount(12)
         self.table.setHorizontalHeaderLabels([
-            "方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "均持", "市场状态", "指纹摘要"
+            "方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "均持", "市场状态", "指纹摘要", "策略池"
         ])
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
@@ -394,6 +394,17 @@ class TradeLogWidget(QtWidgets.QWidget):
             fp_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(i, 10, fp_item)
 
+            # 策略池
+            pool_id_str = t.get("pool_id", "") or ""
+            pool_id_item = QtWidgets.QTableWidgetItem(pool_id_str)
+            if pool_id_str == "pool1":
+                pool_id_item.setForeground(QtGui.QColor("#00BCD4"))
+            elif pool_id_str == "pool2":
+                pool_id_item.setForeground(QtGui.QColor("#FFC107"))
+            else:
+                pool_id_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
+            self.table.setItem(i, 11, pool_id_item)
+
         # 自动根据内容调整列宽，保持可横向滚动
         self.table.resizeColumnsToContents()
         self._update_limit_hint(len(self._latest_trades))
@@ -421,7 +432,7 @@ class TradeLogWidget(QtWidgets.QWidget):
             return
         if not path.lower().endswith(".txt"):
             path += ".txt"
-        headers = ["方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "均持", "市场状态", "指纹摘要"]
+        headers = ["方向", "入场时间", "入场价", "出场时间", "出场价", "盈利(USDT)", "收益率%", "持仓", "均持", "市场状态", "指纹摘要", "策略池"]
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\t".join(headers) + "\n")
@@ -438,6 +449,7 @@ class TradeLogWidget(QtWidgets.QWidget):
                         str(t.get("avg_hold", "-")),
                         str(t.get("regime", "")),
                         str(t.get("fingerprint", "")),
+                        str(t.get("pool_id", "")),
                     ]
                     f.write("\t".join(row) + "\n")
             QtWidgets.QMessageBox.information(self, "导出完成", f"已导出到:\n{path}")
@@ -471,9 +483,9 @@ class BacktestLogWidget(QtWidgets.QWidget):
         layout.addLayout(toolbar)
 
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels([
-            "事件", "时间", "方向", "价格", "止损", "止盈", "说明"
+            "事件", "时间", "方向", "价格", "止损", "止盈", "说明", "策略池"
         ])
         header = self.table.horizontalHeader()
         header.setStretchLastSection(True)
@@ -511,6 +523,7 @@ class BacktestLogWidget(QtWidgets.QWidget):
             sl = log.get("stop_loss", "")
             tp = log.get("take_profit", "")
             detail = log.get("detail", "")
+            pool_id = log.get("info", {}).get("meta", {}).get("pool_id", "")
 
             self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(event))
             self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(log.get("time", "")))
@@ -526,6 +539,15 @@ class BacktestLogWidget(QtWidgets.QWidget):
             self.table.setItem(i, 4, QtWidgets.QTableWidgetItem(str(sl)))
             self.table.setItem(i, 5, QtWidgets.QTableWidgetItem(str(tp)))
             self.table.setItem(i, 6, QtWidgets.QTableWidgetItem(str(detail)))
+
+            pool_id_item = QtWidgets.QTableWidgetItem(pool_id)
+            if pool_id == "pool1":
+                pool_id_item.setForeground(QtGui.QColor("#00BCD4"))  # ACCENT_CYAN
+            elif pool_id == "pool2":
+                pool_id_item.setForeground(QtGui.QColor("#FFC107"))  # ACCENT_GOLD
+            else:
+                pool_id_item.setForeground(QtGui.QColor("#9e9e9e"))
+            self.table.setItem(i, 7, pool_id_item)
 
         self.table.resizeColumnsToContents()
         self._update_limit_hint(len(self._latest_logs))
@@ -551,13 +573,14 @@ class BacktestLogWidget(QtWidgets.QWidget):
             return
         if not path.lower().endswith(".txt"):
             path += ".txt"
-        headers = ["事件", "时间", "方向", "价格", "止损", "止盈", "说明"]
+        headers = ["事件", "时间", "方向", "价格", "止损", "止盈", "说明", "策略池"]
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\t".join(headers) + "\n")
                 # 导出时去重，避免重复累计刷屏
                 seen = set()
                 for log in self._latest_logs:
+                    pool_id = log.get("info", {}).get("meta", {}).get("pool_id", "")
                     row = [
                         str(log.get("event", "")),
                         str(log.get("time", "")),
@@ -566,6 +589,7 @@ class BacktestLogWidget(QtWidgets.QWidget):
                         str(log.get("stop_loss", "")),
                         str(log.get("take_profit", "")),
                         str(log.get("detail", "")),
+                        str(pool_id),
                     ]
                     key = tuple(row)
                     if key in seen:
@@ -662,7 +686,7 @@ class MarketRegimeWidget(QtWidgets.QWidget):
     def _init_table(self):
         """初始化方向 × 市场状态双维表格"""
         from core.market_regime import MarketRegime
-        regimes = MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN]
+        regimes = MarketRegime.ALL_REGIMES + [MarketRegime.UNKNOWN, "多头趋势", "空头趋势", "震荡市"]
         self._row_specs = []
         for direction in ("long", "short"):
             if direction == "short":

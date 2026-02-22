@@ -159,17 +159,30 @@ class SignalLiveMonitor:
 
         _tier_map = tier_map or {}
 
-        # 1. 过滤：该市场状态下有历史触发记录的组合
+        # 1. 过滤：优先用当前市场状态专项统计，无专项时回退到整体统计
         valid_triggered = []
         for key in triggered_keys:
             entry = cumulative.get(key)
             if not entry:
                 continue
+            # 整体无记录才真正跳过
+            if entry.get('total_triggers', 0) == 0:
+                continue
             breakdown = entry.get('market_state_breakdown', {})
             state_info = breakdown.get(market_state, {})
+            direction = entry.get('direction', 'long')
+            _thresh = 0.64 if direction == 'long' else 0.52
             if state_info.get('total_triggers', 0) > 0:
-                tier = _tier_map.get(key, "精品")
-                valid_triggered.append((key, entry, tier))
+                _trig = state_info.get('total_triggers', 0)
+                _wr = state_info.get('avg_rate', 0.0)
+                # 样本≥5时做命中率过滤
+                if _trig >= 5 and _wr < _thresh:
+                    continue
+            # 无专项数据时用整体命中率做过滤
+            elif entry.get('overall_rate', 0.0) < _thresh:
+                continue
+            tier = _tier_map.get(key, "精品")
+            valid_triggered.append((key, entry, tier))
 
         if not valid_triggered:
             return None
@@ -183,14 +196,9 @@ class SignalLiveMonitor:
                 bkd = (item[1].get('market_state_breakdown') or {}).get(market_state, {})
                 return bkd.get('avg_rate', 0.0)
 
-            if market_state == "多头趋势":
-                longs = [x for x in pool if x[1].get('direction') == 'long']
-                return max(longs, key=_state_wr) if longs else None
-            elif market_state == "空头趋势":
-                shorts = [x for x in pool if x[1].get('direction') == 'short']
-                return max(shorts, key=_state_wr) if shorts else None
-            else:  # 震荡市
-                return max(pool, key=_state_wr)
+            # 不按方向过滤，所有方向均参与竞争
+            # 逆势安全检查由 live_trading_engine 的 counter-trend 逻辑负责
+            return max(pool, key=_state_wr)
 
         # 精品 → 高频，两层兜底
         elite_pool = [x for x in valid_triggered if x[2] == "精品"]

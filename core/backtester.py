@@ -75,6 +75,7 @@ class TradeRecord:
     signal_rate: float = 0.0            # 综合命中率 overall_rate
     signal_score: float = 0.0          # 综合评分
     avg_hold_bars: int = 0              # 策略平均持仓（用于时间衰减）
+    pool_id: str = ""                   # 来源池：pool1 / pool2
 
 
 @dataclass
@@ -367,7 +368,7 @@ class Backtester:
     def run_with_strategy(self, df: pd.DataFrame, features: np.ndarray,
                           strategy_weights: np.ndarray,
                           long_threshold: float, short_threshold: float,
-                          max_hold: int = 120) -> BacktestResult:
+                          max_hold: int = 60) -> BacktestResult:
         """
         使用策略权重运行回测
         

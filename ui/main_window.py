@@ -261,6 +261,7 @@ class SignalBacktestWorker(QtCore.QObject):
         self._labels_ready = False
         self.strict_state_filter = False  # 严格市场状态过滤：⚠状态禁止开仓
         self.use_alt_tpsl = False  # 回测试验 TP/SL 开关
+        self.trailing_stop_enabled = False  # 是否启用追踪止损
 
     @QtCore.pyqtSlot()
     def run_backtest(self):
@@ -269,7 +270,7 @@ class SignalBacktestWorker(QtCore.QObject):
             import threading as _threading
             import pandas as _pd
             from utils.indicators import calculate_all_indicators
-            from core.signal_store import get_cumulative
+            from core.signal_store import get_cumulative_both_pools
             from core.signal_analyzer import (
                 _build_condition_arrays,
                 LONG_TP1_PCT, LONG_SL_PCT,
@@ -301,7 +302,8 @@ class SignalBacktestWorker(QtCore.QObject):
             self._precompute_failed = False
             self._df_work = None
             self._cond = None
-            self._valid = None
+            self._valid_p1 = None
+            self._valid_p2 = None
 
             def _make_running_metrics(records, init_cap, current_pos=None):
                 total_trades = len(records)
@@ -357,10 +359,10 @@ class SignalBacktestWorker(QtCore.QObject):
                 try:
                     self.labeling_progress.emit("正在计算所有指标...")
                     df_work = calculate_all_indicators(self.df.copy())
-                    cumulative = get_cumulative()
-                    valid = {k: v for k, v in cumulative.items()
-                             if v.get('appear_rounds', 0) >= 3}
-                    if not valid:
+                    p1, p2 = get_cumulative_both_pools()
+                    valid_p1 = {k: v for k, v in p1.items() if v.get('appear_rounds', 0) >= 2}
+                    valid_p2 = {k: v for k, v in p2.items() if v.get('appear_rounds', 0) >= 2}
+                    if not valid_p1 and not valid_p2:
                         self._precompute_failed = True
                         self.error.emit("策略池为空，请先完成信号分析")
                         return
@@ -372,7 +374,8 @@ class SignalBacktestWorker(QtCore.QObject):
 
                     self._df_work = df_work
                     self._cond = cond
-                    self._valid = valid
+                    self._valid_p1 = valid_p1
+                    self._valid_p2 = valid_p2
                     self._precompute_ready = True
                     self.labeling_progress.emit("预计算完成，正在播放...")
                 except Exception as exc:
@@ -385,7 +388,8 @@ class SignalBacktestWorker(QtCore.QObject):
             labels_arr = None
             df_work = None
             cond = None
-            valid = None
+            valid_p1 = None
+            valid_p2 = None
             prep_initialized = False
 
             trade_records = []
@@ -399,6 +403,9 @@ class SignalBacktestWorker(QtCore.QObject):
             e_margin = None
             e_key = None
             e_info = None
+            e_pool_id = None
+            e_avg_hold_bars = 0          # 策略平均持仓根数
+            e_state = ""                 # 入场时的市场状态（三态）
             # 动态止损追踪状态
             peak_pnl_pct = 0.0           # 持仓期间杠杆后峰值盈亏%
             ever_reached_threshold = False  # 是否曾触达保本阈值
@@ -429,7 +436,8 @@ class SignalBacktestWorker(QtCore.QObject):
                 if self._precompute_ready and not prep_initialized:
                     df_work = self._df_work
                     cond = self._cond
-                    valid = self._valid
+                    valid_p1 = self._valid_p1
+                    valid_p2 = self._valid_p2
                     labels_arr = np.zeros(len(df_work), dtype=int)
                     self.labels = _pd.Series(labels_arr, index=df_work.index, copy=False)
                     self._labels_ready = True
@@ -464,6 +472,11 @@ class SignalBacktestWorker(QtCore.QObject):
                             bar2    = int(_cfg.get("TIME_DECAY_BAR_2", 180))
                             sl1_pnl = float(_cfg.get("TIME_DECAY_SL_1", -10.0))
                             sl2_pnl = float(_cfg.get("TIME_DECAY_SL_2", -5.0))
+
+                            # 根据策略平均持仓动态计算时间衰减阈值（与 backtester.py 逻辑一致）
+                            if e_avg_hold_bars >= 10:
+                                bar1 = int(e_avg_hold_bars * 0.50)
+                                bar2 = int(e_avg_hold_bars * 0.70)
 
                             if not ever_reached_threshold and peak_pnl_pct >= bp_thr:
                                 # 保本触发：浮盈达到阈值，止损上移
@@ -511,11 +524,18 @@ class SignalBacktestWorker(QtCore.QObject):
                             (is_long and hi >= tp) or (not is_long and lo <= tp)
                         )
                         hit_sl = (is_long and lo <= sl) or (not is_long and hi >= sl)
+                        # 方案2：入场K线保护 — 前2根K线内屏蔽止损，给价格足够呼吸空间
+                        if hold_bars <= 2:
+                            hit_sl = False
                         timed  = hold_bars >= MAX_HOLD
 
                         if hit_tp and not hit_sl:
-                            # ── 阶段1 TP1 命中：分批止盈 70%，剩余 30% 追踪 ──
-                            tp1_ratio    = float(_cfg.get("STAGED_TP_RATIO_1", 0.70))
+                            if not getattr(self, 'trailing_stop_enabled', False):
+                                # 若未开启追踪止损，TP1 命中则全平
+                                tp1_ratio = 1.0
+                            else:
+                                tp1_ratio = float(_cfg.get("STAGED_TP_RATIO_1", 0.70))
+                            
                             remain_ratio = 1.0 - tp1_ratio
                             active_margin  = e_margin or (capital * PCT)
                             partial_margin = active_margin * tp1_ratio
@@ -524,13 +544,15 @@ class SignalBacktestWorker(QtCore.QObject):
                             )
                             pnl = pnl_pct * partial_margin * LEVERAGE
                             capital += pnl
-                            _append_trade_log("tp1_partial", cur, e_dir, tp, {
+                            
+                            note_text = "TP1全平仓" if tp1_ratio == 1.0 else f"TP1分批平仓{tp1_ratio:.0%}→剩余{remain_ratio:.0%}进追踪阶段"
+                            _append_trade_log("tp1_partial" if tp1_ratio < 1.0 else "tp_full", cur, e_dir, tp, {
                                 "profit_pct": round(pnl_pct * 100.0, 2),
                                 "hold_bars": hold_bars,
                                 "entry_price": round(e_price, 2),
                                 "stop_loss": sl,
                                 "take_profit": tp,
-                                "note": f"TP1分批平仓{tp1_ratio:.0%}→剩余{remain_ratio:.0%}进追踪阶段",
+                                "note": note_text,
                             })
                             trade_records.append(TradeRecord(
                                 entry_idx=e_idx, exit_idx=cur,
@@ -538,7 +560,7 @@ class SignalBacktestWorker(QtCore.QObject):
                                 entry_price=e_price, exit_price=tp,
                                 size=partial_margin * LEVERAGE / e_price,
                                 profit=pnl, profit_pct=pnl_pct * 100,
-                                hold_periods=hold_bars, exit_reason="tp1_partial",
+                                hold_periods=hold_bars, exit_reason="tp1_partial" if tp1_ratio < 1.0 else "take_profit",
                                 stop_loss=sl or 0.0,
                                 take_profit=tp or 0.0,
                                 liquidation_price=0.0,
@@ -546,32 +568,53 @@ class SignalBacktestWorker(QtCore.QObject):
                                 signal_key=e_key or "",
                                 signal_rate=(e_info or {}).get('overall_rate', 0.0),
                                 signal_score=(e_info or {}).get('综合评分', 0.0),
+                                pool_id=e_pool_id or "",
+                                market_regime=e_state,
+                                avg_hold_bars=e_avg_hold_bars,
                             ))
-                            # 进入阶段2：SL 上移至开仓价保本，追踪止损从 TP1 开始
-                            pos_stage  = 2
-                            e_margin   = active_margin * remain_ratio
-                            peak_price = tp
-                            trail_pct  = float(_cfg.get("TRAILING_STOP_PCT", 0.08))
-                            sl = max(e_price, peak_price * (1.0 - trail_pct)) if is_long \
-                                 else min(e_price, peak_price * (1.0 + trail_pct))
-                            # 发射剩余仓位持仓更新
-                            cur_pos = Position(
-                                side=PositionSide.LONG if is_long else PositionSide.SHORT,
-                                entry_price=e_price, entry_idx=e_idx,
-                                size=e_margin * LEVERAGE / e_price,
-                                stop_loss=sl, take_profit=tp, liquidation_price=0.0,
-                                margin=e_margin,
-                            )
-                            try:
-                                cur_pos.signal_key   = e_key or ""
-                                cur_pos.signal_rate  = (e_info or {}).get('overall_rate', 0.0)
-                                cur_pos.signal_score = (e_info or {}).get('综合评分', 0.0)
-                            except Exception:
-                                pass
-                            m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
-                            m["current_bar"] = cur
-                            m["trade_logs"]  = list(trade_logs)
-                            self.rt_update.emit(m, list(trade_records))
+                            
+                            if tp1_ratio == 1.0:
+                                # 全平仓
+                                in_pos = False
+                                e_idx = -1
+                                e_price = 0.0
+                                e_margin = 0.0
+                                e_key = None
+                                e_info = None
+                                pos_stage = 0
+                                _append_trade_log("position_closed", cur, e_dir, tp, {
+                                    "reason": "TP1全平仓结束"
+                                })
+                                m = _make_running_metrics(trade_records, INITIAL_CAP)
+                                m["current_bar"] = cur
+                                m["trade_logs"]  = list(trade_logs)
+                                self.rt_update.emit(m, list(trade_records))
+                            else:
+                                # 进入阶段2：SL 上移至开仓价保本，追踪止损从 TP1 开始
+                                pos_stage  = 2
+                                e_margin   = active_margin * remain_ratio
+                                peak_price = tp
+                                trail_pct  = float(_cfg.get("TRAILING_STOP_PCT", 0.08))
+                                sl = max(e_price, peak_price * (1.0 - trail_pct)) if is_long \
+                                     else min(e_price, peak_price * (1.0 + trail_pct))
+                                # 发射剩余仓位持仓更新
+                                cur_pos = Position(
+                                    side=PositionSide.LONG if is_long else PositionSide.SHORT,
+                                    entry_price=e_price, entry_idx=e_idx,
+                                    size=e_margin * LEVERAGE / e_price,
+                                    stop_loss=sl, take_profit=tp, liquidation_price=0.0,
+                                    margin=e_margin,
+                                )
+                                try:
+                                    cur_pos.signal_key   = e_key or ""
+                                    cur_pos.signal_rate  = (e_info or {}).get('overall_rate', 0.0)
+                                    cur_pos.signal_score = (e_info or {}).get('综合评分', 0.0)
+                                except Exception:
+                                    pass
+                                m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
+                                m["current_bar"] = cur
+                                m["trade_logs"]  = list(trade_logs)
+                                self.rt_update.emit(m, list(trade_records))
 
                         elif hit_sl or timed:
                             # ── SL 触发 / 超时平仓（含阶段2追踪止损触发）────────
@@ -606,9 +649,14 @@ class SignalBacktestWorker(QtCore.QObject):
                                 signal_key=e_key or "",
                                 signal_rate=(e_info or {}).get('overall_rate', 0.0),
                                 signal_score=(e_info or {}).get('综合评分', 0.0),
+                                pool_id=e_pool_id or "",
+                                market_regime=e_state,
+                                avg_hold_bars=e_avg_hold_bars,
                             ))
                             in_pos = False
                             e_margin = None
+                            e_avg_hold_bars = 0
+                            e_state = ""
                             self.rt_update.emit(
                                 {**_make_running_metrics(trade_records, INITIAL_CAP), "trade_logs": list(trade_logs)},
                                 list(trade_records),
@@ -648,73 +696,102 @@ class SignalBacktestWorker(QtCore.QObject):
                         continue
 
                     state = detect_state(float(adx), float(slope))
-                    # 方向预过滤：多头趋势只做多，空头趋势只做空，震荡市两边均可
-                    if state == '多头趋势':
-                        _allowed = {'long'}
-                    elif state == '空头趋势':
-                        _allowed = {'short'}
-                    else:
-                        _allowed = {'long', 'short'}
+                    # 策略池的信号是超卖/超买反弹型，允许所有方向
+                    # 由条件匹配和EV per bar自然过滤，不强制方向限制
+                    _allowed = {'long', 'short'}
                     _triggered = []
-                    for key, entry in valid.items():
-                        d = entry.get('direction', 'long')
-                        if d not in _allowed:
-                            continue
-                        conds = entry.get('conditions', [])
-                        bkd   = (entry.get('market_state_breakdown') or {}).get(state, {})
-                        if bkd.get('total_triggers', 0) == 0:
-                            continue
-                        arr = cond.get(d, {})
-                        if all(bool(arr.get(c, [False])[cur]) for c in conds if c in arr):
-                            state_wr = bkd.get('avg_rate', 0.0)
-                            # 严格市场状态过滤：若该状态下触发次数≥5且命中率低于候选门槛（⚠），则跳过
-                            if self.strict_state_filter:
-                                _thresh = 0.64 if d == 'long' else 0.52
-                                _trig   = bkd.get('total_triggers', 0)
-                                if _trig >= 5 and state_wr < _thresh:
+                    
+                    from core.signal_store import get_ev_per_bar
+                    from config import POOL2_LONG_TP_PCT, POOL2_LONG_SL_PCT, POOL2_SHORT_TP_PCT, POOL2_SHORT_SL_PCT
+                    
+                    for pool_id, valid in [('pool1', valid_p1), ('pool2', valid_p2)]:
+                        for key, entry in valid.items():
+                            d = entry.get('direction', 'long')
+                            if d not in _allowed:
+                                continue
+                            conds = entry.get('conditions', [])
+                            bkd   = (entry.get('market_state_breakdown') or {}).get(state, {})
+                            _wr_thresh = 0.64 if d == 'long' else 0.52
+                            if bkd.get('total_triggers', 0) == 0:
+                                # 当前市场状态无专项记录，回退到整体统计
+                                if entry.get('total_triggers', 0) == 0:
                                     continue
-                            _triggered.append((key, entry, d, state_wr, len(conds)))
-                    # 按状态专项命中率降序，同分时少条件优先
+                                state_wr = entry.get('overall_rate', 0.0)
+                                # 无专项数据时整体胜率不达标则跳过（与 signal_live_monitor 一致）
+                                if state_wr < _wr_thresh:
+                                    continue
+                            else:
+                                state_wr = bkd.get('avg_rate', 0.0)
+                                # 专项样本≥5时做命中率过滤
+                                if bkd.get('total_triggers', 0) >= 5 and state_wr < _wr_thresh:
+                                    continue
+                            arr = cond.get(d, {})
+                            if all(bool(arr.get(c, [False])[cur]) for c in conds if c in arr):
+                                # EV per bar 选池
+                                ev_bar = get_ev_per_bar(entry)
+                                _triggered.append((key, entry, d, ev_bar, len(conds), pool_id))
+                    
+                    # 按 EV per bar 降序，同分时少条件优先
                     best_entry = None
                     if _triggered:
                         _triggered.sort(key=lambda x: (-x[3], x[4]))
                         _best = _triggered[0]
-                        best_entry = (_best[0], _best[1], _best[2])
+                        best_entry = (_best[0], _best[1], _best[2], _best[5])
                     if best_entry:
-                        key, info, d = best_entry
-                        in_pos, e_price, e_idx, e_dir = True, cl, cur, d
-                        e_key, e_info = key, info
-                        labels_arr[cur] = 1 if d == 'long' else -1
-                        self.label_found.emit(cur, int(labels_arr[cur]))
-                        tp = cl * (1 + long_tp_pct)  if d == 'long' else cl * (1 - short_tp_pct)
-                        sl = cl * (1 - long_sl_pct)  if d == 'long' else cl * (1 + short_sl_pct)
-                        e_margin = capital * PCT
-                        # 重置动态止损状态
-                        peak_pnl_pct = 0.0
-                        ever_reached_threshold = False
-                        pos_stage  = 1
-                        peak_price = cl
-                        stage2_margin = 0.0
-                        _append_trade_log("entry", cur, d, cl, {
-                            "reason": "signal",
-                            "meta": {"signal_key": key},
-                            "stop_loss": sl,
-                            "take_profit": tp,
-                            "leverage": LEVERAGE,
-                            "margin": e_margin,
-                        })
-                        # 开仓时立即刷新持仓和交易明细
-                        cur_pos = Position(
-                            side=PositionSide.LONG if d == 'long' else PositionSide.SHORT,
-                            entry_price=e_price, entry_idx=e_idx,
-                            size=e_margin * LEVERAGE / e_price,
-                            stop_loss=sl, take_profit=tp, liquidation_price=0.0,
-                            margin=e_margin,
-                        )
-                        m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
-                        m["current_bar"] = cur
-                        m["trade_logs"] = list(trade_logs)
-                        self.rt_update.emit(m, list(trade_records))
+                        key, info, d, pool_id = best_entry
+
+                        if pool_id == 'pool2':
+                            p_long_tp, p_long_sl = POOL2_LONG_TP_PCT, POOL2_LONG_SL_PCT
+                            p_short_tp, p_short_sl = POOL2_SHORT_TP_PCT, POOL2_SHORT_SL_PCT
+                        else:
+                            p_long_tp, p_long_sl = long_tp_pct, long_sl_pct
+                            p_short_tp, p_short_sl = short_tp_pct, short_sl_pct
+
+                        _tp = cl * (1 + p_long_tp) if d == 'long' else cl * (1 - p_short_tp)
+                        _sl = cl * (1 - p_long_sl) if d == 'long' else cl * (1 + p_short_sl)
+
+                        # 方案1：ATR 过滤 — ATR 超过 SL 距离 80% 说明波动过大，跳过本次开仓
+                        _atr_val = float(row.get('atr', 0) or 0)
+                        _sl_dist = abs(_sl - cl) / cl if cl > 0 else 0.0
+                        if _atr_val > 0 and _sl_dist > 0 and (_atr_val / cl) > _sl_dist * 0.8:
+                            pass  # 波动率过大，止损距离不足以覆盖，放弃开仓
+                        else:
+                            in_pos, e_price, e_idx, e_dir = True, cl, cur, d
+                            e_state = state          # 记录入场时的三态市场状态
+                            e_key, e_info = key, info
+                            e_pool_id = pool_id
+                            tp = _tp
+                            sl = _sl
+                            labels_arr[cur] = 1 if d == 'long' else -1
+                            self.label_found.emit(cur, int(labels_arr[cur]))
+                            e_margin = capital * PCT
+                            e_avg_hold_bars = int(info.get('avg_hold_bars', 0) or 0)
+                            # 重置动态止损状态
+                            peak_pnl_pct = 0.0
+                            ever_reached_threshold = False
+                            pos_stage  = 1
+                            peak_price = cl
+                            stage2_margin = 0.0
+                            _append_trade_log("entry", cur, d, cl, {
+                                "reason": "signal",
+                                "meta": {"signal_key": key, "pool_id": pool_id},
+                                "stop_loss": sl,
+                                "take_profit": tp,
+                                "leverage": LEVERAGE,
+                                "margin": e_margin,
+                            })
+                            # 开仓时立即刷新持仓和交易明细
+                            cur_pos = Position(
+                                side=PositionSide.LONG if d == 'long' else PositionSide.SHORT,
+                                entry_price=e_price, entry_idx=e_idx,
+                                size=e_margin * LEVERAGE / e_price,
+                                stop_loss=sl, take_profit=tp, liquidation_price=0.0,
+                                margin=e_margin,
+                            )
+                            m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
+                            m["current_bar"] = cur
+                            m["trade_logs"] = list(trade_logs)
+                            self.rt_update.emit(m, list(trade_records))
 
                 self.step_completed.emit(cur)
                 cur += 1
@@ -866,7 +943,6 @@ class QuickLabelWorker(QtCore.QObject):
         try:
             from core.labeler import GodViewLabeler
             from core.backtester import Backtester
-            from core.market_regime import MarketRegimeClassifier
             from core.feature_vector import FeatureVectorEngine
             from core.vector_memory import VectorMemory
             from utils.indicators import calculate_all_indicators
@@ -913,35 +989,37 @@ class QuickLabelWorker(QtCore.QObject):
             fv_engine = None
             vector_memory = None
 
-            if labeler.alternating_swings:
-                self.progress.emit("正在生成市场状态与向量空间...")
-                classifier = MarketRegimeClassifier(
-                    labeler.alternating_swings, MARKET_REGIME_CONFIG
-                )
-                regime_classifier = classifier
+            self.progress.emit("正在生成市场状态与向量空间...")
+            fv_engine = FeatureVectorEngine()
+            fv_engine.precompute(df)
+            vector_memory = VectorMemory(
+                k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
+                min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
+            )
 
-                fv_engine = FeatureVectorEngine()
-                fv_engine.precompute(df)
-                vector_memory = VectorMemory(
-                    k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
-                    min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
-                )
+            from core.market_state_detector import detect_state as _detect_state
+            for ti, trade in enumerate(bt_result.trades):
+                # market_regime 已在 Backtester.run_with_labels 中通过 detect_state 赋值，
+                # 此处仅补填 regime_map 供 UI 统计使用
+                if not trade.market_regime:
+                    try:
+                        _adx   = float(df['adx'].iloc[trade.entry_idx])
+                        _slope = float(df['ma5_slope'].iloc[trade.entry_idx])
+                        trade.market_regime = _detect_state(_adx, _slope)
+                    except Exception:
+                        trade.market_regime = "未知"
+                regime_map[ti] = trade.market_regime
 
-                for ti, trade in enumerate(bt_result.trades):
-                    regime = classifier.classify_at(trade.entry_idx)
-                    trade.market_regime = regime
-                    regime_map[ti] = regime
+                regime_name = trade.market_regime or '未知'
+                direction = "LONG" if trade.side == 1 else "SHORT"
 
-                    regime_name = regime or '未知'
-                    direction = "LONG" if trade.side == 1 else "SHORT"
+                entry_abc = fv_engine.get_abc(trade.entry_idx)
+                trade.entry_abc = entry_abc
+                vector_memory.add_point(regime_name, direction, "ENTRY", *entry_abc)
 
-                    entry_abc = fv_engine.get_abc(trade.entry_idx)
-                    trade.entry_abc = entry_abc
-                    vector_memory.add_point(regime_name, direction, "ENTRY", *entry_abc)
-
-                    exit_abc = fv_engine.get_abc(trade.exit_idx)
-                    trade.exit_abc = exit_abc
-                    vector_memory.add_point(regime_name, direction, "EXIT", *exit_abc)
+                exit_abc = fv_engine.get_abc(trade.exit_idx)
+                trade.exit_abc = exit_abc
+                vector_memory.add_point(regime_name, direction, "EXIT", *exit_abc)
 
             self.finished.emit({
                 "df": df,
@@ -1713,6 +1791,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.labeling_worker.speed = speed
         self.labeling_worker.strict_state_filter = self.control_panel.get_strict_state_filter()
         self.labeling_worker.use_alt_tpsl = self.control_panel.get_alt_tpsl()
+        self.labeling_worker.trailing_stop_enabled = self.control_panel.get_trailing_stop()
         self.labeling_worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.labeling_worker.run_backtest)
@@ -1887,11 +1966,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     templates_added = 0
                     for ti in range(self.rt_last_trade_count, new_count):
                         trade = self.rt_backtester.trades[ti]
-                        # 市场状态分类
-                        if self.regime_classifier is not None:
-                            regime = self.regime_classifier.classify_at(trade.entry_idx)
-                            trade.market_regime = regime
-                            self.regime_map[ti] = regime
+                        # 市场状态直接使用简单的三态
+                        if self.df is not None and trade.entry_idx < len(self.df):
+                            try:
+                                adx = float(self.df['adx'].iloc[trade.entry_idx])
+                                slope = float(self.df['ma5_slope'].iloc[trade.entry_idx])
+                                from core.market_state_detector import detect_state
+                                regime = detect_state(adx, slope)
+                            except Exception:
+                                regime = "未知"
+                        else:
+                            regime = "未知"
+                        trade.market_regime = regime
+                        self.regime_map[ti] = regime
                         # 向量坐标记录
                         if self._fv_ready and self.fv_engine:
                             self._record_trade_vectors(trade)
@@ -1910,10 +1997,17 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._update_fingerprint_view()
                         self._update_memory_stats()
 
-                # 实时更新当前K线的市场状态
-                if self.regime_classifier is not None:
-                    current_regime = self.regime_classifier.classify_at(idx)
-                    self.analysis_panel.market_regime_widget.update_current_regime(current_regime)
+                # 实时更新当前K线的市场状态（detect_state 三态）
+                if self.df is not None and idx < len(self.df):
+                    try:
+                        from core.market_state_detector import detect_state as _ds
+                        _adx   = float(self.df['adx'].iloc[idx])
+                        _slope = float(self.df['ma5_slope'].iloc[idx])
+                        self.analysis_panel.market_regime_widget.update_current_regime(
+                            _ds(_adx, _slope)
+                        )
+                    except Exception:
+                        pass
     
     def _on_label_found(self, idx: int, label_type: int):
         """发现标注点"""
@@ -1949,18 +2043,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.chart_widget.add_signal_at(i, v, self.df)
             return
 
-        # 创建市场状态分类器
-        if self.labeling_worker and self.labeling_worker.labeler:
-            try:
-                from core.market_regime import MarketRegimeClassifier
-                alt_swings = self.labeling_worker.labeler.alternating_swings
-                if alt_swings:
-                    self.regime_classifier = MarketRegimeClassifier(
-                        alt_swings, MARKET_REGIME_CONFIG
-                    )
-                    print(f"[MarketRegime] 分类器就绪, 交替摆动点: {len(alt_swings)}")
-            except Exception as e:
-                print(f"[MarketRegime] 初始化失败: {e}")
+        # MarketRegimeClassifier（旧六态）已废弃，改用 detect_state 三态，无需在此初始化
 
         # 仅做轻量初始化：重计算（FV precompute）延后到标注完成阶段，避免“开始标记”卡UI
         if self.df is not None:
@@ -2000,10 +2083,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.rt_catchup_thread.start()
 
-    def _on_rt_catchup_finished(self, backtester, result, last_idx: int):
-        """回测追赶完成"""
-        self.rt_backtester = backtester
-        self.rt_last_idx = last_idx
+            self.rt_backtester = backtester
+            self.rt_last_idx = last_idx
 
         metrics = {
             "initial_capital": result.initial_capital,
@@ -2028,10 +2109,19 @@ class MainWindow(QtWidgets.QMainWindow):
         templates_added = 0
         if self.rt_backtester:
             for ti, trade in enumerate(self.rt_backtester.trades):
-                if self.regime_classifier is not None:
-                    regime = self.regime_classifier.classify_at(trade.entry_idx)
-                    trade.market_regime = regime
-                    self.regime_map[ti] = regime
+                # 市场状态直接使用简单的三态
+                if self.df is not None and trade.entry_idx < len(self.df):
+                    try:
+                        adx = float(self.df['adx'].iloc[trade.entry_idx])
+                        slope = float(self.df['ma5_slope'].iloc[trade.entry_idx])
+                        from core.market_state_detector import detect_state
+                        regime = detect_state(adx, slope)
+                    except Exception:
+                        regime = "未知"
+                else:
+                    regime = "未知"
+                trade.market_regime = regime
+                self.regime_map[ti] = regime
                 # 填充向量坐标和记忆体
                 if self._fv_ready and self.fv_engine:
                     self._record_trade_vectors(trade)
@@ -2095,6 +2185,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     fingerprint = "--"
             avg_hold = getattr(current_pos, 'avg_hold_bars', 0) or 0
+            pool_id = getattr(current_pos, 'pool_id', '') or ''
             rows.append({
                 "side": side,
                 "entry_time": fmt_time(entry_idx),
@@ -2107,6 +2198,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "avg_hold": str(avg_hold) if avg_hold else "-",
                 "regime": "",
                 "fingerprint": fingerprint,
+                "pool_id": pool_id,
             })
         for t in trades[-200:]:
             side = "LONG" if t.side == 1 else "SHORT"
@@ -2124,6 +2216,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     fingerprint = "--"
             avg_hold = getattr(t, 'avg_hold_bars', 0) or 0
+            pool_id = getattr(t, 'pool_id', '') or ''
             rows.append({
                 "side": side,
                 "entry_time": fmt_time(t.entry_idx),
@@ -2136,6 +2229,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "avg_hold": str(avg_hold) if avg_hold else "-",
                 "regime": getattr(t, 'market_regime', ''),
                 "fingerprint": fingerprint,
+                "pool_id": pool_id,
             })
         return rows
 
@@ -2195,6 +2289,7 @@ class MainWindow(QtWidgets.QMainWindow):
             profit_pct = info.get("profit_pct")
             hold_bars  = info.get("hold_bars")
             entry_price = info.get("entry_price")
+            pool_id     = info.get("meta", {}).get("pool_id", "") # 新增 pool_id
 
             if ev == "entry":
                 reason = info.get("reason", "")
@@ -2209,6 +2304,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     ss = meta.get("short_score")
                     if ls is not None:
                         detail_parts.append(f"多分={ls:.2f} 空分={ss:.2f}")
+                if pool_id: # 新增 pool_id 显示
+                    detail_parts.append(f"策略池={pool_id}")
             elif ev == "tp1":
                 ratio = info.get("ratio", 70)
                 if profit_pct is not None:
@@ -3721,11 +3818,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.rt_backtester.trades, self.regime_map
             )
             # 当前市场状态
-            current_regime = MarketRegime.UNKNOWN
-            if self.regime_classifier is not None and self.chart_widget.current_display_index > 0:
-                current_regime = self.regime_classifier.classify_at(
-                    self.chart_widget.current_display_index
-                )
+            if self.df is not None and self.chart_widget.current_display_index > 0:
+                try:
+                    adx = float(self.df['adx'].iloc[self.chart_widget.current_display_index])
+                    slope = float(self.df['ma5_slope'].iloc[self.chart_widget.current_display_index])
+                    from core.market_state_detector import detect_state
+                    current_regime = detect_state(adx, slope)
+                except Exception:
+                    current_regime = "未知"
+            else:
+                current_regime = "未知"
             self.analysis_panel.update_market_regime(current_regime, stats)
         except Exception as e:
             print(f"[MarketRegime] 统计更新失败: {e}")
@@ -3754,7 +3856,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.df is not None and self.labels is not None:
             try:
                 from core.backtester import Backtester
-                from core.market_regime import MarketRegimeClassifier
 
                 bt_cfg = LABEL_BACKTEST_CONFIG
                 backtester = Backtester(
@@ -3784,57 +3885,56 @@ class MainWindow(QtWidgets.QMainWindow):
                 }
                 self.optimizer_panel.update_backtest_metrics(metrics)
 
-                # 最终市场状态分类 + 向量记忆体构建
-                if self.labeler and self.labeler.alternating_swings:
-                    classifier = MarketRegimeClassifier(
-                        self.labeler.alternating_swings, MARKET_REGIME_CONFIG
-                    )
-                    self.regime_classifier = classifier
-                    self.regime_map = {}
+                # 最终市场状态分类 + 向量记忆体构建（detect_state 三态，无需 alternating_swings）
+                self.regime_classifier = None  # 旧六态分类器已废弃
+                self.regime_map = {}
 
-                    # 初始化向量引擎（如果还没有）
-                    if not self._fv_ready:
-                        try:
-                            from core.feature_vector import FeatureVectorEngine
-                            from core.vector_memory import VectorMemory
-                            self.fv_engine = FeatureVectorEngine()
-                            self.fv_engine.precompute(self.df)
-                            self.vector_memory = VectorMemory(
-                                k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
-                                min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
-                            )
-                            self._fv_ready = True
-                        except Exception as fv_err:
-                            print(f"[FeatureVector] 最终初始化失败: {fv_err}")
-                    else:
-                        # 清空旧记忆体重新构建
-                        if self.vector_memory:
-                            self.vector_memory.clear()
-
-                    for ti, trade in enumerate(bt_result.trades):
-                        regime = classifier.classify_at(trade.entry_idx)
-                        trade.market_regime = regime
-                        self.regime_map[ti] = regime
-                        # 记录向量坐标
-                        if self._fv_ready and self.fv_engine:
-                            self._record_trade_vectors(trade)
-
-                    # 保存回测器引用以便统计
-                    self.rt_backtester = backtester
-                    self._update_regime_stats()
-                    self._update_vector_space_plot()
-                    self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
-                    self.analysis_panel.update_backtest_log(self._format_backtest_logs(getattr(bt_result, "trade_logs", [])))
-
-                    # 打印记忆体统计
+                # 初始化向量引擎（如果还没有）
+                if not self._fv_ready:
+                    try:
+                        from core.feature_vector import FeatureVectorEngine
+                        from core.vector_memory import VectorMemory
+                        self.fv_engine = FeatureVectorEngine()
+                        self.fv_engine.precompute(self.df)
+                        self.vector_memory = VectorMemory(
+                            k_neighbors=VECTOR_SPACE_CONFIG["K_NEIGHBORS"],
+                            min_points=VECTOR_SPACE_CONFIG["MIN_CLOUD_POINTS"],
+                        )
+                        self._fv_ready = True
+                    except Exception as fv_err:
+                        print(f"[FeatureVector] 最终初始化失败: {fv_err}")
+                else:
                     if self.vector_memory:
-                        stats = self.vector_memory.get_stats()
-                        total = self.vector_memory.total_points()
-                        print(f"[VectorMemory] 记忆体构建完成: {total} 个点, "
-                              f"{len(stats)} 个市场状态")
+                        self.vector_memory.clear()
 
-                    # ── 轨迹模板提取 ──
-                    self._extract_trajectory_templates(bt_result.trades)
+                from core.market_state_detector import detect_state as _detect_state_lf
+                for ti, trade in enumerate(bt_result.trades):
+                    # 补填市场状态（run_with_labels 未赋值时使用 detect_state）
+                    if not trade.market_regime:
+                        try:
+                            _adx   = float(self.df['adx'].iloc[trade.entry_idx])
+                            _slope = float(self.df['ma5_slope'].iloc[trade.entry_idx])
+                            trade.market_regime = _detect_state_lf(_adx, _slope)
+                        except Exception:
+                            trade.market_regime = "未知"
+                    self.regime_map[ti] = trade.market_regime
+                    if self._fv_ready and self.fv_engine:
+                        self._record_trade_vectors(trade)
+
+                # 保存回测器引用以便统计
+                self.rt_backtester = backtester
+                self._update_regime_stats()
+                self._update_vector_space_plot()
+                self.analysis_panel.update_trade_log(self._format_trades(bt_result.trades))
+                self.analysis_panel.update_backtest_log(self._format_backtest_logs(getattr(bt_result, "trade_logs", [])))
+
+                if self.vector_memory:
+                    _vm_stats = self.vector_memory.get_stats()
+                    print(f"[VectorMemory] 记忆体构建完成: {self.vector_memory.total_points()} 个点, "
+                          f"{len(_vm_stats)} 个市场状态")
+
+                # ── 轨迹模板提取 ──
+                self._extract_trajectory_templates(bt_result.trades)
 
             except Exception as e:
                 self.statusBar().showMessage(f"标注回测失败: {str(e)}")
@@ -4439,10 +4539,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 initial_balance=config["initial_balance"],
                 adaptive_controller=adaptive_controller,
                 leverage=effective_leverage,
+                max_hold_bars=int(PAPER_TRADING_CONFIG.get("MAX_HOLD_BARS", 60)),
                 use_qualified_only=(config.get("use_qualified_only", True) and (not has_prototypes)),
                 qualified_fingerprints=qualified_fingerprints,
                 qualified_prototype_fingerprints=(verified_proto_fps if use_verified_protos else set()),
                 oscillation_filter_enabled=config.get("oscillation_filter_enabled", True),
+                trailing_stop_enabled=config.get("trailing_stop_enabled", False),
                 api_key=config.get("api_key"),
                 api_secret=config.get("api_secret"),
                 use_testnet=PAPER_TRADING_CONFIG.get("USE_TESTNET", True),

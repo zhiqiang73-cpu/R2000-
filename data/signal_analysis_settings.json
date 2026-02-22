@@ -1,7 +1,8 @@
 {
-  "exclude_ma5": false,
-  "exclude_ma5_slope": false,
-  "min_rounds": 3,
+  "exclude_ma5": true,
+  "exclude_ma5_slope": true,
+  "min_rounds": 2,
   "regime_filter": "全量",
-  "validation_split_enabled": true
+  "validation_split_enabled": true,
+  "max_hold": 60
 }

@@ -64,11 +64,12 @@ class SignalAnalysisWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(list)            # List[dict] 本轮结果
     error    = QtCore.pyqtSignal(str)
 
-    def __init__(self, df, excluded_families=None, validation_split=0.0, parent=None):
+    def __init__(self, df, excluded_families=None, validation_split=0.0, max_hold: int = 60, parent=None):
         super().__init__(parent)
         self._df = df
         self._excluded_families = excluded_families or []
         self._validation_split = validation_split
+        self._max_hold = max_hold
         self._stop = False
 
     def stop(self):
@@ -91,28 +92,48 @@ class SignalAnalysisWorker(QtCore.QObject):
                     self.progress.emit(50 + max(0, min(pct // 2, 49)), f"[做空] {text}")
 
             if not self._stop:
-                long_results = analyze(
-                    self._df, 'long', progress_cb=cb_long,
+                long_p1 = analyze(
+                    self._df, 'long', pool_id='pool1', progress_cb=cb_long,
                     excluded_families=self._excluded_families,
                     validation_split=self._validation_split,
+                    max_hold=self._max_hold,
                 )
-                all_results.extend(long_results)
+                all_results.extend(long_p1)
 
             if not self._stop:
-                short_results = analyze(
-                    self._df, 'short', progress_cb=cb_short,
+                short_p1 = analyze(
+                    self._df, 'short', pool_id='pool1', progress_cb=cb_short,
                     excluded_families=self._excluded_families,
                     validation_split=self._validation_split,
+                    max_hold=self._max_hold,
                 )
-                all_results.extend(short_results)
+                all_results.extend(short_p1)
+
+            if not self._stop:
+                long_p2 = analyze(
+                    self._df, 'long', pool_id='pool2', progress_cb=cb_long,
+                    excluded_families=self._excluded_families,
+                    validation_split=self._validation_split,
+                    max_hold=self._max_hold,
+                )
+                all_results.extend(long_p2)
+
+            if not self._stop:
+                short_p2 = analyze(
+                    self._df, 'short', pool_id='pool2', progress_cb=cb_short,
+                    excluded_families=self._excluded_families,
+                    validation_split=self._validation_split,
+                    max_hold=self._max_hold,
+                )
+                all_results.extend(short_p2)
 
             if not self._stop:
                 self.progress.emit(99, "写入持久化状态...")
-                long_res  = [r for r in all_results if r['direction'] == 'long']
-                short_res = [r for r in all_results if r['direction'] == 'short']
-                signal_store.merge_rounds(long_res, short_res, bar_count=len(self._df))
+                signal_store.merge_rounds(long_p1, short_p1, bar_count=len(self._df), pool_id='pool1')
+                signal_store.merge_rounds(long_p2, short_p2, bar_count=len(self._df), pool_id='pool2')
                 # 两次 merge 都完成后，执行一次去重并更新缓存（O(n²)，只跑一次）
-                signal_store.rebuild_pruned_cache()
+                signal_store.rebuild_pruned_cache(pool_id='pool1')
+                signal_store.rebuild_pruned_cache(pool_id='pool2')
 
             if not self._stop:
                 self.progress.emit(100, f"分析完成，共 {len(all_results)} 个有效组合")
@@ -134,12 +155,11 @@ class _InitialLoadWorker(QtCore.QObject):
     def run(self):
         try:
             from core import signal_store
-            # 一次调用同时拿到 items 和 cumulative，消除重复 get_cumulative() 调用
-            combos, cumulative = signal_store.get_cumulative_results(top_n=200)
+            # 预热两池缓存
+            signal_store.get_cumulative_results(top_n=200, pool_id='pool1')
+            signal_store.get_cumulative_results(top_n=200, pool_id='pool2')
             rounds = signal_store.get_rounds()
             self.finished.emit({
-                'combos':     combos,
-                'cumulative': cumulative,
                 'rounds':     rounds,
             })
         except Exception as e:
@@ -158,9 +178,14 @@ def _tier_color(tier: str) -> str:
     }.get(tier, TEXT_DIM)
 
 
-def _tier_from_rate(rate: float, direction: str) -> str:
-    """根据综合命中率和方向返回层级（与 signal_analyzer 门槛一致）"""
-    if direction == 'long':
+def _tier_from_rate(rate: float, direction: str, pool_id: str = 'pool1') -> str:
+    """根据综合命中率、方向和策略池返回层级（与 signal_analyzer 门槛一致）"""
+    if pool_id == 'pool2':
+        # pool2 双向对称门槛
+        if rate >= 0.59: return '精品'
+        if rate >= 0.55: return '优质'
+        if rate >= 0.52: return '候选'
+    elif direction == 'long':
         if rate >= 0.71: return '精品'
         if rate >= 0.67: return '优质'
         if rate >= 0.64: return '候选'
@@ -192,13 +217,16 @@ def _pnl_color(pnl: float) -> str:
     return TEXT_DIM
 
 
-def _ev_per_trigger_pct(overall_rate: float, direction: str) -> float:
+def _ev_per_trigger_pct(overall_rate: float, direction: str, pool_id: str = 'pool1') -> float:
     """单次触发期望盈亏（百分比，未考虑杠杆）。"""
     # 含费后净值（与 signal_store.py 保持一致）
-    if direction == "short":
-        tp_pct, sl_pct = 0.0074, 0.0066
+    if pool_id == 'pool2':
+        tp_pct, sl_pct = 0.0094, 0.0086  # Pool2 双向对称
     else:
-        tp_pct, sl_pct = 0.0054, 0.0086
+        if direction == "short":
+            tp_pct, sl_pct = 0.0074, 0.0066
+        else:
+            tp_pct, sl_pct = 0.0054, 0.0086
     per_trade = overall_rate * tp_pct - (1.0 - overall_rate) * sl_pct
     return round(per_trade * 100, 4)
 
@@ -210,7 +238,7 @@ def _make_table(headers: List[str]) -> QtWidgets.QTableWidget:
     tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
     tbl.setAlternatingRowColors(True)
     tbl.verticalHeader().setVisible(False)
-    tbl.horizontalHeader().setStretchLastSection(True)
+    tbl.horizontalHeader().setStretchLastSection(False)
     tbl.setShowGrid(False)
     tbl.setStyleSheet(f"""
         QTableWidget {{
@@ -521,6 +549,17 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         exclude_row.addWidget(self._chk_exclude_ma5)
         exclude_row.addWidget(self._chk_exclude_ma5_slope)
         exclude_row.addWidget(self._chk_validation_split)
+
+        # 最大持仓 SpinBox
+        lbl_max_hold = QtWidgets.QLabel("最大持仓K线:")
+        self._spn_max_hold = QtWidgets.QSpinBox()
+        self._spn_max_hold.setRange(20, 240)
+        self._spn_max_hold.setValue(int(_sig_settings.get("max_hold", 60)))
+        self._spn_max_hold.setFixedWidth(60)
+        self._spn_max_hold.setFixedHeight(24)
+        self._spn_max_hold.valueChanged.connect(self._on_exclude_changed)
+        exclude_row.addWidget(lbl_max_hold)
+        exclude_row.addWidget(self._spn_max_hold)
         exclude_row.addStretch()
 
         exclude_frame = QtWidgets.QFrame()
@@ -709,6 +748,14 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         """)
         self._btn_export_cumul.clicked.connect(self._export_cumulative_txt)
         cumul_count_row.addWidget(self._btn_export_cumul)
+
+        self._btn_backup_github = QtWidgets.QPushButton("☁ 备份GitHub")
+        self._btn_backup_github.setFixedHeight(26)
+        self._btn_backup_github.setFixedWidth(110)
+        self._btn_backup_github.setToolTip("备份信号池数据到可提交目录（含 pool1/pool2）")
+        self._btn_backup_github.setStyleSheet(self._btn_export_cumul.styleSheet())
+        self._btn_backup_github.clicked.connect(self._backup_to_github)
+        cumul_count_row.addWidget(self._btn_backup_github)
         
         # 方向筛选
         lbl_dir = QtWidgets.QLabel("方向:")
@@ -808,12 +855,39 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         cumul_count_row.addWidget(self._cumul_count_lbl)
         right_layout.addLayout(cumul_count_row)
 
-        self._cumul_table = _make_table([
+        cumul_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        cumul_splitter.setHandleWidth(4)
+        cumul_splitter.setStyleSheet(f"QSplitter::handle {{ background: {BORDER_COLOR}; }}")
+
+        p1_box = QtWidgets.QWidget()
+        p1_layout = QtWidgets.QVBoxLayout(p1_box)
+        p1_layout.setContentsMargins(0, 0, 0, 0)
+        p1_lbl = QtWidgets.QLabel("策略池 1（TP 0.6% / SL 0.8%，做多≥64% / 做空≥52%）")
+        p1_lbl.setStyleSheet(f"color: {ACCENT_CYAN}; font-weight: bold; font-size: 11px; padding: 2px;")
+        p1_layout.addWidget(p1_lbl)
+        self._cumul_table_p1 = _make_table([
             "#", "方向", "层级", "出现轮次", "累计触发", "累计命中",
             "综合命中率", "平均命中率", "波动", "综合评分",
             "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
         ])
-        right_layout.addWidget(self._cumul_table)
+        p1_layout.addWidget(self._cumul_table_p1)
+        cumul_splitter.addWidget(p1_box)
+
+        p2_box = QtWidgets.QWidget()
+        p2_layout = QtWidgets.QVBoxLayout(p2_box)
+        p2_layout.setContentsMargins(0, 4, 0, 0)
+        p2_lbl = QtWidgets.QLabel("策略池 2（TP 1.0% / SL 0.8%，做多≥52% / 做空≥52%）")
+        p2_lbl.setStyleSheet(f"color: {ACCENT_GOLD}; font-weight: bold; font-size: 11px; padding: 2px;")
+        p2_layout.addWidget(p2_lbl)
+        self._cumul_table_p2 = _make_table([
+            "#", "方向", "层级", "出现轮次", "累计触发", "累计命中",
+            "综合命中率", "平均命中率", "波动", "综合评分",
+            "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
+        ])
+        p2_layout.addWidget(self._cumul_table_p2)
+        cumul_splitter.addWidget(p2_box)
+
+        right_layout.addWidget(cumul_splitter)
         splitter.addWidget(right_box)
 
         splitter.setSizes([450, 550])
@@ -1022,7 +1096,9 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             except Exception:
                 pass
             self._round_table.setRowCount(0)
-            self._cumul_table.setRowCount(0)
+            if hasattr(self, '_cumul_table_p1'):
+                self._cumul_table_p1.setRowCount(0)
+                self._cumul_table_p2.setRowCount(0)
             self._live_table.setRowCount(0)
             self._history_text.clear()
             self._status_lbl.setText("记录已清空")
@@ -1038,6 +1114,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         _settings["exclude_ma5"] = self._chk_exclude_ma5.isChecked()
         _settings["exclude_ma5_slope"] = self._chk_exclude_ma5_slope.isChecked()
         _settings["validation_split_enabled"] = self._chk_validation_split.isChecked()
+        _settings["max_hold"] = self._spn_max_hold.value()
         _save_signal_settings(_settings)
 
     def _on_filter_changed(self):
@@ -1051,6 +1128,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         state['exclude_ma5'] = self._chk_exclude_ma5.isChecked()
         state['exclude_ma5_slope'] = self._chk_exclude_ma5_slope.isChecked()
         state['validation_split_enabled'] = self._chk_validation_split.isChecked()
+        state['max_hold'] = self._spn_max_hold.value()
         if hasattr(self, "_cmb_regime_filter"):
             state['regime_filter'] = self._cmb_regime_filter.currentText()
         _save_signal_settings(state)
@@ -1142,6 +1220,7 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             df_to_use,
             excluded_families=excluded_families,
             validation_split=validation_split,
+            max_hold=self._spn_max_hold.value(),
         )
         self._worker.moveToThread(self._thread)
 
@@ -1213,55 +1292,64 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             )
             min_rounds = self._spn_min_rounds.value() if hasattr(self, '_spn_min_rounds') else 1
             
+            def _filter_combos(combos):
+                # 应用最少轮次筛选
+                combos = [c for c in combos if c.get("appear_rounds", 0) >= min_rounds]
+
+                # 方案B：条件族限额，防止"偏离MA5"类条件垄断策略池
+                MAX_PER_FAMILY = 20
+                family_count: dict = {}
+                capped_combos = []
+                for c in combos:
+                    conditions = c.get("conditions", [])
+                    families = set(
+                        re.sub(r"_(loose|strict|mod_loose|mod_strict)$", "", cond)
+                        for cond in conditions
+                    )
+                    if all(family_count.get(f, 0) < MAX_PER_FAMILY for f in families):
+                        capped_combos.append(c)
+                        for f in families:
+                            family_count[f] = family_count.get(f, 0) + 1
+                combos = capped_combos
+
+                # 做空硬门槛：空头趋势下胜率必须 ≥ 52%（有足够样本时才检查）
+                hard_filtered = []
+                for c in combos:
+                    if c.get("direction") == "short":
+                        breakdown = c.get("market_state_breakdown", {}) or {}
+                        bear_info = breakdown.get("空头趋势", {}) or {}
+                        bear_rate = float(bear_info.get("avg_rate", 0.0))
+                        bear_triggers = int(bear_info.get("total_triggers", 0))
+                        if bear_triggers >= 5 and bear_rate < 0.52:
+                            continue  # 剔除：有样本但胜率不达标
+                    hard_filtered.append(c)
+                return hard_filtered
+
             # 获取数据（已在后台去重+层级过滤，这里只做方向和轮次过滤）
-            combos, cumulative = signal_store.get_cumulative_results(top_n=500, direction=direction)
+            c1, cumul1 = signal_store.get_cumulative_results(top_n=500, direction=direction, pool_id='pool1')
+            c2, cumul2 = signal_store.get_cumulative_results(top_n=500, direction=direction, pool_id='pool2')
             
-            # 应用最少轮次筛选
-            combos = [c for c in combos if c.get("appear_rounds", 0) >= min_rounds]
-
-            # 方案B：条件族限额，防止"偏离MA5"类条件垄断策略池
-            MAX_PER_FAMILY = 20
-            family_count: dict = {}
-            capped_combos = []
-            for c in combos:
-                conditions = c.get("conditions", [])
-                families = set(
-                    re.sub(r"_(loose|strict|mod_loose|mod_strict)$", "", cond)
-                    for cond in conditions
-                )
-                if all(family_count.get(f, 0) < MAX_PER_FAMILY for f in families):
-                    capped_combos.append(c)
-                    for f in families:
-                        family_count[f] = family_count.get(f, 0) + 1
-            combos = capped_combos
-
-            # 做空硬门槛：空头趋势下胜率必须 ≥ 52%（有足够样本时才检查）
-            hard_filtered = []
-            for c in combos:
-                if c.get("direction") == "short":
-                    breakdown = c.get("market_state_breakdown", {}) or {}
-                    bear_info = breakdown.get("空头趋势", {}) or {}
-                    bear_rate = float(bear_info.get("avg_rate", 0.0))
-                    bear_triggers = int(bear_info.get("total_triggers", 0))
-                    if bear_triggers >= 5 and bear_rate < 0.52:
-                        continue  # 剔除：有样本但胜率不达标
-                hard_filtered.append(c)
-            combos = hard_filtered
+            combos_p1 = _filter_combos(c1)
+            combos_p2 = _filter_combos(c2)
 
         except Exception:
             return
         
         # 缓存当前筛选后的列表，供导出使用（保证导出与表格一致）
-        self._latest_cumulative_combos = list(combos)
+        self._latest_cumulative_combos_p1 = list(combos_p1)
+        self._latest_cumulative_combos_p2 = list(combos_p2)
 
         # 更新总数统计（含层级数量）- 基于过滤后的数据
-        filtered_cumulative = {c.get('combo_key', ''): c for c in combos}
-        total = len(filtered_cumulative)
-        long_count = sum(1 for c in combos if c.get("direction") == "long")
+        total = len(combos_p1) + len(combos_p2)
+        long_count = sum(1 for c in combos_p1 + combos_p2 if c.get("direction") == "long")
         short_count = total - long_count
         elite_count = good_count = 0
-        for c in combos:
-            tier = _tier_from_rate(c.get("overall_rate", 0.0), c.get("direction", "long"))
+        for c in combos_p1:
+            tier = _tier_from_rate(c.get("overall_rate", 0.0), c.get("direction", "long"), pool_id='pool1')
+            if tier == "精品": elite_count += 1
+            elif tier == "优质": good_count += 1
+        for c in combos_p2:
+            tier = _tier_from_rate(c.get("overall_rate", 0.0), c.get("direction", "long"), pool_id='pool2')
             if tier == "精品": elite_count += 1
             elif tier == "优质": good_count += 1
         cumul_lbl = getattr(self, "_cumul_count_lbl", None)
@@ -1271,102 +1359,107 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                 f"精品 {elite_count} | 优质 {good_count}"
             )
 
-        tbl = self._cumul_table
-        tbl.setSortingEnabled(False)
-        tbl.setRowCount(0)
-        for seq, c in enumerate(combos, start=1):
-            row = tbl.rowCount()
-            tbl.insertRow(row)
+        def _populate_table(tbl, combos, pool_id):
+            tbl.setSortingEnabled(False)
+            tbl.setRowCount(0)
+            for seq, c in enumerate(combos, start=1):
+                row = tbl.rowCount()
+                tbl.insertRow(row)
 
-            direction_val = c.get("direction", "long")
-            dir_color     = LONG_COLOR if direction_val == "long" else SHORT_COLOR
-            dir_str       = "做多" if direction_val == "long" else "做空"
-            overall_rate  = c.get("overall_rate", 0.0)
-            avg_rate      = c.get("avg_rate", 0.0)
-            overall_color = _rate_color(overall_rate, direction_val)
-            avg_color     = _rate_color(avg_rate, direction_val)
-            rate_std      = c.get("rate_std", 0.0)
-            score         = c.get("综合评分", 0.0)
-            baseline      = 0.61 if direction_val == "long" else 0.47
-            score_color   = _rate_color(
-                score / 100.0 * 0.75 + baseline * (1 - score / 100.0),
-                direction_val
-            )
+                direction_val = c.get("direction", "long")
+                dir_color     = LONG_COLOR if direction_val == "long" else SHORT_COLOR
+                dir_str       = "做多" if direction_val == "long" else "做空"
+                overall_rate  = c.get("overall_rate", 0.0)
+                avg_rate      = c.get("avg_rate", 0.0)
+                overall_color = _rate_color(overall_rate, direction_val)
+                avg_color     = _rate_color(avg_rate, direction_val)
+                rate_std      = c.get("rate_std", 0.0)
+                score         = c.get("综合评分", 0.0)
+                baseline      = 0.61 if direction_val == "long" else 0.47
+                score_color   = _rate_color(
+                    score / 100.0 * 0.75 + baseline * (1 - score / 100.0),
+                    direction_val
+                )
 
-            # 各状态命中率明细
-            breakdown  = c.get("market_state_breakdown") or {}
-            dom_state  = _format_state_detail(breakdown, direction_val)
+                # 各状态命中率明细
+                breakdown  = c.get("market_state_breakdown") or {}
+                dom_state  = _format_state_detail(breakdown, direction_val)
 
-            # 估算总盈亏
-            pnl_pct    = c.get("estimated_pnl_pct", 0.0)
-            pnl_str    = f"{pnl_pct:+.2f}%" if pnl_pct != 0 else "0.00%"
-            pnl_color  = _pnl_color(pnl_pct)
+                # 单次EV（实时计算，避免旧数据缺字段）
+                ev_pct   = _ev_per_trigger_pct(overall_rate, direction_val, pool_id=pool_id)
 
-            # 单次EV（实时计算，避免旧数据缺字段）
-            ev_pct   = _ev_per_trigger_pct(overall_rate, direction_val)
-            ev_str   = f"{ev_pct:+.2f}%" if ev_pct != 0 else "0.00%"
-            ev_color = _pnl_color(ev_pct)
+                # 估算总盈亏（实时计算，避免旧数据用错策略池参数）
+                total_triggers_val = c.get("total_triggers", 0) or 0
+                pnl_pct  = round(ev_pct * total_triggers_val, 4)
+                pnl_str    = f"{pnl_pct:+.2f}%" if pnl_pct != 0 else "0.00%"
+                pnl_color  = _pnl_color(pnl_pct)
+                ev_str   = f"{ev_pct:+.2f}%" if ev_pct != 0 else "0.00%"
+                ev_color = _pnl_color(ev_pct)
 
-            # 层级（根据综合命中率与方向）
-            tier_str   = _tier_from_rate(overall_rate, direction_val)
-            tier_color = _tier_color(tier_str) if tier_str else TEXT_DIM
+                # 层级（根据综合命中率、方向与策略池）
+                tier_str   = _tier_from_rate(overall_rate, direction_val, pool_id=pool_id)
+                tier_color = _tier_color(tier_str) if tier_str else TEXT_DIM
 
-            _set_item(tbl, row,  0, str(seq), TEXT_DIM)
-            _set_item(tbl, row,  1, dir_str, dir_color, bold=True)
-            _set_item(tbl, row,  2, tier_str or "--", tier_color, bold=bool(tier_str))
-            _set_item(tbl, row,  3, str(c.get("appear_rounds", 0)), ACCENT_GOLD,
-                      sort_value=c.get("appear_rounds", 0))
-            _set_item(tbl, row,  4, str(c.get("total_triggers", "")),
-                      sort_value=c.get("total_triggers", 0))
-            _set_item(tbl, row,  5, str(c.get("total_hits", "")),
-                      sort_value=c.get("total_hits", 0))
-            _set_item(tbl, row,  6, f"{overall_rate:.1%}", overall_color, bold=True,
-                      sort_value=overall_rate)
-            _set_item(tbl, row,  7, f"{avg_rate:.1%}", avg_color, sort_value=avg_rate)
-            _set_item(tbl, row,  8, f"{rate_std:.3f}", TEXT_DIM, sort_value=rate_std)
-            _set_item(tbl, row,  9, f"{score:.1f}", score_color, bold=True,
-                      sort_value=score)
-            _set_item(tbl, row, 10, dom_state, TEXT_DIM)
-            _set_item(tbl, row, 11, pnl_str, pnl_color, bold=(pnl_pct != 0),
-                      sort_value=pnl_pct)
-            _set_item(tbl, row, 12, ev_str, ev_color, bold=(ev_pct != 0),
-                      sort_value=ev_pct)
-            # 平均持仓（0 显示 "-"）
-            avg_hold = c.get("avg_hold_bars", 0) or 0
-            avg_hold_str = str(avg_hold) if avg_hold else "-"
-            decay_tip = ""
-            if avg_hold >= 10:
-                d1, d2 = int(avg_hold * 0.50), int(avg_hold * 0.70)
-                decay_tip = f"衰减计划: {d1}根/-6% | {d2}根/-3%"
-            _set_item(tbl, row, 13, avg_hold_str, TEXT_DIM, sort_value=avg_hold,
-                      tooltip=decay_tip or None)
-            _set_item(tbl, row, 14,
-                      _format_conditions(c.get("conditions", []), c.get("direction", "")),
-                      TEXT_DIM)
-        tbl.setSortingEnabled(True)
+                _set_item(tbl, row,  0, str(seq), TEXT_DIM)
+                _set_item(tbl, row,  1, dir_str, dir_color, bold=True)
+                _set_item(tbl, row,  2, tier_str or "--", tier_color, bold=bool(tier_str))
+                _set_item(tbl, row,  3, str(c.get("appear_rounds", 0)), ACCENT_GOLD,
+                          sort_value=c.get("appear_rounds", 0))
+                _set_item(tbl, row,  4, str(c.get("total_triggers", "")),
+                          sort_value=c.get("total_triggers", 0))
+                _set_item(tbl, row,  5, str(c.get("total_hits", "")),
+                          sort_value=c.get("total_hits", 0))
+                _set_item(tbl, row,  6, f"{overall_rate:.1%}", overall_color, bold=True,
+                          sort_value=overall_rate)
+                _set_item(tbl, row,  7, f"{avg_rate:.1%}", avg_color, sort_value=avg_rate)
+                _set_item(tbl, row,  8, f"{rate_std:.3f}", TEXT_DIM, sort_value=rate_std)
+                _set_item(tbl, row,  9, f"{score:.1f}", score_color, bold=True,
+                          sort_value=score)
+                _set_item(tbl, row, 10, dom_state, TEXT_DIM)
+                _set_item(tbl, row, 11, pnl_str, pnl_color, bold=(pnl_pct != 0),
+                          sort_value=pnl_pct)
+                _set_item(tbl, row, 12, ev_str, ev_color, bold=(ev_pct != 0),
+                          sort_value=ev_pct)
+                # 平均持仓（0 显示 "-"）
+                avg_hold = c.get("avg_hold_bars", 0) or 0
+                avg_hold_str = str(avg_hold) if avg_hold else "-"
+                decay_tip = ""
+                if avg_hold >= 10:
+                    d1, d2 = int(avg_hold * 0.50), int(avg_hold * 0.70)
+                    decay_tip = f"衰减计划: {d1}根/-6% | {d2}根/-3%"
+                _set_item(tbl, row, 13, avg_hold_str, TEXT_DIM, sort_value=avg_hold,
+                          tooltip=decay_tip or None)
+                _set_item(tbl, row, 14,
+                          _format_conditions(c.get("conditions", []), c.get("direction", "")),
+                          TEXT_DIM)
+            tbl.setSortingEnabled(True)
+
+        _populate_table(self._cumul_table_p1, combos_p1, 'pool1')
+        _populate_table(self._cumul_table_p2, combos_p2, 'pool2')
 
     def _export_cumulative_txt(self):
         """导出累计结果为TXT文件"""
-        combos = None
-        # 优先使用当前表格筛选后的数据（去重后的结果）
-        if hasattr(self, "_latest_cumulative_combos"):
-            combos = list(getattr(self, "_latest_cumulative_combos") or [])
-        if combos is None:
+        combos_p1 = getattr(self, "_latest_cumulative_combos_p1", None)
+        combos_p2 = getattr(self, "_latest_cumulative_combos_p2", None)
+        
+        if combos_p1 is None or combos_p2 is None:
             try:
                 from core import signal_store
-                # 读取筛选条件，确保导出与表格一致
                 dir_map = {"全部": None, "做多": "long", "做空": "short"}
                 direction = dir_map.get(
                     self._cmb_direction.currentText() if hasattr(self, '_cmb_direction') else "全部"
                 )
                 min_rounds = self._spn_min_rounds.value() if hasattr(self, '_spn_min_rounds') else 1
-                combos, _ = signal_store.get_cumulative_results(top_n=1000, direction=direction)
-                combos = [c for c in combos if c.get("appear_rounds", 0) >= min_rounds]
+                
+                c1, _ = signal_store.get_cumulative_results(top_n=1000, direction=direction, pool_id='pool1')
+                c2, _ = signal_store.get_cumulative_results(top_n=1000, direction=direction, pool_id='pool2')
+                combos_p1 = [c for c in c1 if c.get("appear_rounds", 0) >= min_rounds]
+                combos_p2 = [c for c in c2 if c.get("appear_rounds", 0) >= min_rounds]
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "导出失败", f"读取数据失败:\n{e}")
                 return
         
-        if not combos:
+        if not combos_p1 and not combos_p2:
             QtWidgets.QMessageBox.information(self, "无数据", "当前没有可导出的累计结果。")
             return
 
@@ -1388,67 +1481,90 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             "各状态命中率", "估算总盈亏", "单次EV", "平均持仓", "条件组合"
         ]
         
+        def _write_pool(f, combos, pool_id, title):
+            f.write(f"=== {title} ===\n")
+            f.write("\t".join(headers) + "\n")
+            seen_keys = set()
+            seq = 0
+            for c in combos:
+                combo_key = c.get("combo_key")
+                if combo_key:
+                    if combo_key in seen_keys:
+                        continue
+                    seen_keys.add(combo_key)
+                seq += 1
+                direction_val = c.get("direction", "long")
+                dir_str = "做多" if direction_val == "long" else "做空"
+                overall_rate = c.get("overall_rate", 0.0)
+                avg_rate = c.get("avg_rate", 0.0)
+                rate_std = c.get("rate_std", 0.0)
+                score = c.get("综合评分", 0.0)
+                ev_pct = _ev_per_trigger_pct(overall_rate, direction_val, pool_id=pool_id)
+                # 实时计算，避免旧数据用错策略池参数
+                pnl_pct = round(ev_pct * (c.get("total_triggers", 0) or 0), 4)
+
+                tier_str = _tier_from_rate(overall_rate, direction_val, pool_id=pool_id) or "--"
+                
+                breakdown = c.get("market_state_breakdown") or {}
+                state_detail = _format_state_detail(breakdown, direction_val)
+                
+                conditions_str = _format_conditions(
+                    c.get("conditions", []),
+                    c.get("direction", "")
+                )
+                
+                avg_hold = c.get("avg_hold_bars", 0) or 0
+                row = [
+                    str(seq),
+                    dir_str,
+                    tier_str,
+                    str(c.get("appear_rounds", 0)),
+                    str(c.get("total_triggers", 0)),
+                    str(c.get("total_hits", 0)),
+                    f"{overall_rate:.1%}",
+                    f"{avg_rate:.1%}",
+                    f"{rate_std:.3f}",
+                    f"{score:.1f}",
+                    state_detail,
+                    f"{pnl_pct:+.2f}%" if pnl_pct != 0 else "0.00%",
+                    f"{ev_pct:+.2f}%" if ev_pct != 0 else "0.00%",
+                    str(avg_hold) if avg_hold else "-",
+                    conditions_str,
+                ]
+                f.write("\t".join(row) + "\n")
+            f.write("\n")
+            return seq
+
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write("\t".join(headers) + "\n")
-                
-                # 按 combo_key 去重（确保导出为去重结果）
-                seen_keys = set()
-                seq = 0
-                exported_count = 0
-                for c in combos:
-                    combo_key = c.get("combo_key")
-                    if combo_key:
-                        if combo_key in seen_keys:
-                            continue
-                        seen_keys.add(combo_key)
-                    seq += 1
-                    exported_count = seq
-                    direction_val = c.get("direction", "long")
-                    dir_str = "做多" if direction_val == "long" else "做空"
-                    overall_rate = c.get("overall_rate", 0.0)
-                    avg_rate = c.get("avg_rate", 0.0)
-                    rate_std = c.get("rate_std", 0.0)
-                    score = c.get("综合评分", 0.0)
-                    pnl_pct = c.get("estimated_pnl_pct", 0.0)
-                    ev_pct = _ev_per_trigger_pct(overall_rate, direction_val)
-                    
-                    # 层级
-                    tier_str = _tier_from_rate(overall_rate, direction_val) or "--"
-                    
-                    # 各状态命中率明细
-                    breakdown = c.get("market_state_breakdown") or {}
-                    state_detail = _format_state_detail(breakdown, direction_val)
-                    
-                    # 条件组合
-                    conditions_str = _format_conditions(
-                        c.get("conditions", []),
-                        c.get("direction", "")
-                    )
-                    
-                    avg_hold = c.get("avg_hold_bars", 0) or 0
-                    row = [
-                        str(seq),
-                        dir_str,
-                        tier_str,
-                        str(c.get("appear_rounds", 0)),
-                        str(c.get("total_triggers", 0)),
-                        str(c.get("total_hits", 0)),
-                        f"{overall_rate:.1%}",
-                        f"{avg_rate:.1%}",
-                        f"{rate_std:.3f}",
-                        f"{score:.1f}",
-                        state_detail,
-                        f"{pnl_pct:+.2f}%" if pnl_pct != 0 else "0.00%",
-                        f"{ev_pct:+.2f}%" if ev_pct != 0 else "0.00%",
-                        str(avg_hold) if avg_hold else "-",
-                        conditions_str,
-                    ]
-                    f.write("\t".join(row) + "\n")
+                cnt1 = _write_pool(f, combos_p1, 'pool1', "策略池 1（TP 0.6% / SL 0.8%，做多≥64% / 做空≥52%）")
+                cnt2 = _write_pool(f, combos_p2, 'pool2', "策略池 2（TP 1.0% / SL 0.8%，做多≥52% / 做空≥52%）")
             
-            QtWidgets.QMessageBox.information(self, "导出完成", f"已导出 {exported_count} 条记录到:\n{path}")
+            QtWidgets.QMessageBox.information(self, "导出完成", f"已导出 {cnt1 + cnt2} 条记录到:\n{path}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "导出失败", f"写入文件失败:\n{e}")
+
+    def _backup_to_github(self):
+        """备份 signal_store 数据到 GitHub 目录（双 pool）"""
+        try:
+            from core import signal_store
+            result = signal_store.backup_to_github()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "备份失败", f"写入失败:\n{e}")
+            return
+
+        target_dir = result.get("target_dir", "")
+        files = result.get("files", []) or []
+        if not files:
+            QtWidgets.QMessageBox.information(self, "无数据", "当前没有可备份的数据。")
+            return
+
+        file_list = "\n".join(os.path.basename(p) for p in files)
+        QtWidgets.QMessageBox.information(
+            self,
+            "备份完成",
+            f"已备份到:\n{target_dir}\n\n文件:\n{file_list}"
+        )
 
     def _refresh_backtest_feedback_table(self):
         """刷新回测信号反馈面板：从纸交易记录统计各组合表现。"""
