@@ -280,6 +280,7 @@ class TradeLogWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self._latest_trades: List[Dict] = []
         self._display_limit = self.MAX_DISPLAY_TRADES
+        self._displayed_keys: List[tuple] = []
         self._init_ui()
     
     def _init_ui(self):
@@ -326,88 +327,125 @@ class TradeLogWidget(QtWidgets.QWidget):
         layout.addWidget(self.table)
     
     def update_trades(self, trades: List[Dict]):
-        """更新交易明细"""
+        """更新交易明细（增量插入优先）"""
         self._latest_trades = trades or []
         display_trades = self._latest_trades[-self._display_limit:]
-        self.table.setRowCount(len(display_trades))
+        keys = [self._trade_key(t) for t in display_trades]
         up_color = QtGui.QColor(UI_CONFIG['CHART_UP_COLOR'])
         down_color = QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR'])
-        
-        for i, t in enumerate(display_trades):
-            # 方向
-            side_item = QtWidgets.QTableWidgetItem(t.get("side", ""))
-            if "LONG" in t.get("side", ""):
-                side_item.setForeground(QtGui.QBrush(up_color))
-            elif "SHORT" in t.get("side", ""):
-                side_item.setForeground(QtGui.QBrush(down_color))
-            self.table.setItem(i, 0, side_item)
-            
-            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(t.get("entry_time", "")))
-            self.table.setItem(i, 2, QtWidgets.QTableWidgetItem(t.get("entry_price", "")))
-            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(t.get("exit_time", "")))
-            self.table.setItem(i, 4, QtWidgets.QTableWidgetItem(t.get("exit_price", "")))
-            
-            # 盈利和收益率着色
-            profit_str = t.get("profit", "0")
-            profit_pct_str = t.get("profit_pct", "0")
-            try:
-                profit_val = float(profit_str)
-                color = up_color if profit_val >= 0 else down_color
-            except ValueError:
-                color = QtGui.QColor(UI_CONFIG['THEME_TEXT'])
-                
-            profit_item = QtWidgets.QTableWidgetItem(profit_str)
-            profit_item.setForeground(QtGui.QBrush(color))
-            self.table.setItem(i, 5, profit_item)
-            
-            pct_item = QtWidgets.QTableWidgetItem(profit_pct_str)
-            pct_item.setForeground(QtGui.QBrush(color))
-            self.table.setItem(i, 6, pct_item)
-            
-            self.table.setItem(i, 7, QtWidgets.QTableWidgetItem(t.get("hold", "")))
-            
-            # 均持（策略平均持仓，0 显示 "-"）
-            avg_hold_str = t.get("avg_hold", "-")
-            self.table.setItem(i, 8, QtWidgets.QTableWidgetItem(avg_hold_str))
-            
-            # 市场状态
-            regime_str = t.get("regime", "")
-            regime_item = QtWidgets.QTableWidgetItem(regime_str)
-            regime_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            # 尝试为市场状态着色
-            try:
-                from core.market_regime import MarketRegime
-                regime_color = MarketRegime.COLORS.get(regime_str, UI_CONFIG['THEME_TEXT'])
-                regime_item.setForeground(QtGui.QBrush(QtGui.QColor(regime_color)))
-            except Exception:
-                pass
-            self.table.setItem(i, 9, regime_item)
 
-            # 指纹摘要（模板ID + 相似度）
-            fp_str = t.get("fingerprint", "--")
-            fp_item = QtWidgets.QTableWidgetItem(fp_str)
-            # 有匹配时用主题高亮色，无匹配时灰色
-            if fp_str and fp_str != "--":
-                fp_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['THEME_ACCENT'])))
+        def rebuild():
+            self.table.setRowCount(len(display_trades))
+            for i, t in enumerate(display_trades):
+                self._set_trade_row(i, t, up_color, down_color)
+
+        self.table.setUpdatesEnabled(False)
+        try:
+            if (not self._displayed_keys
+                    or len(keys) < len(self._displayed_keys)
+                    or keys[:len(self._displayed_keys)] != self._displayed_keys):
+                rebuild()
             else:
-                fp_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
-            fp_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(i, 10, fp_item)
+                if display_trades and display_trades[0].get("exit_time", "") == "持仓中":
+                    self._set_trade_row(0, display_trades[0], up_color, down_color)
+                for i in range(len(self._displayed_keys), len(display_trades)):
+                    self.table.insertRow(i)
+                    self._set_trade_row(i, display_trades[i], up_color, down_color)
+        finally:
+            self.table.setUpdatesEnabled(True)
 
-            # 策略池
-            pool_id_str = t.get("pool_id", "") or ""
-            pool_id_item = QtWidgets.QTableWidgetItem(pool_id_str)
-            if pool_id_str == "pool1":
-                pool_id_item.setForeground(QtGui.QColor("#00BCD4"))
-            elif pool_id_str == "pool2":
-                pool_id_item.setForeground(QtGui.QColor("#FFC107"))
-            else:
-                pool_id_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
-            self.table.setItem(i, 11, pool_id_item)
-
-        # 自动根据内容调整列宽，保持可横向滚动
-        self.table.resizeColumnsToContents()
+        self._displayed_keys = keys
+        if display_trades:
+            self.table.resizeColumnsToContents()
         self._update_limit_hint(len(self._latest_trades))
+
+    def _trade_key(self, trade: Dict) -> tuple:
+        exit_time = trade.get("exit_time", "")
+        if exit_time == "持仓中":
+            return ("OPEN",
+                    trade.get("side", ""),
+                    trade.get("entry_time", ""),
+                    trade.get("entry_price", ""))
+        return (
+            trade.get("side", ""),
+            trade.get("entry_time", ""),
+            trade.get("exit_time", ""),
+            trade.get("entry_price", ""),
+            trade.get("exit_price", ""),
+            trade.get("pool_id", ""),
+        )
+
+    def _set_trade_row(self, row: int, t: Dict, up_color, down_color) -> None:
+        # 方向
+        side_item = QtWidgets.QTableWidgetItem(t.get("side", ""))
+        if "LONG" in t.get("side", ""):
+            side_item.setForeground(QtGui.QBrush(up_color))
+        elif "SHORT" in t.get("side", ""):
+            side_item.setForeground(QtGui.QBrush(down_color))
+        self.table.setItem(row, 0, side_item)
+
+        self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(t.get("entry_time", "")))
+        self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(t.get("entry_price", "")))
+        self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(t.get("exit_time", "")))
+        self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(t.get("exit_price", "")))
+
+        # 盈利和收益率着色
+        profit_str = t.get("profit", "0")
+        profit_pct_str = t.get("profit_pct", "0")
+        try:
+            profit_val = float(profit_str)
+            color = up_color if profit_val >= 0 else down_color
+        except ValueError:
+            color = QtGui.QColor(UI_CONFIG['THEME_TEXT'])
+
+        profit_item = QtWidgets.QTableWidgetItem(profit_str)
+        profit_item.setForeground(QtGui.QBrush(color))
+        self.table.setItem(row, 5, profit_item)
+
+        pct_item = QtWidgets.QTableWidgetItem(profit_pct_str)
+        pct_item.setForeground(QtGui.QBrush(color))
+        self.table.setItem(row, 6, pct_item)
+
+        self.table.setItem(row, 7, QtWidgets.QTableWidgetItem(t.get("hold", "")))
+
+        # 均持（策略平均持仓，0 显示 "-"）
+        avg_hold_str = t.get("avg_hold", "-")
+        self.table.setItem(row, 8, QtWidgets.QTableWidgetItem(avg_hold_str))
+
+        # 市场状态
+        regime_str = t.get("regime", "")
+        regime_item = QtWidgets.QTableWidgetItem(regime_str)
+        regime_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        # 尝试为市场状态着色
+        try:
+            from core.market_regime import MarketRegime
+            regime_color = MarketRegime.COLORS.get(regime_str, UI_CONFIG['THEME_TEXT'])
+            regime_item.setForeground(QtGui.QBrush(QtGui.QColor(regime_color)))
+        except Exception:
+            pass
+        self.table.setItem(row, 9, regime_item)
+
+        # 指纹摘要（模板ID + 相似度）
+        fp_str = t.get("fingerprint", "--")
+        fp_item = QtWidgets.QTableWidgetItem(fp_str)
+        # 有匹配时用主题高亮色，无匹配时灰色
+        if fp_str and fp_str != "--":
+            fp_item.setForeground(QtGui.QBrush(QtGui.QColor(UI_CONFIG['THEME_ACCENT'])))
+        else:
+            fp_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
+        fp_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.table.setItem(row, 10, fp_item)
+
+        # 策略池
+        pool_id_str = t.get("pool_id", "") or ""
+        pool_id_item = QtWidgets.QTableWidgetItem(pool_id_str)
+        if pool_id_str == "pool1":
+            pool_id_item.setForeground(QtGui.QColor("#00BCD4"))
+        elif pool_id_str == "pool2":
+            pool_id_item.setForeground(QtGui.QColor("#FFC107"))
+        else:
+            pool_id_item.setForeground(QtGui.QBrush(QtGui.QColor("#888")))
+        self.table.setItem(row, 11, pool_id_item)
 
     def _update_limit_hint(self, total_count: int):
         """更新显示条数提示"""
@@ -465,6 +503,7 @@ class BacktestLogWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self._latest_logs: List[Dict] = []
         self._display_limit = self.MAX_DISPLAY_LOGS
+        self._displayed_keys: List[tuple] = []
         self._init_ui()
 
     def _init_ui(self):
@@ -509,48 +548,81 @@ class BacktestLogWidget(QtWidgets.QWidget):
         layout.addWidget(self.table)
 
     def update_logs(self, logs: List[Dict]):
-        """更新回测日志"""
+        """更新回测日志（增量插入优先）"""
         self._latest_logs = logs or []
         display_logs = self._latest_logs[-self._display_limit:]
-        self.table.setRowCount(len(display_logs))
+        keys = [self._log_key(l) for l in display_logs]
         up_color = QtGui.QColor(UI_CONFIG['CHART_UP_COLOR'])
         down_color = QtGui.QColor(UI_CONFIG['CHART_DOWN_COLOR'])
 
-        for i, log in enumerate(display_logs):
-            event = log.get("event", "")
-            side = log.get("side", "")
-            price = log.get("price", "")
-            sl = log.get("stop_loss", "")
-            tp = log.get("take_profit", "")
-            detail = log.get("detail", "")
-            pool_id = log.get("info", {}).get("meta", {}).get("pool_id", "")
+        def rebuild():
+            self.table.setRowCount(len(display_logs))
+            for i, log in enumerate(display_logs):
+                self._set_log_row(i, log, up_color, down_color)
 
-            self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(event))
-            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(log.get("time", "")))
-
-            side_item = QtWidgets.QTableWidgetItem(side)
-            if "LONG" in side:
-                side_item.setForeground(QtGui.QBrush(up_color))
-            elif "SHORT" in side:
-                side_item.setForeground(QtGui.QBrush(down_color))
-            self.table.setItem(i, 2, side_item)
-
-            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(str(price)))
-            self.table.setItem(i, 4, QtWidgets.QTableWidgetItem(str(sl)))
-            self.table.setItem(i, 5, QtWidgets.QTableWidgetItem(str(tp)))
-            self.table.setItem(i, 6, QtWidgets.QTableWidgetItem(str(detail)))
-
-            pool_id_item = QtWidgets.QTableWidgetItem(pool_id)
-            if pool_id == "pool1":
-                pool_id_item.setForeground(QtGui.QColor("#00BCD4"))  # ACCENT_CYAN
-            elif pool_id == "pool2":
-                pool_id_item.setForeground(QtGui.QColor("#FFC107"))  # ACCENT_GOLD
+        self.table.setUpdatesEnabled(False)
+        try:
+            if (not self._displayed_keys
+                    or len(keys) < len(self._displayed_keys)
+                    or keys[:len(self._displayed_keys)] != self._displayed_keys):
+                rebuild()
             else:
-                pool_id_item.setForeground(QtGui.QColor("#9e9e9e"))
-            self.table.setItem(i, 7, pool_id_item)
+                for i in range(len(self._displayed_keys), len(display_logs)):
+                    self.table.insertRow(i)
+                    self._set_log_row(i, display_logs[i], up_color, down_color)
+        finally:
+            self.table.setUpdatesEnabled(True)
 
-        self.table.resizeColumnsToContents()
+        self._displayed_keys = keys
+        if display_logs:
+            self.table.resizeColumnsToContents()
         self._update_limit_hint(len(self._latest_logs))
+
+    def _log_key(self, log: Dict) -> tuple:
+        pool_id = log.get("info", {}).get("meta", {}).get("pool_id", "")
+        return (
+            log.get("event", ""),
+            log.get("time", ""),
+            log.get("side", ""),
+            str(log.get("price", "")),
+            str(log.get("stop_loss", "")),
+            str(log.get("take_profit", "")),
+            str(log.get("detail", "")),
+            pool_id,
+        )
+
+    def _set_log_row(self, row: int, log: Dict, up_color, down_color) -> None:
+        event = log.get("event", "")
+        side = log.get("side", "")
+        price = log.get("price", "")
+        sl = log.get("stop_loss", "")
+        tp = log.get("take_profit", "")
+        detail = log.get("detail", "")
+        pool_id = log.get("info", {}).get("meta", {}).get("pool_id", "")
+
+        self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(event))
+        self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(log.get("time", "")))
+
+        side_item = QtWidgets.QTableWidgetItem(side)
+        if "LONG" in side:
+            side_item.setForeground(QtGui.QBrush(up_color))
+        elif "SHORT" in side:
+            side_item.setForeground(QtGui.QBrush(down_color))
+        self.table.setItem(row, 2, side_item)
+
+        self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(price)))
+        self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(str(sl)))
+        self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(tp)))
+        self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(str(detail)))
+
+        pool_id_item = QtWidgets.QTableWidgetItem(pool_id)
+        if pool_id == "pool1":
+            pool_id_item.setForeground(QtGui.QColor("#00BCD4"))  # ACCENT_CYAN
+        elif pool_id == "pool2":
+            pool_id_item.setForeground(QtGui.QColor("#FFC107"))  # ACCENT_GOLD
+        else:
+            pool_id_item.setForeground(QtGui.QColor("#9e9e9e"))
+        self.table.setItem(row, 7, pool_id_item)
 
     def _update_limit_hint(self, total_count: int):
         if total_count > self._display_limit:

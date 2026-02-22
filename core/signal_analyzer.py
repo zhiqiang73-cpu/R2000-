@@ -72,6 +72,12 @@ WARN_TRIGGERS_MAX    = 14     # 样本偏少警告上限
 # 数据量大（如50000根）时命中率收敛至随机基准，命中率剪枝会误杀所有条件
 PRUNE_MIN_RATE = None   # 已弃用，保留仅为兼容性，实际不使用
 
+# ── ATR 合理区间门控 ──────────────────────────────────────────────────────────
+# 当 ATR/价格 低于此值时视为低波动，60根内无法走出 TP/SL，跳过该 bar（不可入场）
+MIN_ATR_RATIO = 0.0004  # 0.04%，低于此即为低波动行情（1分钟K经验值）
+# 当 ATR/价格 高于 SL距离 × 此倍数时视为高波动，止损保护不足，跳过该 bar
+MAX_ATR_SL_MULT = 1.5   # ATR > SL距离 × 150% 则放弃入场（BTC 1分钟线正常波动约0.5%-1.0%）
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 策略 1：预计算 outcome 数组
@@ -86,6 +92,9 @@ def _precompute_outcomes(
     tp_pct: float = TP1_PCT,
     sl_pct: float = SL_PCT,
     max_hold: int = MAX_HOLD,
+    atr_arr: Optional[np.ndarray] = None,
+    min_atr_ratio: float = MIN_ATR_RATIO,
+    max_atr_sl_mult: float = MAX_ATR_SL_MULT,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     对每个 bar i 预计算：若在 bar i 收盘后发出信号、于 bar i+1 开盘入场，
@@ -93,6 +102,10 @@ def _precompute_outcomes(
 
     同K线双触发规则：
       - 悲观假设：同K线同时触及 TP 和 SL → 一律视为止损（False）
+
+    ATR 双向门控（需传入 atr_arr）：
+      - ATR/价格 < min_atr_ratio  → 低波动，bar 标记为不可入场（outcomes=False, hold=-1）
+      - ATR/价格 > SL距离 × max_atr_sl_mult → 高波动，止损不足以覆盖正常波动，同样跳过
 
     Returns:
         (outcomes, hold_bars):
@@ -108,6 +121,17 @@ def _precompute_outcomes(
         entry_price = open_arr[entry_idx]
         if entry_price <= 0.0:
             continue
+
+        # ATR 双向门控：低波动 / 高波动均跳过，视为不可入场
+        if atr_arr is not None and entry_price > 0:
+            atr_val = float(atr_arr[i])
+            if atr_val > 0:
+                atr_ratio = atr_val / entry_price
+                sl_dist = sl_pct  # sl_pct 本身就是价格变动比例
+                if atr_ratio < min_atr_ratio:
+                    continue  # 低波动：60根内走不出 TP/SL，跳过
+                if atr_ratio > sl_dist * max_atr_sl_mult:
+                    continue  # 高波动：ATR 超过 SL 距离，止损保护不足，跳过
 
         if direction == 'long':
             tp_price = entry_price * (1.0 + tp_pct)
@@ -373,6 +397,8 @@ def analyze(
     validation_split: float = 0.0,
     pool_id: str = "pool1",
     max_hold: int = MAX_HOLD,
+    min_atr_ratio: float = MIN_ATR_RATIO,
+    max_atr_sl_mult: float = MAX_ATR_SL_MULT,
 ) -> List[dict]:
     """
     对给定 K 线数据执行信号组合分析。
@@ -428,6 +454,7 @@ def analyze(
     n = len(df)
     adx_arr       = df['adx'].values.astype(float)       if 'adx'       in df.columns else np.full(n, 20.0)
     ma5_slope_arr = df['ma5_slope'].values.astype(float) if 'ma5_slope' in df.columns else np.zeros(n)
+    atr_arr       = df['atr'].values.astype(float)       if 'atr'       in df.columns else None
     market_state_arr = np.array(
         [detect_state(float(adx_arr[i]), float(ma5_slope_arr[i])) for i in range(n)],
         dtype=object,
@@ -444,7 +471,10 @@ def analyze(
         tp_pct = LONG_TP1_PCT if direction == 'long' else SHORT_TP1_PCT
         sl_pct = LONG_SL_PCT  if direction == 'long' else SHORT_SL_PCT
     outcome, hold_bars_arr = _precompute_outcomes(high_arr, low_arr, open_arr, close_arr, direction,
-                                                   tp_pct=tp_pct, sl_pct=sl_pct, max_hold=max_hold)
+                                                   tp_pct=tp_pct, sl_pct=sl_pct, max_hold=max_hold,
+                                                   atr_arr=atr_arr,
+                                                   min_atr_ratio=min_atr_ratio,
+                                                   max_atr_sl_mult=max_atr_sl_mult)
 
     if progress_cb:
         progress_cb(5, "正在构建条件数组...")

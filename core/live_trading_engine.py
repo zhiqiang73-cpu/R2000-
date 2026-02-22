@@ -2151,7 +2151,22 @@ class LiveTradingEngine:
                 sl_price = entry_price * (1 + SHORT_SL_PCT)
             side = OrderSide.SHORT
 
-        # 7. 固定 5% 仓位下单
+        # 7. ATR 双向门控（与回测及 signal_analyzer 口径一致）
+        _entry_atr = self._get_current_atr()
+        if _entry_atr > 0 and entry_price > 0:
+            from core.signal_analyzer import MIN_ATR_RATIO, MAX_ATR_SL_MULT
+            _atr_ratio = _entry_atr / entry_price
+            _sl_dist = abs(sl_price - entry_price) / entry_price if entry_price > 0 else 0.0
+            if _atr_ratio < MIN_ATR_RATIO:
+                self.state.last_event = f"[入场跳过] ATR过小({_atr_ratio:.4%}<{MIN_ATR_RATIO:.4%})，低波动行情"
+                print(f"[LiveEngine] 跳过入场：ATR过小 atr_ratio={_atr_ratio:.4%} < {MIN_ATR_RATIO:.4%}")
+                return
+            if _sl_dist > 0 and _atr_ratio > _sl_dist * MAX_ATR_SL_MULT:
+                self.state.last_event = f"[入场跳过] ATR过大({_atr_ratio:.4%}>{_sl_dist*MAX_ATR_SL_MULT:.4%})，止损保护不足"
+                print(f"[LiveEngine] 跳过入场：ATR过大 atr_ratio={_atr_ratio:.4%} > sl_dist*{MAX_ATR_SL_MULT}={_sl_dist*MAX_ATR_SL_MULT:.4%}")
+                return
+
+        # 8. 固定 5% 仓位下单
         # combo_key 格式已经是 "long|cond1+cond2+..." ，直接用作 template_fingerprint
         order = self._paper_trader.open_position(
             side=side,

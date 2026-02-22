@@ -64,12 +64,15 @@ class SignalAnalysisWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(list)            # List[dict] 本轮结果
     error    = QtCore.pyqtSignal(str)
 
-    def __init__(self, df, excluded_families=None, validation_split=0.0, max_hold: int = 60, parent=None):
+    def __init__(self, df, excluded_families=None, validation_split=0.0, max_hold: int = 60,
+                 min_atr_ratio: float = 0.0004, max_atr_sl_mult: float = 0.8, parent=None):
         super().__init__(parent)
         self._df = df
         self._excluded_families = excluded_families or []
         self._validation_split = validation_split
         self._max_hold = max_hold
+        self._min_atr_ratio = min_atr_ratio
+        self._max_atr_sl_mult = max_atr_sl_mult
         self._stop = False
 
     def stop(self):
@@ -91,12 +94,14 @@ class SignalAnalysisWorker(QtCore.QObject):
                 if not self._stop:
                     self.progress.emit(50 + max(0, min(pct // 2, 49)), f"[做空] {text}")
 
+            _atr_kw = dict(min_atr_ratio=self._min_atr_ratio, max_atr_sl_mult=self._max_atr_sl_mult)
+
             if not self._stop:
                 long_p1 = analyze(
                     self._df, 'long', pool_id='pool1', progress_cb=cb_long,
                     excluded_families=self._excluded_families,
                     validation_split=self._validation_split,
-                    max_hold=self._max_hold,
+                    max_hold=self._max_hold, **_atr_kw,
                 )
                 all_results.extend(long_p1)
 
@@ -105,7 +110,7 @@ class SignalAnalysisWorker(QtCore.QObject):
                     self._df, 'short', pool_id='pool1', progress_cb=cb_short,
                     excluded_families=self._excluded_families,
                     validation_split=self._validation_split,
-                    max_hold=self._max_hold,
+                    max_hold=self._max_hold, **_atr_kw,
                 )
                 all_results.extend(short_p1)
 
@@ -114,7 +119,7 @@ class SignalAnalysisWorker(QtCore.QObject):
                     self._df, 'long', pool_id='pool2', progress_cb=cb_long,
                     excluded_families=self._excluded_families,
                     validation_split=self._validation_split,
-                    max_hold=self._max_hold,
+                    max_hold=self._max_hold, **_atr_kw,
                 )
                 all_results.extend(long_p2)
 
@@ -123,7 +128,7 @@ class SignalAnalysisWorker(QtCore.QObject):
                     self._df, 'short', pool_id='pool2', progress_cb=cb_short,
                     excluded_families=self._excluded_families,
                     validation_split=self._validation_split,
-                    max_hold=self._max_hold,
+                    max_hold=self._max_hold, **_atr_kw,
                 )
                 all_results.extend(short_p2)
 
@@ -560,6 +565,55 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         self._spn_max_hold.valueChanged.connect(self._on_exclude_changed)
         exclude_row.addWidget(lbl_max_hold)
         exclude_row.addWidget(self._spn_max_hold)
+
+        # ATR 区间 SpinBox（下限 / 上限倍数）
+        _spn_style = f"""
+            QDoubleSpinBox {{
+                background-color: {BG_CARD};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 3px;
+                padding: 2px 4px;
+                font-size: 11px;
+            }}
+            QDoubleSpinBox:hover {{ border-color: {ACCENT_CYAN}; }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                background-color: {BG_PANEL}; border: none; width: 14px;
+            }}
+            QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{
+                background-color: {ACCENT_CYAN};
+            }}
+        """
+        lbl_atr_min = QtWidgets.QLabel("ATR下限%:")
+        lbl_atr_min.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        self._spn_atr_min = QtWidgets.QDoubleSpinBox()
+        self._spn_atr_min.setRange(0.01, 0.50)
+        self._spn_atr_min.setSingleStep(0.01)
+        self._spn_atr_min.setDecimals(3)
+        self._spn_atr_min.setValue(float(_sig_settings.get("min_atr_ratio_pct", 0.04)))
+        self._spn_atr_min.setFixedWidth(72)
+        self._spn_atr_min.setFixedHeight(24)
+        self._spn_atr_min.setToolTip("ATR/价格 低于此值(%)时视为低波动，跳过该bar（默认 0.04%）")
+        self._spn_atr_min.setStyleSheet(_spn_style)
+        self._spn_atr_min.valueChanged.connect(self._on_exclude_changed)
+
+        lbl_atr_max = QtWidgets.QLabel("ATR上限(×SL):")
+        lbl_atr_max.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        self._spn_atr_max = QtWidgets.QDoubleSpinBox()
+        self._spn_atr_max.setRange(0.30, 2.00)
+        self._spn_atr_max.setSingleStep(0.05)
+        self._spn_atr_max.setDecimals(2)
+        self._spn_atr_max.setValue(float(_sig_settings.get("max_atr_sl_mult", 1.50)))
+        self._spn_atr_max.setFixedWidth(72)
+        self._spn_atr_max.setFixedHeight(24)
+        self._spn_atr_max.setToolTip("ATR/价格 超过 SL距离×此倍数时视为高波动，跳过该bar（默认 1.50）")
+        self._spn_atr_max.setStyleSheet(_spn_style)
+        self._spn_atr_max.valueChanged.connect(self._on_exclude_changed)
+
+        exclude_row.addWidget(lbl_atr_min)
+        exclude_row.addWidget(self._spn_atr_min)
+        exclude_row.addWidget(lbl_atr_max)
+        exclude_row.addWidget(self._spn_atr_max)
         exclude_row.addStretch()
 
         exclude_frame = QtWidgets.QFrame()
@@ -1092,7 +1146,8 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         if reply == QtWidgets.QMessageBox.StandardButton.Yes:
             try:
                 from core import signal_store
-                signal_store.clear()
+                signal_store.clear("pool1")
+                signal_store.clear("pool2")
             except Exception:
                 pass
             self._round_table.setRowCount(0)
@@ -1101,7 +1156,9 @@ class SignalAnalysisTab(QtWidgets.QWidget):
                 self._cumul_table_p2.setRowCount(0)
             self._live_table.setRowCount(0)
             self._history_text.clear()
-            self._status_lbl.setText("记录已清空")
+            # 强制从已清空的 signal_store 刷新累计表，确保 UI 与磁盘状态一致
+            self._refresh_cumulative_table()
+            self._status_lbl.setText("记录已清空（池子1: 0条，池子2: 0条）— 磁盘缓存已同步删除")
 
     def _on_risk_changed(self):
         self._risk_state["daily_loss_limit"]  = self._chk_daily_loss.isChecked()
@@ -1115,6 +1172,8 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         _settings["exclude_ma5_slope"] = self._chk_exclude_ma5_slope.isChecked()
         _settings["validation_split_enabled"] = self._chk_validation_split.isChecked()
         _settings["max_hold"] = self._spn_max_hold.value()
+        _settings["min_atr_ratio_pct"] = self._spn_atr_min.value()
+        _settings["max_atr_sl_mult"] = self._spn_atr_max.value()
         _save_signal_settings(_settings)
 
     def _on_filter_changed(self):
@@ -1129,6 +1188,8 @@ class SignalAnalysisTab(QtWidgets.QWidget):
         state['exclude_ma5_slope'] = self._chk_exclude_ma5_slope.isChecked()
         state['validation_split_enabled'] = self._chk_validation_split.isChecked()
         state['max_hold'] = self._spn_max_hold.value()
+        state['min_atr_ratio_pct'] = self._spn_atr_min.value()
+        state['max_atr_sl_mult'] = self._spn_atr_max.value()
         if hasattr(self, "_cmb_regime_filter"):
             state['regime_filter'] = self._cmb_regime_filter.currentText()
         _save_signal_settings(state)
@@ -1221,6 +1282,8 @@ class SignalAnalysisTab(QtWidgets.QWidget):
             excluded_families=excluded_families,
             validation_split=validation_split,
             max_hold=self._spn_max_hold.value(),
+            min_atr_ratio=self._spn_atr_min.value() / 100.0,
+            max_atr_sl_mult=self._spn_atr_max.value(),
         )
         self._worker.moveToThread(self._thread)
 

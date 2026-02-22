@@ -27,7 +27,7 @@ from ui.analysis_panel import AnalysisPanel
 from ui.optimizer_panel import OptimizerPanel
 from ui.paper_trading_tab import PaperTradingTab, PaperTradingTradeLog
 from ui.adaptive_learning_tab import AdaptiveLearningTab
-from ui.signal_analysis_tab import SignalAnalysisTab
+from ui.signal_analysis_tab import SignalAnalysisTab, _load_signal_settings
 from core.adaptive_controller import AdaptiveController, TradeContext as AdaptiveTradeContext
 from core.deepseek_reviewer import DeepSeekReviewer, TradeContext as DeepSeekTradeContext
 
@@ -360,8 +360,11 @@ class SignalBacktestWorker(QtCore.QObject):
                     self.labeling_progress.emit("正在计算所有指标...")
                     df_work = calculate_all_indicators(self.df.copy())
                     p1, p2 = get_cumulative_both_pools()
-                    valid_p1 = {k: v for k, v in p1.items() if v.get('appear_rounds', 0) >= 2}
-                    valid_p2 = {k: v for k, v in p2.items() if v.get('appear_rounds', 0) >= 2}
+                    # 从UI设置中读取最少轮次要求，默认为2轮
+                    _settings = _load_signal_settings()
+                    min_rounds_threshold = int(_settings.get('min_rounds', 2))
+                    valid_p1 = {k: v for k, v in p1.items() if v.get('appear_rounds', 0) >= min_rounds_threshold}
+                    valid_p2 = {k: v for k, v in p2.items() if v.get('appear_rounds', 0) >= min_rounds_threshold}
                     if not valid_p1 and not valid_p2:
                         self._precompute_failed = True
                         self.error.emit("策略池为空，请先完成信号分析")
@@ -394,6 +397,7 @@ class SignalBacktestWorker(QtCore.QObject):
 
             trade_records = []
             trade_logs = []
+            _rt_flags = {"trades": False, "logs": False}
             capital = INITIAL_CAP
             LEVERAGE = int(PAPER_TRADING_CONFIG.get("LEVERAGE_DEFAULT", 20))
             PCT = float(PAPER_TRADING_CONFIG.get("POSITION_SIZE_PCT", 0.05))
@@ -423,6 +427,19 @@ class SignalBacktestWorker(QtCore.QObject):
                 })
                 if len(trade_logs) > 800:
                     trade_logs[:] = trade_logs[-800:]
+                _rt_flags["logs"] = True
+
+            def _emit_rt_update(metrics: dict):
+                trades_changed = _rt_flags["trades"]
+                logs_changed = _rt_flags["logs"]
+                if logs_changed:
+                    metrics["trade_logs"] = list(trade_logs)
+                metrics["_trades_changed"] = trades_changed
+                metrics["_logs_changed"] = logs_changed
+                trades_payload = list(trade_records) if trades_changed else []
+                self.rt_update.emit(metrics, trades_payload)
+                _rt_flags["trades"] = False
+                _rt_flags["logs"] = False
 
             cur = 0
             while self.is_running and not self._stop_requested and cur < n:
@@ -572,6 +589,7 @@ class SignalBacktestWorker(QtCore.QObject):
                                 market_regime=e_state,
                                 avg_hold_bars=e_avg_hold_bars,
                             ))
+                            _rt_flags["trades"] = True
                             
                             if tp1_ratio == 1.0:
                                 # 全平仓
@@ -587,8 +605,7 @@ class SignalBacktestWorker(QtCore.QObject):
                                 })
                                 m = _make_running_metrics(trade_records, INITIAL_CAP)
                                 m["current_bar"] = cur
-                                m["trade_logs"]  = list(trade_logs)
-                                self.rt_update.emit(m, list(trade_records))
+                                _emit_rt_update(m)
                             else:
                                 # 进入阶段2：SL 上移至开仓价保本，追踪止损从 TP1 开始
                                 pos_stage  = 2
@@ -613,8 +630,7 @@ class SignalBacktestWorker(QtCore.QObject):
                                     pass
                                 m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
                                 m["current_bar"] = cur
-                                m["trade_logs"]  = list(trade_logs)
-                                self.rt_update.emit(m, list(trade_records))
+                                _emit_rt_update(m)
 
                         elif hit_sl or timed:
                             # ── SL 触发 / 超时平仓（含阶段2追踪止损触发）────────
@@ -653,14 +669,13 @@ class SignalBacktestWorker(QtCore.QObject):
                                 market_regime=e_state,
                                 avg_hold_bars=e_avg_hold_bars,
                             ))
+                            _rt_flags["trades"] = True
                             in_pos = False
                             e_margin = None
                             e_avg_hold_bars = 0
                             e_state = ""
-                            self.rt_update.emit(
-                                {**_make_running_metrics(trade_records, INITIAL_CAP), "trade_logs": list(trade_logs)},
-                                list(trade_records),
-                            )
+                            m = _make_running_metrics(trade_records, INITIAL_CAP)
+                            _emit_rt_update(m)
 
                         else:
                             # ── 持仓中：每步刷新持仓和交易明细 ─────────────────
@@ -679,8 +694,7 @@ class SignalBacktestWorker(QtCore.QObject):
                                 pass
                             m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
                             m["current_bar"] = cur
-                            m["trade_logs"]  = list(trade_logs)
-                            self.rt_update.emit(m, list(trade_records))
+                            _emit_rt_update(m)
 
                         self.step_completed.emit(cur)
                         cur += 1
@@ -750,12 +764,18 @@ class SignalBacktestWorker(QtCore.QObject):
                         _tp = cl * (1 + p_long_tp) if d == 'long' else cl * (1 - p_short_tp)
                         _sl = cl * (1 - p_long_sl) if d == 'long' else cl * (1 + p_short_sl)
 
-                        # 方案1：ATR 过滤 — ATR 超过 SL 距离 80% 说明波动过大，跳过本次开仓
+                        # ATR 双向门控（与 signal_analyzer._precompute_outcomes 口径一致）
                         _atr_val = float(row.get('atr', 0) or 0)
                         _sl_dist = abs(_sl - cl) / cl if cl > 0 else 0.0
-                        if _atr_val > 0 and _sl_dist > 0 and (_atr_val / cl) > _sl_dist * 0.8:
-                            pass  # 波动率过大，止损距离不足以覆盖，放弃开仓
-                        else:
+                        _atr_ratio = (_atr_val / cl) if cl > 0 and _atr_val > 0 else 0.0
+                        _atr_skip = False
+                        if _atr_val > 0:
+                            from core.signal_analyzer import MIN_ATR_RATIO, MAX_ATR_SL_MULT
+                            if _atr_ratio < MIN_ATR_RATIO:
+                                _atr_skip = True   # 波动过小，60根内走不出 TP/SL，跳过
+                            elif _sl_dist > 0 and _atr_ratio > _sl_dist * MAX_ATR_SL_MULT:
+                                _atr_skip = True   # 波动过大，止损距离不足以覆盖，跳过
+                        if not _atr_skip:
                             in_pos, e_price, e_idx, e_dir = True, cl, cur, d
                             e_state = state          # 记录入场时的三态市场状态
                             e_key, e_info = key, info
@@ -790,8 +810,7 @@ class SignalBacktestWorker(QtCore.QObject):
                             )
                             m = _make_running_metrics(trade_records, INITIAL_CAP, cur_pos)
                             m["current_bar"] = cur
-                            m["trade_logs"] = list(trade_logs)
-                            self.rt_update.emit(m, list(trade_records))
+                            _emit_rt_update(m)
 
                 self.step_completed.emit(cur)
                 cur += 1
@@ -3963,12 +3982,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.optimizer_panel.update_backtest_metrics(metrics)
         current_pos = metrics.get("current_pos")
         current_bar = metrics.get("current_bar", 0)
-        self.analysis_panel.update_trade_log(self._format_trades(trades, current_pos=current_pos, current_bar=current_bar))
-        logs = metrics.get("trade_logs")
-        if logs is not None:
-            self.analysis_panel.update_backtest_log(self._format_backtest_logs(logs))
-        elif self.rt_backtester:
-            self.analysis_panel.update_backtest_log(self._format_backtest_logs(self.rt_backtester.trade_logs))
+        trades_changed = bool(metrics.get("_trades_changed"))
+        logs_changed = bool(metrics.get("_logs_changed"))
+
+        if trades_changed or not hasattr(self, "_rt_cached_trades"):
+            self._rt_cached_trades = trades or []
+
+        # 降频更新交易明细：仅在新交易/新日志或间隔到达时刷新
+        now = time.time()
+        last_ts = getattr(self, "_rt_last_ui_ts", 0.0)
+        min_interval = 0.3
+        should_refresh_trades = trades_changed or logs_changed or (current_pos is not None and now - last_ts >= min_interval)
+        if should_refresh_trades:
+            self.analysis_panel.update_trade_log(
+                self._format_trades(self._rt_cached_trades, current_pos=current_pos, current_bar=current_bar)
+            )
+            self._rt_last_ui_ts = now
+
+        if logs_changed:
+            logs = metrics.get("trade_logs")
+            if logs is not None:
+                self.analysis_panel.update_backtest_log(self._format_backtest_logs(logs))
         # 同步更新图表 SL/TP 线（反映时间衰减和追踪止损的实时变化）
         if hasattr(self, 'chart_widget') and self.chart_widget is not None:
             if current_pos is not None:
